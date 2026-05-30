@@ -1,0 +1,15 @@
+id = "dawn"
+appearance = "dark"
+
+[colors]
+background = "#15100D"
+surface = "#211814"
+elevated = "#2E211A"
+text_primary = "#FFF1E5"
+text_secondary = "#D8BFA8"
+text_tertiary = "#957B66"
+accent = "#FF8A3D"
+success = "#9ECE6A"
+warning = "#FFB86B"
+error = "#FF6E6E"
+border = "#FFE3CC"

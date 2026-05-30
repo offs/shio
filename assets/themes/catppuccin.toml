@@ -1,0 +1,15 @@
+id = "catppuccin"
+appearance = "dark"
+
+[colors]
+background = "#11111B"
+surface = "#181825"
+elevated = "#1E1E2E"
+text_primary = "#CDD6F4"
+text_secondary = "#BAC2DE"
+text_tertiary = "#7F849C"
+accent = "#89B4FA"
+success = "#A6E3A1"
+warning = "#FAB387"
+error = "#F38BA8"
+border = "#CBA6F7"

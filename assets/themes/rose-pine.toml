@@ -1,0 +1,15 @@
+id = "rose-pine"
+appearance = "dark"
+
+[colors]
+background = "#191724"
+surface = "#1F1D2E"
+elevated = "#26233A"
+text_primary = "#E0DEF4"
+text_secondary = "#C4A7E7"
+text_tertiary = "#908CAA"
+accent = "#EBBCBA"
+success = "#31748F"
+warning = "#F6C177"
+error = "#EB6F92"
+border = "#C4A7E7"

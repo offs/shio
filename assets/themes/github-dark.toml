@@ -1,0 +1,15 @@
+id = "github-dark"
+appearance = "dark"
+
+[colors]
+background = "#0D1117"
+surface = "#161B22"
+elevated = "#21262D"
+text_primary = "#F0F6FC"
+text_secondary = "#C9D1D9"
+text_tertiary = "#8B949E"
+accent = "#58A6FF"
+success = "#3FB950"
+warning = "#D29922"
+error = "#F85149"
+border = "#F0F6FC"

@@ -1,0 +1,50 @@
+[package]
+name = "shio-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "download app"
+
+[[bin]]
+name = "shio"
+path = "src/main.rs"
+
+[dependencies]
+shio-core = { path = "../shio-core", version = "0.1.0" }
+iced = { workspace = true, features = ["tokio", "advanced", "lazy"] }
+iced_aw = { workspace = true, features = ["context_menu"] }
+iced_drop = { workspace = true }
+iced_fonts = { workspace = true }
+tokio = { workspace = true }
+parking_lot = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+nucleo-matcher = { workspace = true }
+bytesize = { workspace = true }
+url = { workspace = true }
+arboard = { workspace = true }
+rfd = { workspace = true }
+open = { workspace = true }
+notify-rust = { workspace = true }
+image = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+window-vibrancy = "0.7.1"
+windows-sys = { workspace = true }
+tray-icon = { workspace = true }
+
+[build-dependencies]
+winresource = { workspace = true }
+
+[features]
+default = ["wgpu"]
+wgpu = ["iced/wgpu"]
+software = ["iced/tiny-skia"]
+
+[lints]
+workspace = true

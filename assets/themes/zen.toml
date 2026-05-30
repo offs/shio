@@ -1,0 +1,15 @@
+id = "zen"
+appearance = "dark"
+
+[colors]
+background = "#000000"
+surface = "#050505"
+elevated = "#0C0C0C"
+text_primary = "#FFFFFF"
+text_secondary = "#BDBDBD"
+text_tertiary = "#6F6F6F"
+accent = "#FFFFFF"
+success = "#D8D8D8"
+warning = "#B8B8B8"
+error = "#E0E0E0"
+border = "#FFFFFF"

@@ -1,0 +1,11 @@
+/target
+.claude/
+.codex
+.remember/
+/docs/superpowers/
+**/*.rs.bk
+*.pdb
+.env
+*.db
+*.db-journal
+AGENTS.md
