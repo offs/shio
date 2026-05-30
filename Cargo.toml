@@ -14,34 +14,34 @@ authors = ["offs"]
 [workspace.dependencies]
 librqbit = "8.1.1"
 iced = { version = "0.14.0", default-features = false }
-iced_aw = { version = "0.13.1", default-features = false }
-iced_drop = { version = "0.2.23", default-features = false, features = ["helpers"] }
+iced_aw = { version = "0.14.1", default-features = false }
+iced_drop = { version = "0.2.29", default-features = false, features = ["helpers"] }
 iced_fonts = { version = "0.3.0", features = ["bootstrap"] }
 
-tokio = { version = "1.52.0", features = ["rt-multi-thread", "macros", "fs", "io-util", "net", "sync", "time", "signal"] }
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "fs", "io-util", "net", "sync", "time", "signal"] }
 tokio-util = { version = "0.7.18", default-features = false, features = ["rt"] }
 futures = "0.3.32"
 
-reqwest = { version = "0.13.2", default-features = false, features = [
+reqwest = { version = "0.13.4", default-features = false, features = [
     "stream",
     "cookies",
     "socks",
     "rustls",
 ] }
 
-rusqlite = { version = "0.39.0", features = ["bundled"] }
+rusqlite = { version = "0.40.0", features = ["bundled"] }
 parking_lot = "0.12.5"
 
 serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.149"
-toml = "0.8.2"
+serde_json = "1.0.150"
+toml = "1.1.2"
 
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 thiserror = "2.0.18"
 
-uuid = { version = "1.23.0", features = ["v4", "serde"] }
+uuid = { version = "1.23.2", features = ["v4", "serde"] }
 chrono = { version = "0.4.44", features = ["serde"] }
 url = { version = "2.5.8", features = ["serde"] }
 bytesize = "2.3.1"
@@ -49,21 +49,21 @@ nucleo-matcher = "0.3.1"
 regex = "1.12.3"
 directories = "6.0.0"
 async-trait = "0.1.89"
-open = "5.3.3"
+open = "5.3.5"
 
-zip = { version = "2.4.2", default-features = false, features = ["deflate", "deflate64", "lzma", "zstd"] }
-sevenz-rust2 = { version = "0.17.1", features = ["compress"] }
-tar = "0.4.45"
+zip = { version = "8.6.0", default-features = false, features = ["deflate", "deflate64", "lzma", "zstd"] }
+sevenz-rust2 = { version = "0.20.2", features = ["compress"] }
+tar = "0.4.46"
 flate2 = "1.1.9"
 zstd = "0.13.3"
 unrar = "0.5.8"
 
-notify-rust = "4.15.0"
+notify-rust = "4.17.0"
 rfd = "0.17.2"
 arboard = "3.6.1"
-image = { version = "0.25.9", default-features = false, features = ["png"] }
-tray-icon = "0.22.0"
-windows-sys = { version = "0.60.2", features = ["Win32_Foundation", "Win32_Security", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_System_Registry"] }
+image = { version = "0.25.10", default-features = false, features = ["png"] }
+tray-icon = "0.24.0"
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_System_Registry"] }
 winresource = "0.1.31"
 
 [profile.release]
