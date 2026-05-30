@@ -1,0 +1,15 @@
+id = "light"
+appearance = "light"
+
+[colors]
+background = "#FAFAFA"
+surface = "#F0F0F2"
+elevated = "#FFFFFF"
+text_primary = "#1A1A1E"
+text_secondary = "#65656D"
+text_tertiary = "#A0A0AB"
+accent = "#5B5BD6"
+success = "#2DA866"
+warning = "#D4900A"
+error = "#C93C3C"
+border = "#000000"

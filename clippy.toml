@@ -1,0 +1,9 @@
+msrv = "1.96"
+cognitive-complexity-threshold = 30
+too-many-arguments-threshold = 8
+type-complexity-threshold = 250
+avoid-breaking-exported-api = false
+allow-expect-in-tests = true
+allow-unwrap-in-tests = true
+allow-panic-in-tests = true
+check-private-items = true

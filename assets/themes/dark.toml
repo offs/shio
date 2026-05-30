@@ -1,0 +1,15 @@
+id = "dark"
+appearance = "dark"
+
+[colors]
+background = "#09090B"
+surface = "#0F0F12"
+elevated = "#1A1A1E"
+text_primary = "#EDEDEF"
+text_secondary = "#8C8C96"
+text_tertiary = "#595961"
+accent = "#5B5BD6"
+success = "#3CCB7F"
+warning = "#F5A623"
+error = "#DC4C4C"
+border = "#FFFFFF"

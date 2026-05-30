@@ -1,0 +1,81 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
+    <Package Name="shio"
+             Version="$(PackageVersion)"
+             Manufacturer="shio"
+             Language="1033"
+             UpgradeCode="3B4C7D19-4B43-42E0-9698-9604CB742D4A"
+             UpgradeStrategy="majorUpgrade"
+             Scope="perMachine">
+        <MajorUpgrade Schedule="afterInstallInitialize"
+                      DowngradeErrorMessage="A newer version of [ProductName] is already installed." />
+        <Media Id="1"
+               Cabinet="media1.cab"
+               EmbedCab="yes" />
+        <SetProperty Id="ARPINSTALLLOCATION"
+                     Value="[APPLICATIONFOLDER]"
+                     After="CostFinalize"
+                     Sequence="execute" />
+
+        <StandardDirectory Id="ProgramFiles6432Folder">
+            <Directory Id="APPLICATIONFOLDER"
+                       Name="shio">
+                <Directory Id="Bin"
+                           Name="bin" />
+            </Directory>
+        </StandardDirectory>
+        <StandardDirectory Id="ProgramMenuFolder">
+            <Directory Id="ApplicationProgramsFolder"
+                       Name="shio" />
+        </StandardDirectory>
+
+        <ComponentGroup Id="MainComponents">
+            <Component Directory="Bin">
+                <File Id="ShioExe"
+                      DiskId="1"
+                      Source="$(CargoTargetBinDir)\shio.exe"
+                      KeyPath="yes">
+                    <Shortcut Id="ApplicationStartMenuShortcut"
+                              Directory="ApplicationProgramsFolder"
+                              Name="shio"
+                              Icon="shio.ico"
+                              IconIndex="0"
+                              WorkingDirectory="APPLICATIONFOLDER"
+                              Advertise="yes" />
+                </File>
+            </Component>
+            <Component Directory="APPLICATIONFOLDER">
+                <File Id="LicenseFile"
+                      DiskId="1"
+                      Source="wix\License.rtf"
+                      KeyPath="yes" />
+            </Component>
+            <Component Directory="ApplicationProgramsFolder">
+                <RemoveFolder Id="ApplicationProgramsFolder"
+                              On="uninstall" />
+                <RegistryValue Root="HKCU"
+                               Key="Software\Shio"
+                               Name="Installed"
+                               Type="integer"
+                               Value="1"
+                               KeyPath="yes" />
+            </Component>
+        </ComponentGroup>
+
+        <Icon Id="shio.ico"
+              SourceFile="..\..\assets\icons\icon.ico" />
+        <Property Id="ARPPRODUCTICON"
+                  Value="shio.ico" />
+        <Property Id="ARPHELPLINK"
+                  Value="https://github.com/offs/shio" />
+        <WixVariable Id="WixUILicenseRtf"
+                     Value="wix\License.rtf" />
+        <WixVariable Id="WixUIBannerBmp"
+                     Value="wix\Banner.bmp" />
+        <WixVariable Id="WixUIDialogBmp"
+                     Value="wix\Dialog.bmp" />
+        <ui:WixUI Id="WixUI_InstallDir"
+                  InstallDirectory="APPLICATIONFOLDER" />
+    </Package>
+</Wix>

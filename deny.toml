@@ -1,0 +1,120 @@
+[graph]
+targets = [
+    { triple = "x86_64-pc-windows-msvc" },
+    { triple = "x86_64-unknown-linux-gnu" },
+    { triple = "aarch64-apple-darwin" },
+]
+all-features = false
+no-default-features = false
+
+[advisories]
+version = 2
+yanked = "warn"
+ignore = [
+    # owner: release
+    # review-by: 2026-07-01
+    # scope: transitive through librqbit; no direct Shio API exposure
+    # remove-when: librqbit drops backoff or updates past the advisory
+    "RUSTSEC-2025-0012",
+    # owner: release
+    # review-by: 2026-07-01
+    # scope: transitive through librqbit internals; torrent metadata is still treated as untrusted
+    # remove-when: librqbit updates bincode past the advisory
+    "RUSTSEC-2025-0141",
+    # owner: release
+    # review-by: 2026-07-01
+    # scope: transitive through librqbit; no direct Shio API exposure
+    # remove-when: librqbit drops crypto-hash or updates past the advisory
+    "RUSTSEC-2025-0060",
+    # owner: release
+    # review-by: 2026-07-01
+    # scope: transitive through librqbit; no direct Shio API exposure
+    # remove-when: librqbit removes the instant dependency path
+    "RUSTSEC-2024-0384",
+    # owner: release
+    # review-by: 2026-07-01
+    # scope: Linux-only transitive GTK3 stack through tray-icon; tray integration is not privileged
+    # remove-when: tray-icon updates away from the vulnerable GTK3 dependency path
+    "RUSTSEC-2024-0412",
+    # owner: release
+    # review-by: 2026-07-01
+    # scope: Linux-only transitive GTK3 stack through tray-icon; tray integration is not privileged
+    # remove-when: tray-icon updates away from the vulnerable GTK3 dependency path
+    "RUSTSEC-2024-0413",
+    # owner: release
+    # review-by: 2026-07-01
+    # scope: Linux-only transitive GTK3 stack through tray-icon; tray integration is not privileged
+    # remove-when: tray-icon updates away from the vulnerable GTK3 dependency path
+    "RUSTSEC-2024-0415",
+    # owner: release
+    # review-by: 2026-07-01
+    # scope: Linux-only transitive GTK3 stack through tray-icon; tray integration is not privileged
+    # remove-when: tray-icon updates away from the vulnerable GTK3 dependency path
+    "RUSTSEC-2024-0416",
+    # owner: release
+    # review-by: 2026-07-01
+    # scope: Linux-only transitive GTK3 stack through tray-icon; tray integration is not privileged
+    # remove-when: tray-icon updates away from the vulnerable GTK3 dependency path
+    "RUSTSEC-2024-0418",
+    # owner: release
+    # review-by: 2026-07-01
+    # scope: Linux-only transitive GTK3 stack through tray-icon; tray integration is not privileged
+    # remove-when: tray-icon updates away from the vulnerable GTK3 dependency path
+    "RUSTSEC-2024-0419",
+    # owner: release
+    # review-by: 2026-07-01
+    # scope: Linux-only transitive GTK3 stack through tray-icon; tray integration is not privileged
+    # remove-when: tray-icon updates away from the vulnerable GTK3 dependency path
+    "RUSTSEC-2024-0420",
+    # owner: release
+    # review-by: 2026-07-01
+    # scope: transitive through the Linux tray-icon GTK3 macro stack
+    # remove-when: tray-icon updates away from the proc-macro-error dependency path
+    "RUSTSEC-2024-0436",
+    # owner: release
+    # review-by: 2026-07-01
+    # scope: transitive through wgpu/iced UI stack; no direct Shio API exposure
+    # remove-when: iced/wgpu drops paste or updates past the advisory
+    "RUSTSEC-2024-0370",
+]
+
+[licenses]
+version = 2
+confidence-threshold = 0.8
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "MPL-2.0",
+    "BSL-1.0",
+    "CC0-1.0",
+    "bzip2-1.0.6",
+]
+exceptions = []
+
+[[licenses.clarify]]
+name = "ring"
+expression = "MIT AND ISC AND OpenSSL"
+license-files = [{ path = "LICENSE", hash = 0xbd0eed23 }]
+
+[bans]
+multiple-versions = "allow"
+wildcards = "deny"
+highlight = "all"
+workspace-default-features = "allow"
+external-default-features = "allow"
+allow = []
+deny = []
+skip = []
+skip-tree = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
