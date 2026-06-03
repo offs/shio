@@ -32,6 +32,7 @@ impl Shio {
                 has_search: !self.search_query.is_empty(),
                 drag: self.drag_hover.as_ref(),
                 widths: self.column_widths,
+                available_width: download_list_width(self.window.size),
                 scroll_long_names: self.config.scroll_long_names,
                 carousel_offset: self.name_carousel_offset(),
             },
@@ -138,6 +139,26 @@ impl Shio {
             } else {
                 main_content
             }
+        } else if let Some(targets) = self.cancel_confirm_targets() {
+            let (label, multiple) = match targets {
+                [] => (String::new(), false),
+                [id] => (
+                    self.downloads
+                        .iter()
+                        .find(|d| d.id == *id)
+                        .map(|d| d.filename.clone())
+                        .unwrap_or_default(),
+                    false,
+                ),
+                many => (format!("{} downloads", many.len()), true),
+            };
+            views::confirm_cancel::view(
+                label,
+                multiple,
+                p,
+                self.config.window.material,
+                main_content,
+            )
         } else if let Some(targets) = self.delete_confirm_targets() {
             let (label, multiple) = match targets {
                 [] => (String::new(), false),
@@ -234,6 +255,13 @@ impl Shio {
         }
     }
 }
+
+fn download_list_width(window_size: Option<iced::Size>) -> Option<f32> {
+    let size = window_size?;
+    Some((size.width - CONTENT_PANE_HORIZONTAL_PADDING).max(0.0))
+}
+
+const CONTENT_PANE_HORIZONTAL_PADDING: f32 = 24.0;
 
 fn notice_overlay<'a>(
     notices: &'a [PersistentNotice],

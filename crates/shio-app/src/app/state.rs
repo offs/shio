@@ -234,6 +234,7 @@ pub(crate) enum Overlay {
     FirstRun,
     AddDownload,
     Settings,
+    CancelConfirm(Vec<DownloadId>),
     DeleteConfirm(Vec<DownloadId>),
     Password(DownloadId),
     Edit(DownloadId),
@@ -477,6 +478,13 @@ impl Shio {
         matches!(self.overlay, Overlay::Settings)
     }
 
+    pub(super) fn cancel_confirm_targets(&self) -> Option<&[DownloadId]> {
+        match &self.overlay {
+            Overlay::CancelConfirm(targets) => Some(targets),
+            _ => None,
+        }
+    }
+
     pub(super) fn delete_confirm_targets(&self) -> Option<&[DownloadId]> {
         match &self.overlay {
             Overlay::DeleteConfirm(targets) => Some(targets),
@@ -515,7 +523,7 @@ impl Shio {
         if source_id == target_id {
             return;
         }
-        if self.is_pinned(source_id) || self.is_pinned(target_id) {
+        if self.is_pinned(source_id) != self.is_pinned(target_id) {
             return;
         }
         if let Some(src_pos) = self.downloads.iter().position(|d| d.id == source_id) {

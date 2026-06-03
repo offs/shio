@@ -687,6 +687,25 @@ impl Shio {
         Task::none()
     }
 
+    pub(super) fn cancel_dialog_open(&mut self, id: DownloadId) -> Task<Message> {
+        self.overlay = Overlay::CancelConfirm(self.delete_targets_for(id));
+        Task::none()
+    }
+
+    pub(super) fn cancel_dialog_cancel(&mut self) -> Task<Message> {
+        self.overlay = Overlay::None;
+        Task::none()
+    }
+
+    pub(super) fn cancel_dialog_confirm(&mut self) -> Task<Message> {
+        let Overlay::CancelConfirm(targets) = std::mem::replace(&mut self.overlay, Overlay::None)
+        else {
+            return Task::none();
+        };
+        let tasks: Vec<_> = targets.iter().map(|&id| self.cancel_download(id)).collect();
+        Task::batch(tasks)
+    }
+
     pub(super) fn delete_dialog_open(&mut self, id: DownloadId) -> Task<Message> {
         self.overlay = Overlay::DeleteConfirm(self.delete_targets_for(id));
         Task::none()

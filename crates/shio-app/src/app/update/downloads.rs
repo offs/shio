@@ -92,10 +92,6 @@ impl Shio {
         )
     }
 
-    pub(super) fn remove_download(&self, id: DownloadId) -> Task<Message> {
-        self.remove_ids(&[id], false)
-    }
-
     pub(super) fn remove_ids(&self, ids: &[DownloadId], delete_files: bool) -> Task<Message> {
         if ids.is_empty() {
             return Task::none();

@@ -1,4 +1,5 @@
 pub(crate) mod add_dialog;
+pub(crate) mod confirm_cancel;
 pub(crate) mod confirm_delete;
 pub(crate) mod download_list;
 pub(crate) mod edit_dialog;

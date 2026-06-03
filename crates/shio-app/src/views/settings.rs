@@ -72,7 +72,6 @@ struct SearchResult {
 const DOWNLOADS_SECTION: &str = "Downloads";
 const ADD_DOWNLOADS_SECTION: &str = "Add downloads";
 const BANDWIDTH_SECTION: &str = "Bandwidth";
-const CAPTURE_SECTION: &str = "Capture";
 const TORRENT_SECTION: &str = "Torrents";
 const SYSTEM_SECTION: &str = "System";
 const THEME_SECTION: &str = "Theme";
@@ -99,6 +98,27 @@ const STATIC_SETTINGS: &[SettingMeta] = &[
         title: "Default segments",
         description: "Number of parallel chunks per download",
         key: SettingKey::DefaultSegments,
+    },
+    SettingMeta {
+        category: SettingsCategory::General,
+        section: DOWNLOADS_SECTION,
+        title: "Close to tray",
+        description: "Hide the window on close and keep running in the system tray",
+        key: SettingKey::CloseToTray,
+    },
+    SettingMeta {
+        category: SettingsCategory::General,
+        section: DOWNLOADS_SECTION,
+        title: "Clipboard monitoring",
+        description: "Automatically detect URLs copied to clipboard",
+        key: SettingKey::ClipboardMonitoring,
+    },
+    SettingMeta {
+        category: SettingsCategory::General,
+        section: DOWNLOADS_SECTION,
+        title: "File associations",
+        description: "Use Shio for .torrent files and magnet links",
+        key: SettingKey::FileAssociations,
     },
     SettingMeta {
         category: SettingsCategory::General,
@@ -129,25 +149,11 @@ const STATIC_SETTINGS: &[SettingMeta] = &[
         key: SettingKey::DeleteArchiveAfterExtract,
     },
     SettingMeta {
-        category: SettingsCategory::General,
-        section: ADD_DOWNLOADS_SECTION,
-        title: "Close to tray",
-        description: "Hide the window on close and keep running in the system tray",
-        key: SettingKey::CloseToTray,
-    },
-    SettingMeta {
         category: SettingsCategory::Network,
         section: BANDWIDTH_SECTION,
         title: "Speed limit",
         description: "Maximum download speed in KB/s, 0 for unlimited",
         key: SettingKey::SpeedLimit,
-    },
-    SettingMeta {
-        category: SettingsCategory::Network,
-        section: CAPTURE_SECTION,
-        title: "Clipboard monitoring",
-        description: "Automatically detect URLs copied to clipboard",
-        key: SettingKey::ClipboardMonitoring,
     },
     SettingMeta {
         category: SettingsCategory::Network,
@@ -176,13 +182,6 @@ const STATIC_SETTINGS: &[SettingMeta] = &[
         title: "After download finishes",
         description: "Control post-download seeding",
         key: SettingKey::TorrentSeedPolicy,
-    },
-    SettingMeta {
-        category: SettingsCategory::Network,
-        section: TORRENT_SECTION,
-        title: "File associations",
-        description: "Use Shio for .torrent files and magnet links",
-        key: SettingKey::FileAssociations,
     },
     SettingMeta {
         category: SettingsCategory::Notifications,
@@ -290,8 +289,7 @@ fn search_results(query: &str) -> Vec<SearchResult> {
 fn section_order(section: &str) -> usize {
     match section {
         DOWNLOADS_SECTION | BANDWIDTH_SECTION | SYSTEM_SECTION | THEME_SECTION | APP_SECTION => 0,
-        CAPTURE_SECTION => 1,
-        TORRENT_SECTION | ADD_DOWNLOADS_SECTION => 2,
+        TORRENT_SECTION | ADD_DOWNLOADS_SECTION => 1,
         _ => usize::MAX,
     }
 }
@@ -1318,12 +1316,12 @@ mod tests {
             ("scroll", SettingsCategory::Appearance, "Scroll long names"),
             (
                 "clipboard",
-                SettingsCategory::Network,
+                SettingsCategory::General,
                 "Clipboard monitoring",
             ),
             (
                 "association",
-                SettingsCategory::Network,
+                SettingsCategory::General,
                 "File associations",
             ),
             ("torrent", SettingsCategory::Network, "Torrent port"),

@@ -5381,7 +5381,7 @@ dependencies = [
 
 [[package]]
 name = "shio-app"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "arboard",
  "bytesize",
@@ -5410,7 +5410,7 @@ dependencies = [
 
 [[package]]
 name = "shio-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "bytesize",

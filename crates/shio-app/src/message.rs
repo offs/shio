@@ -115,7 +115,9 @@ pub(crate) enum Message {
 
     PauseDownload(DownloadId),
     ResumeDownload(DownloadId),
-    CancelDownload(DownloadId),
+    RequestCancelDownload(DownloadId),
+    ConfirmCancelDownload,
+    CancelCancelDownload,
     RetryDownload(DownloadId),
     ForceRecheck(DownloadId),
     RetryExtract(DownloadId),
@@ -124,7 +126,6 @@ pub(crate) enum Message {
     PasswordChanged(String),
     ConfirmPassword(DownloadId),
     CancelPassword,
-    RemoveDownload(DownloadId),
     RequestDeleteWithFiles(DownloadId),
     ConfirmDeleteFiles,
     ConfirmRemoveFromList,
@@ -412,7 +413,7 @@ impl SettingsCategory {
             Self::General => {
                 "Download defaults, file routing, archive handling, and tray behavior."
             },
-            Self::Network => "Bandwidth, torrents, and clipboard.",
+            Self::Network => "Bandwidth and torrents.",
             Self::Notifications => "System notification behavior.",
             Self::Appearance => "Theme and visual preferences.",
             Self::About => "Version, source, and diagnostics.",

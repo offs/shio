@@ -55,7 +55,9 @@ impl Shio {
 
             Message::PauseDownload(id) => self.pause_download(id),
             Message::ResumeDownload(id) => self.resume_download(id),
-            Message::CancelDownload(id) => self.cancel_download(id),
+            Message::RequestCancelDownload(id) => self.cancel_dialog_open(id),
+            Message::ConfirmCancelDownload => self.cancel_dialog_confirm(),
+            Message::CancelCancelDownload => self.cancel_dialog_cancel(),
             Message::RetryDownload(id) => self.retry_download(id),
             Message::ForceRecheck(id) => self.force_recheck(id),
             Message::RetryExtract(id) => self.retry_extract(id),
@@ -64,7 +66,6 @@ impl Shio {
             Message::PasswordChanged(value) => self.password_changed(value),
             Message::ConfirmPassword(id) => self.confirm_password(id),
             Message::CancelPassword => self.cancel_password(),
-            Message::RemoveDownload(id) => self.remove_download(id),
             Message::TogglePin(id) => self.toggle_pin(id),
             Message::PauseAll => self.pause_all(),
             Message::ResumeAll => self.resume_all(),

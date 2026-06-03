@@ -230,15 +230,30 @@ impl Shio {
             },
             "p" | "P" => self.batch_on_selected(Message::TogglePin, |_| true),
             "r" | "R" => self.retry_selected(),
-            "c" | "C" => self.batch_on_selected(Message::CancelDownload, |s| {
-                matches!(
-                    s,
-                    DownloadStatus::Downloading
-                        | DownloadStatus::Starting
-                        | DownloadStatus::Queued
-                        | DownloadStatus::Paused
-                )
-            }),
+            "c" | "C" => {
+                let ids: Vec<_> = self
+                    .selected_ids()
+                    .into_iter()
+                    .filter(|id| {
+                        self.downloads
+                            .iter()
+                            .find(|d| d.id == *id)
+                            .is_some_and(|d| {
+                                matches!(
+                                    d.status,
+                                    DownloadStatus::Downloading
+                                        | DownloadStatus::Starting
+                                        | DownloadStatus::Queued
+                                        | DownloadStatus::Paused
+                                )
+                            })
+                    })
+                    .collect();
+                match ids.first() {
+                    Some(&id) => self.cancel_dialog_open(id),
+                    None => Task::none(),
+                }
+            },
             "u" | "U" => self.selected_single_action(Message::CopyUrl),
             "e" | "E" => self.selected_single_action(Message::RequestEdit),
             "f" | "F" => self.selected_single_action(Message::OpenFolder),

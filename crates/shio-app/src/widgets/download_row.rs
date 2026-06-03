@@ -12,8 +12,11 @@ use shio_core::{Download, DownloadId, DownloadStatus, TorrentSource};
 const MAX_FILENAME_CHARS: usize = 34;
 const FILENAME_TAIL_CHARS: usize = 10;
 const ROW_HEIGHT: f32 = 48.0;
+const ROW_VERTICAL_PADDING: u16 = 8;
+const ROW_HORIZONTAL_PADDING: u16 = 16;
 const ACTION_BUTTON_SIZE: f32 = 32.0;
-const ACTION_COLUMN_WIDTH: f32 = 76.0;
+const ACTION_BUTTON_GAP: f32 = 4.0;
+pub(crate) const ACTION_COLUMN_WIDTH: f32 = ACTION_BUTTON_SIZE * 2.0 + ACTION_BUTTON_GAP;
 const COLUMN_GAP_WIDTH: f32 = 8.0;
 const ROW_SPACING: f32 = 4.0;
 const APPROX_FILENAME_CHAR_WIDTH: f32 = 7.2;
@@ -54,7 +57,8 @@ pub(crate) fn view<'a>(
     ]
     .spacing(ROW_SPACING)
     .align_y(iced::Alignment::Center)
-    .padding([10, 16])
+    .width(Length::Fill)
+    .padding([ROW_VERTICAL_PADDING, ROW_HORIZONTAL_PADDING])
     .height(ROW_HEIGHT);
 
     let wrapped: Element<'_, Message> = if let Some(side) = drop_side {
@@ -314,77 +318,174 @@ fn eta_cell<'a>(
 }
 
 fn action_cell<'a>(download: &'a Download, p: &'a Palette) -> Element<'a, Message> {
-    let id = download.id;
     row![
-        action_button(download, p),
-        button(iced_fonts::bootstrap::x_lg().size(12))
-            .style(style::btn_icon(p))
-            .on_press(Message::RemoveDownload(id))
-            .padding(0)
-            .width(Length::Fixed(ACTION_BUTTON_SIZE))
-            .height(Length::Fixed(ACTION_BUTTON_SIZE)),
+        control_slot(primary_control(download), p),
+        control_slot(
+            cancel_control(download).or_else(|| remove_control(download)),
+            p,
+        ),
     ]
-    .spacing(4)
+    .spacing(ACTION_BUTTON_GAP)
     .align_y(iced::Alignment::Center)
     .width(Length::Fixed(ACTION_COLUMN_WIDTH))
     .into()
 }
 
-fn action_button<'a>(download: &'a Download, p: &'a Palette) -> Element<'a, Message> {
+struct InlineControl {
+    icon: InlineIcon,
+    message: Message,
+    tone: InlineControlTone,
+}
+
+#[derive(Clone, Copy)]
+enum InlineControlTone {
+    Primary,
+    Cancel,
+}
+
+#[derive(Clone, Copy)]
+enum InlineIcon {
+    Pause,
+    Play,
+    Stop,
+    Retry,
+    Key,
+    Folder,
+    Cancel,
+}
+
+const fn primary_control(download: &Download) -> Option<InlineControl> {
     let id = download.id;
     match download.status {
         DownloadStatus::Downloading
         | DownloadStatus::Starting
-        | DownloadStatus::FetchingMetadata => button(iced_fonts::bootstrap::pause_fill().size(12))
-            .style(style::btn_ghost(p))
-            .on_press(Message::PauseDownload(id))
-            .padding(0)
-            .width(Length::Fixed(ACTION_BUTTON_SIZE))
-            .height(Length::Fixed(ACTION_BUTTON_SIZE))
+        | DownloadStatus::FetchingMetadata => Some(InlineControl::primary(
+            InlineIcon::Pause,
+            Message::PauseDownload(id),
+        )),
+        DownloadStatus::Seeding => Some(InlineControl::primary(
+            InlineIcon::Stop,
+            Message::StopSeeding(id),
+        )),
+        DownloadStatus::Paused => Some(InlineControl::primary(
+            InlineIcon::Play,
+            Message::ResumeDownload(id),
+        )),
+        DownloadStatus::Error => Some(InlineControl::primary(
+            InlineIcon::Retry,
+            Message::RetryDownload(id),
+        )),
+        DownloadStatus::ExtractError => Some(InlineControl::primary(
+            InlineIcon::Retry,
+            Message::RetryExtract(id),
+        )),
+        DownloadStatus::PasswordRequired => Some(InlineControl::primary(
+            InlineIcon::Key,
+            Message::RequestPassword(id),
+        )),
+        DownloadStatus::Completed => Some(InlineControl::primary(
+            InlineIcon::Folder,
+            Message::OpenFolder(id),
+        )),
+        DownloadStatus::Pending
+        | DownloadStatus::Queued
+        | DownloadStatus::Extracting
+        | DownloadStatus::Cancelled => None,
+    }
+}
+
+const fn cancel_control(download: &Download) -> Option<InlineControl> {
+    if can_cancel_inline(download.status) {
+        return Some(InlineControl::cancel(
+            InlineIcon::Cancel,
+            Message::RequestCancelDownload(download.id),
+        ));
+    }
+    None
+}
+
+const fn remove_control(download: &Download) -> Option<InlineControl> {
+    if can_remove_inline(download.status) {
+        return Some(InlineControl::cancel(
+            InlineIcon::Cancel,
+            Message::RequestDeleteWithFiles(download.id),
+        ));
+    }
+    None
+}
+
+const fn can_remove_inline(status: DownloadStatus) -> bool {
+    matches!(status, DownloadStatus::Cancelled)
+}
+
+const fn can_cancel_inline(status: DownloadStatus) -> bool {
+    matches!(
+        status,
+        DownloadStatus::Pending
+            | DownloadStatus::Queued
+            | DownloadStatus::Starting
+            | DownloadStatus::Downloading
+            | DownloadStatus::FetchingMetadata
+            | DownloadStatus::Paused
+            | DownloadStatus::Error
+            | DownloadStatus::ExtractError
+            | DownloadStatus::PasswordRequired
+    )
+}
+
+impl InlineControl {
+    const fn primary(icon: InlineIcon, message: Message) -> Self {
+        Self {
+            icon,
+            message,
+            tone: InlineControlTone::Primary,
+        }
+    }
+
+    const fn cancel(icon: InlineIcon, message: Message) -> Self {
+        Self {
+            icon,
+            message,
+            tone: InlineControlTone::Cancel,
+        }
+    }
+}
+
+impl InlineIcon {
+    fn view(self) -> Element<'static, Message> {
+        match self {
+            Self::Pause => iced_fonts::bootstrap::pause_fill().size(12).into(),
+            Self::Play => iced_fonts::bootstrap::play_fill().size(12).into(),
+            Self::Stop => iced_fonts::bootstrap::stop_fill().size(12).into(),
+            Self::Retry => iced_fonts::bootstrap::arrow_clockwise().size(12).into(),
+            Self::Key => iced_fonts::bootstrap::key().size(12).into(),
+            Self::Folder => iced_fonts::bootstrap::foldertwo_open().size(12).into(),
+            Self::Cancel => iced_fonts::bootstrap::x_lg().size(12).into(),
+        }
+    }
+}
+
+fn control_slot(control: Option<InlineControl>, p: &Palette) -> Element<'_, Message> {
+    match control {
+        Some(control) => control_button(control, p),
+        None => Space::new()
+            .width(ACTION_BUTTON_SIZE)
+            .height(ACTION_BUTTON_SIZE)
             .into(),
-        DownloadStatus::Seeding => button(iced_fonts::bootstrap::stop_fill().size(12))
-            .style(style::btn_ghost(p))
-            .on_press(Message::StopSeeding(id))
-            .padding(0)
-            .width(Length::Fixed(ACTION_BUTTON_SIZE))
-            .height(Length::Fixed(ACTION_BUTTON_SIZE))
-            .into(),
-        DownloadStatus::Paused => button(iced_fonts::bootstrap::play_fill().size(12))
-            .style(style::btn_ghost(p))
-            .on_press(Message::ResumeDownload(id))
-            .padding(0)
-            .width(Length::Fixed(ACTION_BUTTON_SIZE))
-            .height(Length::Fixed(ACTION_BUTTON_SIZE))
-            .into(),
-        DownloadStatus::Error => button(iced_fonts::bootstrap::arrow_clockwise().size(12))
-            .style(style::btn_ghost(p))
-            .on_press(Message::RetryDownload(id))
-            .padding(0)
-            .width(Length::Fixed(ACTION_BUTTON_SIZE))
-            .height(Length::Fixed(ACTION_BUTTON_SIZE))
-            .into(),
-        DownloadStatus::ExtractError => button(iced_fonts::bootstrap::arrow_clockwise().size(12))
-            .style(style::btn_ghost(p))
-            .on_press(Message::RetryExtract(id))
-            .padding(0)
-            .width(Length::Fixed(ACTION_BUTTON_SIZE))
-            .height(Length::Fixed(ACTION_BUTTON_SIZE))
-            .into(),
-        DownloadStatus::PasswordRequired => button(iced_fonts::bootstrap::key().size(12))
-            .style(style::btn_ghost(p))
-            .on_press(Message::RequestPassword(id))
-            .padding(0)
-            .width(Length::Fixed(ACTION_BUTTON_SIZE))
-            .height(Length::Fixed(ACTION_BUTTON_SIZE))
-            .into(),
-        DownloadStatus::Completed => button(iced_fonts::bootstrap::foldertwo_open().size(12))
-            .style(style::btn_ghost(p))
-            .on_press(Message::OpenFolder(id))
-            .padding(0)
-            .width(Length::Fixed(ACTION_BUTTON_SIZE))
-            .height(Length::Fixed(ACTION_BUTTON_SIZE))
-            .into(),
-        _ => Space::new().width(ACTION_BUTTON_SIZE).into(),
+    }
+}
+
+fn control_button(control: InlineControl, p: &Palette) -> Element<'_, Message> {
+    let button = button(control.icon.view())
+        .on_press(control.message)
+        .padding(0)
+        .width(Length::Fixed(ACTION_BUTTON_SIZE))
+        .height(Length::Fixed(ACTION_BUTTON_SIZE))
+        .clip(true);
+
+    match control.tone {
+        InlineControlTone::Primary => button.style(style::btn_ghost(p)).into(),
+        InlineControlTone::Cancel => button.style(style::btn_icon(p)).into(),
     }
 }
 
@@ -520,7 +621,13 @@ fn context_menu_items(
         items.push(menu_btn("force recheck", None, Message::ForceRecheck(id)));
     }
 
-    items.push(menu_btn("cancel", Some("C"), Message::CancelDownload(id)));
+    if can_cancel_inline(status) {
+        items.push(menu_btn(
+            "cancel",
+            Some("C"),
+            Message::RequestCancelDownload(id),
+        ));
+    }
     if can_copy_url {
         items.push(menu_btn("copy url", Some("U"), Message::CopyUrl(id)));
     }
@@ -681,6 +788,16 @@ mod tests {
             ),
             "table-update-1.0.2-to-1.0...ws-x64.rar"
         );
+    }
+
+    #[test]
+    fn inline_cancel_is_available_for_paused_downloads() {
+        assert!(can_cancel_inline(DownloadStatus::Paused));
+    }
+
+    #[test]
+    fn inline_cancel_is_hidden_for_completed_downloads() {
+        assert!(!can_cancel_inline(DownloadStatus::Completed));
     }
 
     #[test]
