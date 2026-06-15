@@ -13,7 +13,7 @@ name = "shio"
 path = "src/main.rs"
 
 [dependencies]
-shio-core = { path = "../shio-core", version = "0.1.0" }
+shio-core = { path = "../shio-core", version = "0.1.2" }
 iced = { workspace = true, features = ["tokio", "advanced", "lazy"] }
 iced_aw = { workspace = true, features = ["context_menu"] }
 iced_drop = { workspace = true }

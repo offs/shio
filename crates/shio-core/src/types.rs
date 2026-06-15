@@ -486,6 +486,8 @@ pub struct TorrentProgressSnapshot {
     pub is_private: bool,
     pub files: Vec<TorrentFile>,
     pub trackers: Vec<String>,
+    #[serde(skip)]
+    pub metadata_bytes: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

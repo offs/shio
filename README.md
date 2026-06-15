@@ -1,31 +1,39 @@
 <div align="center">
-  <img src="assets/icons/icon-256.png" width="112" height="112" alt="shio" />
+  <img src="assets/icons/icon-256.png" width="88" height="88" alt="shio" />
+
   <h1>shio</h1>
 
-  <p><strong>download manager</strong></p>
+  <p><strong>download manager for links, torrents, and archives</strong></p>
+
+  <p>
+    <a href="#install">install</a>
+    ·
+    <a href="#build">build</a>
+  </p>
 </div>
 
----
+<details>
+  <summary>screenshots</summary>
+
+  <p align="center">
+    <img src="docs/screenshots/screenshot2.png" alt="shio downloading files" width="100%" />
+    <img src="docs/screenshots/screenshot1.png" alt="shio empty downloads view" width="100%" />
+  </p>
+</details>
 
 ## features
 
-- works with direct links and torrents
-- gpu rendered ui
+- direct links, magnet links, and torrent files
 - segmented downloads with global controls and speed limits
-- automatic archive extraction
+- gpu rendered ui
+- automatic archive extraction and deletion
+- tray controls, clipboard capture, and notifications
 - custom themes
 
 ## install
 
-download the latest build from [releases](https://github.com/offs/shio/releases).
-beta builds are unsigned. release artifacts include sha256 files and GitHub provenance attestations.
-
-## screenshots
-
-<p align="center">
-  <img src="docs/screenshots/screenshot1.png" alt="screenshot 1" width="100%" />
-  <img src="docs/screenshots/screenshot2.png" alt="screenshot 2" width="100%" />
-</p>
+download the latest build from [releases](https://github.com/offs/shio/releases/latest).
+beta builds are unsigned.
 
 ## build
 

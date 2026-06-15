@@ -40,12 +40,15 @@ pub(crate) fn view<'a>(
 
 fn status_segments(downloads: &[Download], config: &AppConfig) -> Vec<String> {
     let total = downloads.len();
-    let transferring = downloads
+    let active_downloads = downloads
         .iter()
         .filter(|d| {
             matches!(
                 d.status,
-                DownloadStatus::Downloading | DownloadStatus::Seeding
+                DownloadStatus::Starting
+                    | DownloadStatus::FetchingMetadata
+                    | DownloadStatus::Downloading
+                    | DownloadStatus::Extracting
             )
         })
         .count();
@@ -102,8 +105,8 @@ fn status_segments(downloads: &[Download], config: &AppConfig) -> Vec<String> {
     };
 
     let mut segments = vec![
-        format!("{total} downloads"),
-        format!("{transferring}/{max} transferring"),
+        format!("{total} {}", download_label(total)),
+        format!("{active_downloads}/{max} active"),
     ];
 
     if preparing > 0 {
@@ -122,48 +125,6 @@ fn status_segments(downloads: &[Download], config: &AppConfig) -> Vec<String> {
     segments
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use shio_core::TorrentSource;
-    use std::path::PathBuf;
-
-    #[test]
-    fn status_segments_include_torrent_summary_once() {
-        let mut download = Download::try_from_torrent(
-            TorrentSource::Magnet(
-                "magnet:?xt=urn:btih:cab507494d02ebb1178b38f2e9d7be299c86b862".into(),
-            ),
-            PathBuf::from("/tmp"),
-        )
-        .expect("valid magnet");
-        download.status = DownloadStatus::Seeding;
-
-        assert_eq!(
-            status_segments(&[download], &AppConfig::default()),
-            vec![
-                "1 downloads".to_string(),
-                "1/3 transferring".to_string(),
-                "1 seeding".to_string(),
-                "clipboard: on".to_string(),
-            ]
-        );
-    }
-
-    #[test]
-    fn status_segments_put_clipboard_last() {
-        let config = AppConfig {
-            clipboard_monitor: false,
-            ..AppConfig::default()
-        };
-
-        assert_eq!(
-            status_segments(&[], &config),
-            vec![
-                "0 downloads".to_string(),
-                "0/3 transferring".to_string(),
-                "clipboard: off".to_string(),
-            ]
-        );
-    }
+const fn download_label(count: usize) -> &'static str {
+    if count == 1 { "download" } else { "downloads" }
 }

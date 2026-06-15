@@ -148,18 +148,23 @@ impl Database {
         is_private: bool,
         files: &[TorrentFile],
         trackers: &[String],
+        metadata_bytes: Option<&[u8]>,
     ) -> Result<()> {
         let files_json = encode_json("torrent_state.files_json", files)?;
         let trackers_json = encode_json("torrent_state.trackers_json", trackers)?;
         self.conn.lock().execute(
             "UPDATE torrent_state
-             SET is_private = ?2, files_json = ?3, trackers_json = ?4
+             SET is_private = ?2,
+                 files_json = ?3,
+                 trackers_json = ?4,
+                 metadata_bytes = COALESCE(?5, metadata_bytes)
              WHERE download_id = ?1",
             params![
                 id.0.to_string(),
                 i32::from(is_private),
                 files_json,
                 trackers_json,
+                metadata_bytes,
             ],
         )?;
         Ok(())
@@ -974,7 +979,7 @@ mod tests {
             selected: true,
         }];
         let trackers = vec!["udp://tracker.example:1337/announce".to_string()];
-        db.update_torrent_metadata(d.id, true, &files, &trackers)
+        db.update_torrent_metadata(d.id, true, &files, &trackers, None)
             .unwrap();
 
         let got = db.get(d.id).unwrap().unwrap();

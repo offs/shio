@@ -180,7 +180,7 @@ const STATIC_SETTINGS: &[SettingMeta] = &[
         category: SettingsCategory::Network,
         section: TORRENT_SECTION,
         title: "After download finishes",
-        description: "Control post-download seeding",
+        description: "Choose whether completed torrents keep uploading",
         key: SettingKey::TorrentSeedPolicy,
     },
     SettingMeta {
@@ -933,7 +933,7 @@ fn torrent_seed_policy_row<'a>(
     let choice = SeedPolicyChoice::from_policy(config.torrent.seed_policy);
     let mut body = column![setting_row(
         "After download finishes",
-        "Control post-download seeding",
+        "Choose whether completed torrents keep uploading",
         picker.into(),
         p
     )]
@@ -957,7 +957,10 @@ fn torrent_seed_policy_row<'a>(
             body = body.push(seed_policy_hint("Keep uploading until stopped.", p));
         },
         SeedPolicyChoice::NeverSeed => {
-            body = body.push(seed_policy_hint("Complete after verification.", p));
+            body = body.push(seed_policy_hint(
+                "Stop uploading when the download completes.",
+                p,
+            ));
         },
     }
 
@@ -1014,7 +1017,11 @@ fn seed_policy_hint<'a>(copy: &'a str, p: &'a crate::style::Palette) -> Element<
 }
 
 fn seed_policy_summary(ratio: &str, days: &str) -> String {
-    format!("Stops at ratio {} or {} days.", ratio.trim(), days.trim())
+    format!(
+        "Upload until ratio {} or {} days.",
+        ratio.trim(),
+        days.trim()
+    )
 }
 
 fn appearance_panel<'a>(

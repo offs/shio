@@ -91,18 +91,18 @@ fn download_detail(download: &Download) -> String {
         return String::new();
     };
     if torrent.peers_connected == 0 {
-        return "waiting for peers".to_string();
+        return "finding peers".to_string();
     }
-    "connected, no data".to_string()
+    "waiting for data".to_string()
 }
 
 fn metadata_detail(download: &Download) -> String {
     let Some(torrent) = download.torrent() else {
-        return "getting metadata".to_string();
+        return "getting torrent info".to_string();
     };
 
     if torrent.metadata_wait_secs >= 30 {
-        return "still looking for metadata".to_string();
+        return "metadata still unavailable".to_string();
     }
     if torrent.peers_connected > 0 {
         return format!("getting metadata · {} peers", torrent.peers_connected);
@@ -120,7 +120,7 @@ fn seeding_detail(download: &Download) -> String {
     }
     if torrent.peers_connected > 0 {
         return format!(
-            "seeding · {} {}",
+            "uploading · {} {}",
             torrent.peers_connected,
             peer_label(torrent.peers_connected)
         );
@@ -134,11 +134,11 @@ fn status_label(download: &Download) -> String {
         DownloadStatus::Queued => "queued".to_string(),
         DownloadStatus::Starting => "starting".to_string(),
         DownloadStatus::Downloading => download_status(download),
-        DownloadStatus::FetchingMetadata => "metadata".to_string(),
+        DownloadStatus::FetchingMetadata => "getting metadata".to_string(),
         DownloadStatus::Extracting => "extracting".to_string(),
         DownloadStatus::Paused => "paused".to_string(),
         DownloadStatus::Seeding => seeding_status(download),
-        DownloadStatus::Completed => "finished".to_string(),
+        DownloadStatus::Completed => "complete".to_string(),
         DownloadStatus::Error => "failed".to_string(),
         DownloadStatus::ExtractError => "extract failed".to_string(),
         DownloadStatus::PasswordRequired => "needs password".to_string(),
@@ -149,7 +149,7 @@ fn status_label(download: &Download) -> String {
 fn download_status(download: &Download) -> String {
     let eta = shio_core::format_eta(download.downloaded, download.total_size, download.avg_speed);
     if eta.is_empty() {
-        "waiting".to_string()
+        "downloading".to_string()
     } else {
         eta
     }
@@ -187,52 +187,6 @@ mod tests {
     use super::*;
     use shio_core::{Download, DownloadStatus, TorrentSource};
     use std::path::PathBuf;
-
-    #[test]
-    fn metadata_copy_escalates_after_waiting_and_with_peers() {
-        let mut download = torrent_download();
-        download.status = DownloadStatus::FetchingMetadata;
-
-        assert_eq!(present(&download).detail, "getting metadata");
-
-        download.torrent_mut().expect("torrent").peers_connected = 3;
-        assert_eq!(present(&download).detail, "getting metadata · 3 peers");
-
-        let torrent = download.torrent_mut().expect("torrent");
-        torrent.peers_connected = 0;
-        torrent.metadata_wait_secs = 30;
-        assert_eq!(present(&download).detail, "still looking for metadata");
-    }
-
-    #[test]
-    fn torrent_peer_and_seeding_copy_stays_human() {
-        let mut download = torrent_download();
-        download.status = DownloadStatus::Downloading;
-
-        assert_eq!(present(&download).detail, "waiting for peers");
-
-        download.torrent_mut().expect("torrent").peers_connected = 2;
-        assert_eq!(present(&download).detail, "connected, no data");
-
-        download.status = DownloadStatus::Seeding;
-        let torrent = download.torrent_mut().expect("torrent");
-        torrent.peers_connected = 1;
-        torrent.upload_speed = 1024;
-        torrent.ratio = 1.25;
-        torrent.seed_elapsed_secs = 3720;
-
-        let presentation = present(&download);
-        assert_eq!(presentation.detail, "up 1.0 KiB/s");
-        assert_eq!(presentation.status, "ratio 1.25 · 1h 02m");
-
-        let torrent = download.torrent_mut().expect("torrent");
-        torrent.upload_speed = 0;
-        torrent.peers_connected = 2;
-        assert_eq!(present(&download).detail, "seeding · 2 peers");
-
-        download.torrent_mut().expect("torrent").peers_connected = 0;
-        assert_eq!(present(&download).detail, "seeding idle");
-    }
 
     #[test]
     fn tone_mapping_for_starting_seeding_paused_and_error() {

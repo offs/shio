@@ -6,18 +6,7 @@ use librqbit::{Session, SessionOptions, SessionPersistenceConfig};
 use crate::error::{Result, ShioError};
 
 const TORRENT_LISTEN_PORT_SPAN: u16 = 10;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum TorrentSessionStop {
-    KeepFiles,
-    DeleteFiles,
-}
-
-impl TorrentSessionStop {
-    const fn delete_files(self) -> bool {
-        matches!(self, Self::DeleteFiles)
-    }
-}
+const TORRENT_SESSION_OP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 pub(crate) async fn open_session(
     data_dir: &Path,
@@ -51,19 +40,47 @@ pub(crate) async fn open_session(
         .map_err(|e| ShioError::Other(format!("librqbit session: {e}")))
 }
 
-pub(crate) async fn stop_torrent_in_session(
-    session: &Session,
-    info_hash: [u8; 20],
-    mode: TorrentSessionStop,
-) -> Result<()> {
+pub(crate) async fn stop_torrent_in_session(session: &Session, info_hash: [u8; 20]) -> Result<()> {
+    tokio::time::timeout(
+        TORRENT_SESSION_OP_TIMEOUT,
+        stop_torrent_in_session_inner(session, info_hash),
+    )
+    .await
+    .map_err(|_| ShioError::Other("delete torrent session timed out".into()))?
+}
+
+async fn stop_torrent_in_session_inner(session: &Session, info_hash: [u8; 20]) -> Result<()> {
     let torrent_id = librqbit::api::TorrentIdOrHash::Hash(librqbit::dht::Id20::new(info_hash));
     if session.get(torrent_id).is_none() {
         return Ok(());
     }
     session
-        .delete(torrent_id, mode.delete_files())
+        .delete(torrent_id, false)
         .await
         .map_err(|e| ShioError::Other(format!("delete torrent session: {e}")))
+}
+
+pub(crate) async fn pause_torrent_in_session(session: &Session, info_hash: [u8; 20]) -> Result<()> {
+    tokio::time::timeout(
+        TORRENT_SESSION_OP_TIMEOUT,
+        pause_torrent_in_session_inner(session, info_hash),
+    )
+    .await
+    .map_err(|_| ShioError::Other("pause torrent session timed out".into()))?
+}
+
+async fn pause_torrent_in_session_inner(session: &Session, info_hash: [u8; 20]) -> Result<()> {
+    let torrent_id = librqbit::api::TorrentIdOrHash::Hash(librqbit::dht::Id20::new(info_hash));
+    let Some(handle) = session.get(torrent_id) else {
+        return Ok(());
+    };
+    if handle.is_paused() {
+        return Ok(());
+    }
+    session
+        .pause(&handle)
+        .await
+        .map_err(|e| ShioError::Other(format!("pause torrent session: {e}")))
 }
 
 pub(super) fn listen_port_range(listen_port: u16) -> std::ops::Range<u16> {

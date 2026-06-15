@@ -13,11 +13,12 @@ use crate::types::{
     ArchivePackage, Download, DownloadId, DownloadKind, DownloadProgress, DownloadStatus,
     HttpPreview, HttpPreviewResult, HttpPreviewState, HttpState, MagnetPreviewResult,
     PackageExtractState, PackageId, PackageItem, ProgressDetail, TorrentFile, TorrentSource,
+    TorrentState,
 };
 use crate::worker::{DownloadWorker, build_client};
 use parking_lot::{Mutex, RwLock};
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 use tokio::sync::{Notify, OnceCell, broadcast, mpsc};
@@ -473,6 +474,32 @@ impl EngineWorkerHandle {
     }
 }
 
+struct CancelGuard {
+    state: Arc<EngineState>,
+    id: DownloadId,
+    cancel: Arc<CancellationToken>,
+}
+
+impl Drop for CancelGuard {
+    fn drop(&mut self) {
+        remove_active_cancel_if_current(&self.state, self.id, &self.cancel);
+    }
+}
+
+fn remove_active_cancel_if_current(
+    state: &EngineState,
+    id: DownloadId,
+    cancel: &Arc<CancellationToken>,
+) {
+    let mut cancels = state.active_cancels.lock();
+    if cancels
+        .get(&id)
+        .is_some_and(|existing| Arc::ptr_eq(existing, cancel))
+    {
+        cancels.remove(&id);
+    }
+}
+
 impl DownloadEngine {
     pub fn new(config: AppConfig, db_path: &Path) -> crate::Result<(Self, ProgressStream)> {
         let db = Database::open(db_path)?;
@@ -501,7 +528,7 @@ impl DownloadEngine {
         });
 
         let restored = db.all()?;
-        let (total, requeued) = restore_downloads(&state, restored);
+        let (total, requeued) = restore_downloads(&state, restored)?;
         for package in db.packages()? {
             state.packages.write().insert(package.id, package);
         }
@@ -574,9 +601,9 @@ impl DownloadEngine {
             EngineCommand::AddTorrentPrepared { request, reply } => {
                 ack(reply, self.add_torrent_prepared(request));
             },
-            EngineCommand::Pause { id, reply } => ack(reply, self.pause(id).await),
+            EngineCommand::Pause { id, reply } => ack(reply, self.pause(id)),
             EngineCommand::Resume { id, reply } => ack(reply, self.resume(id)),
-            EngineCommand::Cancel { id, reply } => ack(reply, self.cancel(id).await),
+            EngineCommand::Cancel { id, reply } => ack(reply, self.cancel(id)),
             EngineCommand::Remove {
                 id,
                 delete_files,
@@ -588,7 +615,7 @@ impl DownloadEngine {
                 password,
                 reply,
             } => ack(reply, self.retry_extract(id, password)),
-            EngineCommand::PauseAll { reply } => ack(reply, self.pause_all().await),
+            EngineCommand::PauseAll { reply } => ack(reply, self.pause_all()),
             EngineCommand::ResumeAll { reply } => ack(reply, self.resume_all()),
             EngineCommand::SetSpeedLimit(limit) => {
                 self.state.config.write().speed_limit = limit;
@@ -639,7 +666,7 @@ impl DownloadEngine {
                 self.cancel_http_preview(request_id);
             },
             EngineCommand::ForceRecheck { id, reply } => ack(reply, self.force_recheck(id).await),
-            EngineCommand::StopSeeding { id, reply } => ack(reply, self.stop_seeding(id).await),
+            EngineCommand::StopSeeding { id, reply } => ack(reply, self.stop_seeding(id)),
             EngineCommand::Shutdown { .. } => {},
         }
     }
@@ -647,6 +674,7 @@ impl DownloadEngine {
     fn add(&self, mut download: Download) -> crate::Result<()> {
         validate_download_http_url(&download)?;
         validate_download_paths(&download)?;
+        self.reject_duplicate_torrent(&download)?;
         download.status = DownloadStatus::Queued;
         let id = download.id;
         let priority = download.priority;
@@ -696,6 +724,7 @@ impl DownloadEngine {
     ) -> crate::Result<()> {
         let mut download = crate::types::Download::try_from_torrent(source, save_path)?;
         validate_download_paths(&download)?;
+        self.reject_duplicate_torrent(&download)?;
         if let Some(torrent) = download.torrent_mut() {
             torrent.auto_extract = auto_extract;
         }
@@ -711,6 +740,25 @@ impl DownloadEngine {
         self.state.downloads.write().insert(id, download);
         if !start_paused {
             self.state.queue.lock().push(id, priority);
+        }
+        Ok(())
+    }
+
+    fn reject_duplicate_torrent(&self, download: &Download) -> crate::Result<()> {
+        let Some(candidate) = download.torrent() else {
+            return Ok(());
+        };
+        let duplicate = self.state.downloads.read().values().any(|existing| {
+            existing.id != download.id
+                && !existing.status.is_terminal()
+                && existing
+                    .torrent()
+                    .is_some_and(|torrent| torrent.info_hash == candidate.info_hash)
+        });
+        if duplicate {
+            return Err(ShioError::Other(
+                "torrent is already in the download list".into(),
+            ));
         }
         Ok(())
     }
@@ -829,7 +877,7 @@ impl DownloadEngine {
                 tracing::debug!("http preview reply dropped: {e}");
             }
         });
-        self.state.active_workers.lock().push(handle);
+        self.push_active_worker(handle);
     }
 
     fn cancel_http_preview(&self, request_id: u64) {
@@ -852,27 +900,11 @@ impl DownloadEngine {
         }
 
         self.state.queue.lock().remove(&id);
-        self.delete_torrent_session(id, false).await;
 
-        let cancel = {
-            let active_cancels = self.state.active_cancels.lock();
-            active_cancels.get(&id).cloned()
-        };
-        if let Some(cancel) = cancel {
-            cancel.cancel();
-            loop {
-                let still_active = {
-                    let active_cancels = self.state.active_cancels.lock();
-                    active_cancels
-                        .get(&id)
-                        .is_some_and(|active| Arc::ptr_eq(active, &cancel))
-                };
-                if !still_active {
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-            }
-        }
+        self.cancel_active_worker_and_wait(id, "force recheck")
+            .await?;
+
+        self.stop_torrent_session(id).await;
 
         let priority = {
             let mut downloads = self.state.downloads.write();
@@ -898,31 +930,38 @@ impl DownloadEngine {
         }
     }
 
-    async fn pause(&self, id: DownloadId) -> crate::Result<()> {
+    fn pause(&self, id: DownloadId) -> crate::Result<()> {
         if let Some(package_id) = self.package_id_for_row(id) {
             let child_ids = self.package_child_ids(package_id);
             for child_id in child_ids {
-                self.pause_download(child_id).await?;
+                self.pause_download(child_id)?;
             }
             return Ok(());
         }
-        self.pause_download(id).await
+        self.pause_download(id)
     }
 
-    async fn pause_download(&self, id: DownloadId) -> crate::Result<()> {
+    fn pause_download(&self, id: DownloadId) -> crate::Result<()> {
         self.reject_extracting_mutation(id)?;
         self.state.queue.lock().remove(&id);
-        self.pause_torrent_session(id).await;
-        if let Some(token) = self.state.active_cancels.lock().get(&id) {
-            token.cancel();
-        }
+        let (downloaded, total_size) = self
+            .state
+            .downloads
+            .read()
+            .get(&id)
+            .map_or((0, None), |d| (d.downloaded, d.total_size));
         let updated = self.mutate_status(id, DownloadStatus::Paused);
         if updated {
             log_db_critical(
-                "update_status paused",
+                "update_final paused",
                 id,
-                self.db.update_status(id, DownloadStatus::Paused, None),
+                self.db
+                    .update_final(id, DownloadStatus::Paused, downloaded, total_size),
             );
+            if let Some(token) = self.state.active_cancels.lock().get(&id) {
+                token.cancel();
+            }
+            self.spawn_pause_torrent_session(id);
             Ok(())
         } else {
             Err(ShioError::Other("download not found".into()))
@@ -959,30 +998,37 @@ impl DownloadEngine {
         }
     }
 
-    async fn cancel(&self, id: DownloadId) -> crate::Result<()> {
+    fn cancel(&self, id: DownloadId) -> crate::Result<()> {
         if let Some(package_id) = self.package_id_for_row(id) {
             let child_ids = self.package_child_ids(package_id);
             for child_id in child_ids {
-                self.cancel_download(child_id).await?;
+                self.cancel_download(child_id)?;
             }
             return Ok(());
         }
-        self.cancel_download(id).await
+        self.cancel_download(id)
     }
 
-    async fn cancel_download(&self, id: DownloadId) -> crate::Result<()> {
+    fn cancel_download(&self, id: DownloadId) -> crate::Result<()> {
         self.reject_extracting_mutation(id)?;
-        self.delete_torrent_session(id, false).await;
-        if let Some(token) = self.state.active_cancels.lock().get(&id) {
-            token.cancel();
-        }
         self.state.queue.lock().remove(&id);
+        let (downloaded, total_size) = self
+            .state
+            .downloads
+            .read()
+            .get(&id)
+            .map_or((0, None), |d| (d.downloaded, d.total_size));
         if self.mutate_status(id, DownloadStatus::Cancelled) {
             log_db_critical(
-                "update_status cancelled",
+                "update_final cancelled",
                 id,
-                self.db.update_status(id, DownloadStatus::Cancelled, None),
+                self.db
+                    .update_final(id, DownloadStatus::Cancelled, downloaded, total_size),
             );
+            if let Some(token) = self.state.active_cancels.lock().get(&id) {
+                token.cancel();
+            }
+            self.spawn_delete_torrent_session(id);
             Ok(())
         } else {
             Err(ShioError::Other("download not found".into()))
@@ -1007,29 +1053,22 @@ impl DownloadEngine {
             return Err(ShioError::Other("download not found".into()));
         }
         self.reject_extracting_mutation(id)?;
-        self.delete_torrent_session(id, delete_files).await;
-        let cancel = self.state.active_cancels.lock().remove(&id);
-        if let Some(token) = cancel {
-            token.cancel();
-        }
         self.state.queue.lock().remove(&id);
 
         if delete_files {
-            let file_path = self
+            self.cancel_active_worker_and_wait(id, "remove").await?;
+            self.stop_torrent_session(id).await;
+            let download = self
                 .state
                 .downloads
                 .read()
                 .get(&id)
-                .and_then(|download| download.kind.is_http().then(|| vec![download.file_path()]))
-                .unwrap_or_default();
-            let torrent_paths = self.selected_torrent_payload_paths(id);
-            for path in file_path.into_iter().chain(torrent_paths) {
-                if let Err(e) = tokio::fs::remove_file(&path).await
-                    && e.kind() != std::io::ErrorKind::NotFound
-                {
-                    return Err(e.into());
-                }
-            }
+                .cloned()
+                .ok_or_else(|| ShioError::Other("download not found".into()))?;
+            remove_delete_targets(delete_targets(&download)).await?;
+        } else {
+            self.cancel_active_worker(id);
+            self.spawn_delete_torrent_session(id);
         }
 
         self.state.downloads.write().remove(&id);
@@ -1160,11 +1199,11 @@ impl DownloadEngine {
                 tracing::warn!(download = %id, "final extract db write dropped: {e}");
             }
         });
-        self.state.active_workers.lock().push(handle);
+        self.push_active_worker(handle);
         Ok(())
     }
 
-    async fn pause_all(&self) -> crate::Result<()> {
+    fn pause_all(&self) -> crate::Result<()> {
         let ids: Vec<_> = self
             .state
             .downloads
@@ -1183,7 +1222,7 @@ impl DownloadEngine {
             .map(|(id, _)| *id)
             .collect();
         for id in ids {
-            self.pause(id).await?;
+            self.pause(id)?;
         }
         Ok(())
     }
@@ -1240,18 +1279,25 @@ impl DownloadEngine {
         Ok(())
     }
 
-    async fn stop_seeding(&self, id: DownloadId) -> crate::Result<()> {
+    fn stop_seeding(&self, id: DownloadId) -> crate::Result<()> {
         let updated = self.mutate_status(id, DownloadStatus::Completed);
-        self.delete_torrent_session(id, false).await;
-        if let Some(token) = self.state.active_cancels.lock().get(&id) {
-            token.cancel();
-        }
+        let (downloaded, total_size) = self
+            .state
+            .downloads
+            .read()
+            .get(&id)
+            .map_or((0, None), |d| (d.downloaded, d.total_size));
         if updated {
             log_db_critical(
-                "update_status completed",
+                "update_final completed",
                 id,
-                self.db.update_status(id, DownloadStatus::Completed, None),
+                self.db
+                    .update_final(id, DownloadStatus::Completed, downloaded, total_size),
             );
+            if let Some(token) = self.state.active_cancels.lock().get(&id) {
+                token.cancel();
+            }
+            self.spawn_delete_torrent_session(id);
             Ok(())
         } else {
             Err(ShioError::Other("download not found".into()))
@@ -1317,7 +1363,7 @@ impl DownloadEngine {
         let handle = tokio::spawn(async move {
             run_package_extract(package_id, target, config, state, db, broadcast, password).await;
         });
-        self.state.active_workers.lock().push(handle);
+        self.push_active_worker(handle);
     }
 
     fn try_start_queued(&self) {
@@ -1395,6 +1441,8 @@ impl DownloadEngine {
         let db = self.db.clone();
         let Some(db_writer) = self.db_writer_sender() else {
             tracing::warn!(download = %id, "http worker skipped: db writer closed");
+            remove_active_cancel_if_current(&self.state, id, cancel);
+            progress_task.abort();
             return;
         };
         let http = self.http.clone();
@@ -1403,11 +1451,18 @@ impl DownloadEngine {
         let worker_token = (**cancel).clone();
 
         let handle = tokio::spawn(async move {
+            let _guard = CancelGuard {
+                state: state.clone(),
+                id,
+                cancel: owned_cancel.clone(),
+            };
             let _slot = slot;
             let result =
                 DownloadWorker::run(download, &config, http, db.clone(), worker_tx, worker_token)
                     .await;
-            let _ = progress_task.await;
+            if let Err(e) = progress_task.await {
+                tracing::warn!(download = %id, "http progress task failed: {e}");
+            }
 
             let current = state
                 .downloads
@@ -1427,7 +1482,11 @@ impl DownloadEngine {
             let (effective_status, downloaded, total_size) = {
                 let mut downloads = state.downloads.write();
                 if let Some(d) = downloads.get_mut(&id) {
-                    let effective_status = effective_http_final_status(d.status, final_status);
+                    let effective_status = effective_http_final_status(
+                        d.status,
+                        final_status,
+                        state.shutdown_token.is_cancelled(),
+                    );
                     d.status = effective_status;
                     d.speed = 0;
                     d.avg_speed = 0;
@@ -1439,7 +1498,14 @@ impl DownloadEngine {
                     ) {
                         d.completed_at = Some(chrono::Utc::now());
                     }
-                    d.error_message = result.as_ref().err().map(ShioError::short_label);
+                    d.error_message = matches!(
+                        effective_status,
+                        DownloadStatus::Error
+                            | DownloadStatus::ExtractError
+                            | DownloadStatus::PasswordRequired
+                    )
+                    .then(|| result.as_ref().err().map(ShioError::short_label))
+                    .flatten();
                     (effective_status, d.downloaded, d.total_size)
                 } else {
                     (final_status, 0, None)
@@ -1468,16 +1534,8 @@ impl DownloadEngine {
                     progress_broadcast.clone(),
                 );
             }
-
-            let mut cancels = state.active_cancels.lock();
-            if cancels
-                .get(&id)
-                .is_some_and(|existing| Arc::ptr_eq(existing, &owned_cancel))
-            {
-                cancels.remove(&id);
-            }
         });
-        self.state.active_workers.lock().push(handle);
+        self.push_active_worker(handle);
     }
 
     fn spawn_torrent_worker(
@@ -1495,13 +1553,19 @@ impl DownloadEngine {
         let state = self.state.clone();
         let Some(db_writer) = self.db_writer_sender() else {
             tracing::warn!(download = %id, "torrent worker skipped: db writer closed");
+            remove_active_cancel_if_current(&self.state, id, cancel);
+            progress_task.abort();
             return;
         };
-        let progress_broadcast = self.progress_tx.clone();
         let owned_cancel = cancel.clone();
         let worker_token = (**cancel).clone();
 
         let handle = tokio::spawn(async move {
+            let _guard = CancelGuard {
+                state: state.clone(),
+                id,
+                cancel: owned_cancel.clone(),
+            };
             let session = match engine.ensure_torrent_session().await {
                 Ok(s) => s,
                 Err(e) => {
@@ -1515,7 +1579,6 @@ impl DownloadEngine {
                     )
                     .await;
                     drop(slot);
-                    state.active_cancels.lock().remove(&id);
                     return;
                 },
             };
@@ -1524,7 +1587,11 @@ impl DownloadEngine {
             let slot_for_closure = slot_holder.clone();
             let on_download_phase_finished: Box<dyn FnOnce() + Send + 'static> =
                 Box::new(move || {
-                    let _ = slot_for_closure.lock().ok().and_then(|mut g| g.take());
+                    if let Ok(mut guard) = slot_for_closure.lock() {
+                        guard.take();
+                    } else {
+                        tracing::warn!(download = %id, "active slot mutex poisoned");
+                    }
                 });
 
             let deps = crate::torrent::TorrentWorkerDeps {
@@ -1537,7 +1604,9 @@ impl DownloadEngine {
             };
 
             let result = crate::torrent::run_torrent(download, deps).await;
-            let _ = progress_task.await;
+            if let Err(e) = progress_task.await {
+                tracing::warn!(download = %id, "torrent progress task failed: {e}");
+            }
 
             if let Ok(mut guard) = slot_holder.lock() {
                 guard.take();
@@ -1547,18 +1616,14 @@ impl DownloadEngine {
             let err_label = result.as_ref().err().map(ShioError::short_label);
 
             finalize_torrent(id, &state, db_writer, final_status, err_label).await;
-
-            let _ = progress_broadcast;
-
-            let mut cancels = state.active_cancels.lock();
-            if cancels
-                .get(&id)
-                .is_some_and(|existing| Arc::ptr_eq(existing, &owned_cancel))
-            {
-                cancels.remove(&id);
-            }
         });
-        self.state.active_workers.lock().push(handle);
+        self.push_active_worker(handle);
+    }
+
+    fn push_active_worker(&self, handle: tokio::task::JoinHandle<()>) {
+        let mut workers = self.state.active_workers.lock();
+        workers.retain(|h| !h.is_finished());
+        workers.push(handle);
     }
 
     fn clone_for_worker(&self) -> EngineWorkerHandle {
@@ -1631,71 +1696,87 @@ impl DownloadEngine {
             .and_then(|download| download.torrent().map(|torrent| torrent.info_hash))
     }
 
-    fn torrent_lookup_id(info_hash: [u8; 20]) -> librqbit::api::TorrentIdOrHash {
-        librqbit::api::TorrentIdOrHash::Hash(librqbit::dht::Id20::new(info_hash))
+    async fn cancel_active_worker_and_wait(
+        &self,
+        id: DownloadId,
+        operation: &'static str,
+    ) -> crate::Result<()> {
+        let cancel = {
+            let active_cancels = self.state.active_cancels.lock();
+            active_cancels.get(&id).cloned()
+        };
+        let Some(cancel) = cancel else {
+            return Ok(());
+        };
+
+        cancel.cancel();
+        let started = std::time::Instant::now();
+        loop {
+            let still_active = {
+                let active_cancels = self.state.active_cancels.lock();
+                active_cancels
+                    .get(&id)
+                    .is_some_and(|active| Arc::ptr_eq(active, &cancel))
+            };
+            if !still_active {
+                return Ok(());
+            }
+            if started.elapsed() >= WORKER_SHUTDOWN_TIMEOUT {
+                return Err(ShioError::Other(format!(
+                    "{operation} timed out waiting for worker cancel"
+                )));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
     }
 
-    async fn pause_torrent_session(&self, id: DownloadId) {
+    fn cancel_active_worker(&self, id: DownloadId) {
+        let cancel = self.state.active_cancels.lock().remove(&id);
+        if let Some(cancel) = cancel {
+            cancel.cancel();
+        }
+    }
+
+    fn spawn_pause_torrent_session(&self, id: DownloadId) {
         let Some(session) = self.state.torrent_session.get().cloned() else {
             return;
         };
         let Some(info_hash) = self.torrent_info_hash(id) else {
             return;
         };
-        let handle = session.get(Self::torrent_lookup_id(info_hash));
-        let Some(handle) = handle else {
-            return;
-        };
-        if let Err(e) = session.pause(&handle).await {
-            tracing::warn!(download = %id, "pause torrent session failed: {e}");
-        }
+        let handle = tokio::spawn(async move {
+            if let Err(e) = crate::torrent::pause_torrent_in_session(&session, info_hash).await {
+                tracing::warn!(download = %id, "pause torrent session failed: {e}");
+            }
+        });
+        self.push_active_worker(handle);
     }
 
-    async fn delete_torrent_session(&self, id: DownloadId, delete_files: bool) {
+    fn spawn_delete_torrent_session(&self, id: DownloadId) {
         let Some(session) = self.state.torrent_session.get().cloned() else {
             return;
         };
         let Some(info_hash) = self.torrent_info_hash(id) else {
             return;
         };
-        let mode = if delete_files {
-            crate::torrent::TorrentSessionStop::DeleteFiles
-        } else {
-            crate::torrent::TorrentSessionStop::KeepFiles
-        };
-        if let Err(e) = crate::torrent::stop_torrent_in_session(&session, info_hash, mode).await {
-            tracing::warn!(download = %id, delete_files, "delete torrent session failed: {e}");
-        }
+        let handle = tokio::spawn(async move {
+            if let Err(e) = crate::torrent::stop_torrent_in_session(&session, info_hash).await {
+                tracing::warn!(download = %id, "delete torrent session failed: {e}");
+            }
+        });
+        self.push_active_worker(handle);
     }
 
-    fn selected_torrent_payload_paths(&self, id: DownloadId) -> Vec<std::path::PathBuf> {
-        let downloads = self.state.downloads.read();
-        let Some(download) = downloads.get(&id) else {
-            return Vec::new();
+    async fn stop_torrent_session(&self, id: DownloadId) {
+        let Some(session) = self.state.torrent_session.get().cloned() else {
+            return;
         };
-        let Some(torrent) = download.torrent() else {
-            return Vec::new();
+        let Some(info_hash) = self.torrent_info_hash(id) else {
+            return;
         };
-        let selected: Vec<_> = torrent.files.iter().filter(|file| file.selected).collect();
-        let files = if selected.is_empty() {
-            torrent.files.iter().collect::<Vec<_>>()
-        } else {
-            selected
-        };
-        files
-            .into_iter()
-            .filter_map(|file| {
-                if let Err(e) = crate::path::validate_relative_path(&file.path) {
-                    tracing::warn!(
-                        download = %id,
-                        path = %file.path.display(),
-                        "skip unsafe torrent payload deletion: {e}"
-                    );
-                    return None;
-                }
-                Some(download.save_path.join(&file.path))
-            })
-            .collect()
+        if let Err(e) = crate::torrent::stop_torrent_in_session(&session, info_hash).await {
+            tracing::warn!(download = %id, "delete torrent session failed: {e}");
+        }
     }
 
     fn spawn_progress_task(
@@ -1733,6 +1814,7 @@ impl DownloadEngine {
                             is_private: snapshot.is_private,
                             files: snapshot.files.clone(),
                             trackers: snapshot.trackers.clone(),
+                            metadata_bytes: snapshot.metadata_bytes.clone(),
                         });
 
                 {
@@ -1747,6 +1829,9 @@ impl DownloadEngine {
                             torrent.is_private = snapshot.is_private;
                             torrent.files.clone_from(&snapshot.files);
                             torrent.trackers.clone_from(&snapshot.trackers);
+                            if let Some(metadata_bytes) = snapshot.metadata_bytes.as_ref() {
+                                torrent.metadata_bytes = Some(metadata_bytes.clone());
+                            }
                         }
                         d.downloaded = progress.downloaded;
                         d.total_size = progress.total_size.or(d.total_size);
@@ -1861,6 +1946,168 @@ fn validate_download_paths(download: &Download) -> crate::Result<()> {
     if let Some(torrent) = download.torrent() {
         for file in &torrent.files {
             crate::path::validate_relative_path(&file.path)?;
+        }
+    }
+    Ok(())
+}
+
+struct DeleteTargets {
+    files: Vec<PathBuf>,
+    empty_dirs: Vec<PathBuf>,
+}
+
+fn delete_targets(download: &Download) -> DeleteTargets {
+    if let Some(http) = download.http() {
+        return http_delete_targets(download, http.subfolder.as_deref());
+    }
+
+    download
+        .torrent()
+        .map_or_else(DeleteTargets::empty, |torrent| {
+            torrent_delete_targets(download, torrent)
+        })
+}
+
+impl DeleteTargets {
+    const fn empty() -> Self {
+        Self {
+            files: Vec::new(),
+            empty_dirs: Vec::new(),
+        }
+    }
+}
+
+fn http_delete_targets(download: &Download, subfolder: Option<&str>) -> DeleteTargets {
+    let mut empty_dirs = subfolder
+        .filter(|subfolder| !subfolder.is_empty())
+        .map(|subfolder| vec![download.save_path.join(subfolder)])
+        .unwrap_or_default();
+    normalize_empty_delete_dirs(&mut empty_dirs, &download.save_path);
+    DeleteTargets {
+        files: vec![download.file_path()],
+        empty_dirs,
+    }
+}
+
+fn torrent_delete_targets(download: &Download, torrent: &TorrentState) -> DeleteTargets {
+    let mut targets = DeleteTargets::empty();
+    for file in selected_torrent_files(torrent) {
+        if let Err(e) = crate::path::validate_relative_path(&file.path) {
+            tracing::warn!(
+                download = %download.id,
+                path = %file.path.display(),
+                "skip unsafe torrent payload cleanup: {e}"
+            );
+            continue;
+        }
+        targets.files.push(download.save_path.join(&file.path));
+        collect_empty_delete_dirs(&mut targets.empty_dirs, &download.save_path, &file.path);
+    }
+    normalize_empty_delete_dirs(&mut targets.empty_dirs, &download.save_path);
+    if torrent_save_path_is_generated_subfolder(download, torrent) {
+        targets.empty_dirs.push(download.save_path.clone());
+        if let Some(parent) = download.save_path.parent() {
+            normalize_empty_delete_dirs(&mut targets.empty_dirs, parent);
+        }
+    }
+    targets
+}
+
+fn selected_torrent_files(torrent: &TorrentState) -> Vec<&TorrentFile> {
+    let selected: Vec<_> = torrent.files.iter().filter(|file| file.selected).collect();
+    if selected.is_empty() {
+        torrent.files.iter().collect::<Vec<_>>()
+    } else {
+        selected
+    }
+}
+
+fn collect_empty_delete_dirs(dirs: &mut Vec<PathBuf>, save_path: &Path, file_path: &Path) {
+    let mut current = save_path.join(file_path);
+    while current.pop() && current != save_path && current.starts_with(save_path) {
+        dirs.push(current.clone());
+    }
+}
+
+fn normalize_empty_delete_dirs(dirs: &mut Vec<PathBuf>, protected_root: &Path) {
+    dirs.retain(|dir| dir != protected_root && dir.starts_with(protected_root));
+    dirs.sort();
+    dirs.dedup();
+    dirs.sort_by_key(|dir| std::cmp::Reverse(dir.components().count()));
+}
+
+fn torrent_save_path_is_generated_subfolder(download: &Download, torrent: &TorrentState) -> bool {
+    let Some(dir_name) = download
+        .save_path
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+    else {
+        return false;
+    };
+
+    torrent_generated_subfolder_name(download, torrent).is_some_and(|name| name == dir_name)
+}
+
+fn torrent_generated_subfolder_name(download: &Download, torrent: &TorrentState) -> Option<String> {
+    let selected = selected_torrent_files(torrent);
+    if selected.is_empty() {
+        return None;
+    }
+    if selected.len() == 1 {
+        return selected[0]
+            .path
+            .file_stem()
+            .and_then(std::ffi::OsStr::to_str)
+            .map(crate::filename::sanitize_filename)
+            .filter(|name| !name.is_empty());
+    }
+
+    torrent_shared_folder_name(&selected).or_else(|| {
+        let name = crate::filename::sanitize_filename(&download.filename);
+        (!name.is_empty()).then_some(name)
+    })
+}
+
+fn torrent_shared_folder_name(files: &[&TorrentFile]) -> Option<String> {
+    let mut components = files
+        .iter()
+        .map(|file| file.path.components().collect::<Vec<_>>());
+    let first = components.next()?;
+    let shared = components.fold(first, |shared, parts| {
+        shared
+            .into_iter()
+            .zip(parts)
+            .take_while(|(left, right)| left == right)
+            .map(|(component, _)| component)
+            .collect()
+    });
+
+    let mut out = PathBuf::new();
+    for component in shared {
+        out.push(component.as_os_str());
+    }
+    out.file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .map(crate::filename::sanitize_filename)
+        .filter(|name| !name.is_empty())
+}
+
+async fn remove_delete_targets(targets: DeleteTargets) -> crate::Result<()> {
+    for file in targets.files {
+        if let Err(e) = tokio::fs::remove_file(&file).await
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            return Err(e.into());
+        }
+    }
+    for dir in targets.empty_dirs {
+        if let Err(e) = tokio::fs::remove_dir(&dir).await
+            && !matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
+            )
+        {
+            return Err(e.into());
         }
     }
     Ok(())
@@ -2004,7 +2251,15 @@ const fn torrent_worker_exit_status(
 const fn effective_http_final_status(
     current: DownloadStatus,
     final_status: DownloadStatus,
+    shutdown_cancelled: bool,
 ) -> DownloadStatus {
+    if matches!(final_status, DownloadStatus::Cancelled)
+        && (matches!(current, DownloadStatus::Queued)
+            || (shutdown_cancelled && current.is_active()))
+    {
+        return DownloadStatus::Queued;
+    }
+
     if matches!(final_status, DownloadStatus::Error)
         || matches!(
             final_status,
@@ -2012,7 +2267,7 @@ const fn effective_http_final_status(
                 | DownloadStatus::ExtractError
                 | DownloadStatus::PasswordRequired
         )
-        || !matches!(current, DownloadStatus::Queued | DownloadStatus::Starting)
+        || !matches!(current, DownloadStatus::Queued)
     {
         return final_status;
     }
@@ -2058,6 +2313,12 @@ async fn finalize_torrent(
         let mut downloads = state.downloads.write();
         if let Some(d) = downloads.get_mut(&id) {
             let effective_status = match (d.status, final_status) {
+                (DownloadStatus::Queued, DownloadStatus::Cancelled) => DownloadStatus::Queued,
+                (status, DownloadStatus::Cancelled)
+                    if status.is_active() && state.shutdown_token.is_cancelled() =>
+                {
+                    DownloadStatus::Queued
+                },
                 (DownloadStatus::Paused, _) => DownloadStatus::Paused,
                 (DownloadStatus::Cancelled, _) => DownloadStatus::Cancelled,
                 (DownloadStatus::Completed, _) => DownloadStatus::Completed,
@@ -2107,7 +2368,11 @@ async fn finalize_torrent(
     }
 }
 
-fn restore_downloads(state: &EngineState, restored: Vec<Download>) -> (usize, usize) {
+fn restore_downloads(
+    state: &EngineState,
+    restored: Vec<Download>,
+) -> crate::Result<(usize, usize)> {
+    reject_duplicate_restored_torrents(&restored)?;
     let mut downloads = state.downloads.write();
     let mut queue = state.queue.lock();
     let mut requeued = 0;
@@ -2133,7 +2398,25 @@ fn restore_downloads(state: &EngineState, restored: Vec<Download>) -> (usize, us
         }
         downloads.insert(d.id, d);
     }
-    (total, requeued)
+    Ok((total, requeued))
+}
+
+fn reject_duplicate_restored_torrents(restored: &[Download]) -> crate::Result<()> {
+    let mut seen = HashSet::new();
+    for download in restored {
+        if download.status.is_terminal() {
+            continue;
+        }
+        let Some(torrent) = download.torrent() else {
+            continue;
+        };
+        if !seen.insert(torrent.info_hash) {
+            return Err(ShioError::Other(
+                "database contains duplicate torrent info hashes".into(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2301,7 +2584,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn remove_torrent_with_delete_files_deletes_selected_payload_without_session() {
+    async fn remove_torrent_with_delete_files_preserves_deselected_payload() {
         let tmp = tempfile::tempdir().unwrap();
         let db = Database::in_memory().unwrap();
         let (engine, _rx) = DownloadEngine::with_database(AppConfig::default(), db).unwrap();
@@ -2334,7 +2617,105 @@ mod tests {
 
         assert!(!selected.exists());
         assert!(deselected.exists());
+        assert!(tmp.path().join("release").exists());
         assert!(engine.db.get(id).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn remove_http_with_delete_files_preserves_unowned_subfolder_contents() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Database::in_memory().unwrap();
+        let (engine, _rx) = DownloadEngine::with_database(AppConfig::default(), db).unwrap();
+        let mut download = Download::new(
+            "https://example.com/payload.bin".to_string(),
+            tmp.path().to_path_buf(),
+        );
+        download.filename = "payload.bin".to_string();
+        download.http_mut().unwrap().subfolder = Some("release".to_string());
+        let id = download.id;
+        let payload = download.file_path();
+        let leftover = tmp.path().join("release/extracted.bin");
+        tokio::fs::create_dir_all(payload.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&payload, b"payload").await.unwrap();
+        tokio::fs::write(&leftover, b"leftover").await.unwrap();
+        engine.add(download).unwrap();
+
+        engine.remove(id, true).await.unwrap();
+
+        assert!(!payload.exists());
+        assert!(leftover.exists());
+        assert!(tmp.path().join("release").exists());
+        assert!(tmp.path().exists());
+    }
+
+    #[tokio::test]
+    async fn remove_torrent_with_delete_files_removes_generated_save_folder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Database::in_memory().unwrap();
+        let (engine, _rx) = DownloadEngine::with_database(AppConfig::default(), db).unwrap();
+        let save_path = tmp.path().join("movie");
+        let mut download = torrent_download(save_path.clone());
+        download.filename = "movie.mkv".to_string();
+        let payload = save_path.join("movie.mkv");
+        tokio::fs::create_dir_all(&save_path).await.unwrap();
+        tokio::fs::write(&payload, b"movie").await.unwrap();
+        download.torrent_mut().unwrap().files = vec![TorrentFile {
+            path: std::path::PathBuf::from("movie.mkv"),
+            size: 5,
+            downloaded: 5,
+            selected: true,
+        }];
+        let id = download.id;
+        engine.add(download).unwrap();
+
+        engine.remove(id, true).await.unwrap();
+
+        assert!(!payload.exists());
+        assert!(!save_path.exists());
+        assert!(tmp.path().exists());
+    }
+
+    #[tokio::test]
+    async fn remove_torrent_with_delete_files_removes_empty_payload_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Database::in_memory().unwrap();
+        let (engine, _rx) = DownloadEngine::with_database(AppConfig::default(), db).unwrap();
+        let mut download = torrent_download(tmp.path().to_path_buf());
+        let first = tmp.path().join("release/cd1/first.bin");
+        let second = tmp.path().join("release/cd2/second.bin");
+        tokio::fs::create_dir_all(first.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(second.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&first, b"first").await.unwrap();
+        tokio::fs::write(&second, b"second").await.unwrap();
+        download.torrent_mut().unwrap().files = vec![
+            TorrentFile {
+                path: std::path::PathBuf::from("release/cd1/first.bin"),
+                size: 5,
+                downloaded: 5,
+                selected: true,
+            },
+            TorrentFile {
+                path: std::path::PathBuf::from("release/cd2/second.bin"),
+                size: 6,
+                downloaded: 6,
+                selected: true,
+            },
+        ];
+        let id = download.id;
+        engine.add(download).unwrap();
+
+        engine.remove(id, true).await.unwrap();
+
+        assert!(!first.exists());
+        assert!(!second.exists());
+        assert!(!tmp.path().join("release").exists());
+        assert!(tmp.path().exists());
     }
 
     #[tokio::test]
@@ -2365,6 +2746,124 @@ mod tests {
         assert!(ack.await.unwrap().is_err());
         assert!(engine.downloads().iter().any(|download| download.id == id));
         assert!(engine.db.get(id).unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn pause_command_ack_does_not_wait_for_full_db_writer_queue() {
+        let db = Database::in_memory().unwrap();
+        let (mut engine, _rx) = DownloadEngine::with_database(AppConfig::default(), db).unwrap();
+        let mut download = Download::new(
+            "https://example.com/payload.bin".to_string(),
+            std::path::PathBuf::from("/tmp"),
+        );
+        download.filename = "payload.bin".to_string();
+        let id = download.id;
+        engine.add(download).unwrap();
+
+        let (db_writer_tx, _db_writer_rx) = mpsc::channel(DB_WRITER_CAPACITY);
+        for _ in 0..DB_WRITER_CAPACITY {
+            db_writer_tx
+                .send(DbWrite::Progress {
+                    id,
+                    downloaded: 0,
+                    total_size: None,
+                })
+                .await
+                .unwrap();
+        }
+        engine.db_writer_tx = Some(db_writer_tx);
+        let (reply, ack) = oneshot::channel();
+
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            engine.handle_command(EngineCommand::Pause { id, reply }),
+        )
+        .await
+        .expect("pause command should not wait for db writer capacity");
+
+        assert!(ack.await.unwrap().is_ok());
+        assert_eq!(
+            engine
+                .downloads()
+                .into_iter()
+                .find(|download| download.id == id)
+                .map(|download| download.status),
+            Some(DownloadStatus::Paused)
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_command_ack_does_not_wait_for_active_worker_to_finish() {
+        let db = Database::in_memory().unwrap();
+        let (engine, _rx) = DownloadEngine::with_database(AppConfig::default(), db).unwrap();
+        let mut download = Download::new(
+            "https://example.com/payload.bin".to_string(),
+            std::path::PathBuf::from("/tmp"),
+        );
+        download.filename = "payload.bin".to_string();
+        let id = download.id;
+        engine.add(download).unwrap();
+        engine
+            .state
+            .active_cancels
+            .lock()
+            .insert(id, Arc::new(CancellationToken::new()));
+        let (reply, ack) = oneshot::channel();
+
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            engine.handle_command(EngineCommand::Remove {
+                id,
+                delete_files: false,
+                reply,
+            }),
+        )
+        .await
+        .expect("remove command should not wait for worker shutdown");
+
+        assert!(ack.await.unwrap().is_ok());
+        assert!(engine.db.get(id).unwrap().is_none());
+        assert!(!engine.state.active_cancels.lock().contains_key(&id));
+    }
+
+    #[tokio::test]
+    async fn remove_with_delete_files_waits_for_active_worker_to_finish() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Database::in_memory().unwrap();
+        let (engine, _rx) = DownloadEngine::with_database(AppConfig::default(), db).unwrap();
+        let mut download = Download::new(
+            "https://example.com/payload.bin".to_string(),
+            tmp.path().to_path_buf(),
+        );
+        download.filename = "payload.bin".to_string();
+        let id = download.id;
+        let payload = download.file_path();
+        tokio::fs::write(&payload, b"payload").await.unwrap();
+        engine.add(download).unwrap();
+
+        let token = Arc::new(CancellationToken::new());
+        engine.state.active_cancels.lock().insert(id, token.clone());
+        let state = engine.state.clone();
+        let worker_payload = payload.clone();
+        let worker = tokio::spawn(async move {
+            token.cancelled().await;
+            assert!(worker_payload.exists());
+            remove_active_cancel_if_current(&state, id, &token);
+        });
+        let (reply, ack) = oneshot::channel();
+
+        engine
+            .handle_command(EngineCommand::Remove {
+                id,
+                delete_files: true,
+                reply,
+            })
+            .await;
+
+        worker.await.unwrap();
+        assert!(ack.await.unwrap().is_ok());
+        assert!(!payload.exists());
+        assert!(engine.db.get(id).unwrap().is_none());
     }
 
     #[tokio::test]
@@ -2556,7 +3055,7 @@ mod tests {
         let id = download.id;
         download.status = DownloadStatus::Seeding;
 
-        let (_, requeued) = restore_downloads(&state, vec![download]);
+        let (_, requeued) = restore_downloads(&state, vec![download]).expect("restore");
 
         assert_eq!(requeued, 1);
         assert_eq!(
@@ -2591,7 +3090,7 @@ mod tests {
         let id = download.id;
         download.status = DownloadStatus::Completed;
 
-        let (_, requeued) = restore_downloads(&state, vec![download]);
+        let (_, requeued) = restore_downloads(&state, vec![download]).expect("restore");
 
         assert_eq!(requeued, 0);
         assert_eq!(
@@ -2627,7 +3126,7 @@ mod tests {
         download.status = DownloadStatus::Seeding;
         download.torrent_mut().expect("torrent").seed_elapsed_secs = 3600;
 
-        let (_, requeued) = restore_downloads(&state, vec![download]);
+        let (_, requeued) = restore_downloads(&state, vec![download]).expect("restore");
 
         assert_eq!(requeued, 1);
         assert_eq!(

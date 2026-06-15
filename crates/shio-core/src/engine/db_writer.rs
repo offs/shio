@@ -29,6 +29,7 @@ pub(super) enum DbWrite {
         is_private: bool,
         files: Vec<TorrentFile>,
         trackers: Vec<String>,
+        metadata_bytes: Option<Vec<u8>>,
     },
     TorrentRuntime {
         id: DownloadId,
@@ -112,11 +113,18 @@ fn apply_db_write(db: &Database, write: DbWrite) {
             is_private,
             files,
             trackers,
+            metadata_bytes,
         } => {
             log_db_critical(
                 "update_torrent_metadata",
                 id,
-                db.update_torrent_metadata(id, is_private, &files, &trackers),
+                db.update_torrent_metadata(
+                    id,
+                    is_private,
+                    &files,
+                    &trackers,
+                    metadata_bytes.as_deref(),
+                ),
             );
         },
         DbWrite::TorrentRuntime {

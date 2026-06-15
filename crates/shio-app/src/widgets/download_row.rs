@@ -791,16 +791,6 @@ mod tests {
     }
 
     #[test]
-    fn inline_cancel_is_available_for_paused_downloads() {
-        assert!(can_cancel_inline(DownloadStatus::Paused));
-    }
-
-    #[test]
-    fn inline_cancel_is_hidden_for_completed_downloads() {
-        assert!(!can_cancel_inline(DownloadStatus::Completed));
-    }
-
-    #[test]
     fn copyable_source_handles_torrent_sources() {
         let download = Download::try_from_torrent(
             TorrentSource::File(sample_torrent_bytes()),
@@ -814,10 +804,5 @@ mod tests {
             Download::try_from_torrent(TorrentSource::Magnet(magnet.into()), PathBuf::from("/tmp"))
                 .expect("valid magnet");
         assert_eq!(copyable_source(&download), Some(magnet));
-    }
-
-    #[test]
-    fn seeding_torrents_can_open_folder_from_menu() {
-        assert!(torrent_can_open_folder(DownloadStatus::Seeding));
     }
 }

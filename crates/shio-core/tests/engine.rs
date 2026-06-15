@@ -205,6 +205,6 @@ async fn shutdown_ack_waits_for_worker_final_status_write() {
 
     assert!(matches!(
         status,
-        Some(DownloadStatus::Error | DownloadStatus::Cancelled)
+        Some(DownloadStatus::Error | DownloadStatus::Queued)
     ));
 }

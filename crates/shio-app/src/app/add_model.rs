@@ -40,9 +40,9 @@ pub(crate) fn parse_add_urls(text: &str) -> ParsedAddUrls {
             parsed.entries.push(line.to_string());
             parsed.magnet_count += 1;
             parsed.magnets.push(line.to_string());
-            parsed.entry_previews.push("magnet link".to_string());
+            parsed.entry_previews.push("magnet".to_string());
             if parsed.preview.len() < ADD_URL_PREVIEW_LIMIT {
-                parsed.preview.push("magnet link".to_string());
+                parsed.preview.push("magnet".to_string());
             }
             continue;
         }
@@ -534,7 +534,7 @@ mod tests {
         assert_eq!(parsed.magnet_count, 1);
         assert_eq!(parsed.preview[0], "archive.part01.rar");
         assert_eq!(parsed.preview[1], "archive.part02.rar");
-        assert_eq!(parsed.preview[2], "magnet link");
+        assert_eq!(parsed.preview[2], "magnet");
         assert!(parsed.has_archive_url);
         assert_eq!(parsed.suggested_subfolder.as_deref(), Some("archive"));
     }
@@ -576,7 +576,7 @@ mod tests {
         assert_eq!(parsed.magnet_count, 1);
         assert_eq!(
             parsed.preview,
-            vec!["download".to_string(), "magnet link".to_string()]
+            vec!["download".to_string(), "magnet".to_string()]
         );
     }
 

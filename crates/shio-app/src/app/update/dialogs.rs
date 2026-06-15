@@ -526,7 +526,7 @@ impl Shio {
             .iter()
             .map(|entry| {
                 if is_magnet(entry) {
-                    "magnet link".to_string()
+                    "magnet".to_string()
                 } else {
                     http_preview_name(entry, &self.add_http_previews)
                         .unwrap_or_else(|| shio_core::extract_filename(entry, None))
@@ -562,7 +562,7 @@ impl Shio {
             .iter()
             .map(|entry| {
                 if is_magnet(entry) {
-                    "magnet link".to_string()
+                    "magnet".to_string()
                 } else {
                     http_preview_name(entry, &self.add_http_previews)
                         .unwrap_or_else(|| shio_core::extract_filename(entry, None))

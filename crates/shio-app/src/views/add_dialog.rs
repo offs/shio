@@ -97,13 +97,13 @@ fn source_summary(http_count: usize, magnet_count: usize, torrent_file_count: us
             }
             if magnets > 0 {
                 parts.push(format!(
-                    "{magnets} magnet{}",
+                    "{magnets} magnet link{}",
                     if magnets == 1 { "" } else { "s" }
                 ));
             }
             if torrents > 0 {
                 parts.push(format!(
-                    "{torrents} torrent{}",
+                    "{torrents} torrent file{}",
                     if torrents == 1 { "" } else { "s" }
                 ));
             }
@@ -179,7 +179,11 @@ fn result_summary(
         } else {
             "sources"
         };
-        let selected_file_label = if selected == 1 { "file" } else { "files" };
+        let selected_file_label = if selected == 1 {
+            "torrent file"
+        } else {
+            "torrent files"
+        };
         if url_sources > 0 {
             return format!(
                 "adds {url_sources} {source_label} and {selected} selected {selected_file_label} to {destination}"
@@ -210,7 +214,10 @@ fn add_button_label_for_context(
     }
     if torrent_count > 0 && addable_url_count == 0 {
         if selected_torrent_files > 0 {
-            return "add selected files".to_string();
+            if selected_torrent_files == 1 {
+                return "add torrent file".to_string();
+            }
+            return "add torrent files".to_string();
         }
         return "add torrent".to_string();
     }
@@ -366,7 +373,7 @@ fn torrent_meta_summary(torrents: &[(usize, &AddTorrentFile)]) -> Option<String>
     };
     let trackers = torrent.trackers.len();
     Some(format!(
-        "{privacy} · {trackers} tracker{}",
+        "{privacy} torrent · {trackers} tracker{}",
         if trackers == 1 { "" } else { "s" }
     ))
 }
@@ -404,7 +411,7 @@ fn torrent_review<'a>(
 
     let meta = torrent_meta_summary(&visible_torrents);
     let mut header = column![
-        text("files").size(12).color(p.text_primary),
+        text("torrent files").size(12).color(p.text_primary),
         Space::new().height(4),
         text(format!(
             "{selected_count}/{total_count} selected · {selected_size}"
@@ -418,7 +425,7 @@ fn torrent_review<'a>(
 
     let search: Element<'_, Message> =
         if total_count > TORRENT_SEARCH_THRESHOLD || !search_query.trim().is_empty() {
-            let input = text_input("filter files", search_query)
+            let input = text_input("filter torrent files", search_query)
                 .id(crate::app::ADD_TORRENT_SEARCH_INPUT_ID.clone())
                 .on_input(Message::AddTorrentSearchChanged)
                 .style(style::input(p))
@@ -460,14 +467,14 @@ fn torrent_review<'a>(
             ))
             .size(11)
             .color(p.text_tertiary),
-            button(text("all").size(11))
+            button(text("select all").size(11))
                 .style(style::btn_ghost(p))
                 .on_press(Message::AddTorrentFilesSelectionChanged {
                     torrent_index,
                     selected: true,
                 })
                 .padding([4, 8]),
-            button(text("none").size(11))
+            button(text("clear").size(11))
                 .style(style::btn_ghost(p))
                 .on_press(Message::AddTorrentFilesSelectionChanged {
                     torrent_index,
@@ -594,7 +601,7 @@ fn sources_pane<'a>(
 ) -> Element<'a, Message> {
     let url_input = text_editor(urls)
         .on_action(Message::AddUrlsAction)
-        .placeholder("urls or magnets, one per line")
+        .placeholder("urls or magnet links, one per line")
         .style(style::text_editor_style(p))
         .size(13)
         .padding([8, 12])
@@ -616,7 +623,7 @@ fn sources_pane<'a>(
         label_text("sources", p),
         url_input,
         row![
-            helper_text("one per line, or drop torrent files.", p),
+            helper_text("paste links here, or drop torrent files.", p),
             Space::new().width(Length::Fill),
             torrent_picker,
         ]
@@ -784,7 +791,7 @@ fn source_inbox<'a>(
     }
 
     column![
-        label_text("source inbox", p),
+        label_text("sources", p),
         scrollable(container(rows).padding([8, 10]))
             .height(Length::Fixed(SOURCE_INBOX_HEIGHT))
             .style(style::scrollable_style(p)),
@@ -803,7 +810,7 @@ fn source_status_label(
             .iter()
             .find(|preview| preview.magnet == url)
             .map_or("ready", |preview| match &preview.state {
-                AddMagnetPreviewState::Resolving => "fetching metadata",
+                AddMagnetPreviewState::Resolving => "getting file list",
                 AddMagnetPreviewState::Failed { .. } => "file list unavailable",
             });
     }
@@ -827,7 +834,7 @@ fn url_display_name(url: &str, url_entries: &[String], url_preview: &[String]) -
         .cloned()
         .unwrap_or_else(|| {
             if url.trim_start().to_ascii_lowercase().starts_with("magnet:") {
-                "magnet link".to_string()
+                "magnet".to_string()
             } else {
                 shio_core::extract_filename(url, None)
             }
@@ -846,7 +853,7 @@ fn url_status_detail(
             .map_or_else(
                 || "ready".to_string(),
                 |preview| match &preview.state {
-                    AddMagnetPreviewState::Resolving => "fetching metadata".to_string(),
+                    AddMagnetPreviewState::Resolving => "getting file list".to_string(),
                     AddMagnetPreviewState::Failed { message } if message.is_empty() => {
                         "file list unavailable".to_string()
                     },

@@ -87,9 +87,6 @@ jobs:
           $msiVersion = "${{ steps.version.outputs.msi_version }}"
           New-Item -ItemType Directory -Force -Path ..\..\dist | Out-Null
           wix -ext WixToolset.UI.wixext build -pdbtype none -arch x64 -d PackageVersion=$msiVersion -d CargoTargetBinDir=..\..\target\release wix\main.wxs -o "..\..\dist\shio-$version-windows-x64.msi"
-          Get-FileHash "..\..\dist\shio-$version-windows-x64.msi" -Algorithm SHA256 |
-            ForEach-Object { "$($_.Hash.ToLowerInvariant())  shio-$version-windows-x64.msi" } |
-            Set-Content "..\..\dist\shio-$version-windows-x64.msi.sha256"
       - name: Zip
         shell: pwsh
         run: |
@@ -100,16 +97,12 @@ jobs:
           Copy-Item README.md "$portable/README.md"
           Copy-Item LICENSE "$portable/LICENSE"
           Compress-Archive -Path "$portable/*" -DestinationPath "$portable.zip" -Force
-          Get-FileHash "$portable.zip" -Algorithm SHA256 |
-            ForEach-Object { "$($_.Hash.ToLowerInvariant())  shio-$version-windows-x64.zip" } |
-            Set-Content "$portable.zip.sha256"
       - name: Attest artifacts
         uses: actions/attest@281a49d4cbb0a72c9575a50d18f6deb515a11deb
         with:
           subject-path: |
             dist/*.msi
             dist/*.zip
-            dist/*.sha256
       - name: Publish
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65
         with:
@@ -121,4 +114,3 @@ jobs:
           files: |
             dist/*.msi
             dist/*.zip
-            dist/*.sha256

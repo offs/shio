@@ -292,7 +292,10 @@ impl DownloadWorker {
         let http = http_state(&download)?;
         let network_url = url_without_fragment(&http.url);
         let headers = http.headers.clone();
-        let probe = probe_server(&client, &network_url, &headers).await?;
+        let probe = tokio::select! {
+            p = probe_server(&client, &network_url, &headers) => p?,
+            () = cancel.cancelled() => return Err(ShioError::Cancelled),
+        };
         tracing::debug!(
             "probe: url={} content_type={:?} content_length={:?} accept_ranges={} attachment={}",
             probe.final_url,

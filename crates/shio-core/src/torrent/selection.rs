@@ -68,5 +68,6 @@ pub(crate) fn snapshot_with_selection(
         is_private: snapshot.is_private,
         files,
         trackers: snapshot.trackers.clone(),
+        metadata_bytes: snapshot.metadata_bytes.clone(),
     }
 }
