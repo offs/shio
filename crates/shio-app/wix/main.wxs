@@ -50,18 +50,33 @@
                       DiskId="1"
                       Source="wix\License.rtf"
                       KeyPath="yes" />
+                <File Id="ThirdPartyLicensesFile"
+                      DiskId="1"
+                      Source="..\..\packaging\THIRD_PARTY_LICENSES.md" />
             </Component>
             <Component Directory="ApplicationProgramsFolder">
                 <RemoveFolder Id="ApplicationProgramsFolder"
                               On="uninstall" />
-                <RegistryValue Root="HKCU"
-                               Key="Software\Shio"
+                <RegistryValue Root="HKLM"
+                               Key="Software\Shio\Installer"
                                Name="Installed"
                                Type="integer"
                                Value="1"
                                KeyPath="yes" />
             </Component>
         </ComponentGroup>
+
+        <CustomAction Id="UnregisterAssociations"
+                      FileRef="ShioExe"
+                      ExeCommand="--unregister-associations"
+                      Execute="deferred"
+                      Impersonate="yes"
+                      Return="ignore" />
+        <InstallExecuteSequence>
+            <Custom Action="UnregisterAssociations"
+                    Before="RemoveFiles"
+                    Condition='REMOVE="ALL" AND NOT UPGRADINGPRODUCTCODE' />
+        </InstallExecuteSequence>
 
         <Icon Id="shio.ico"
               SourceFile="..\..\assets\icons\icon.ico" />

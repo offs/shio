@@ -3,19 +3,14 @@ mod row;
 mod schema;
 
 use self::codec::{
-    decode_bool_i32, decode_u32, encode_i32, encode_i64, encode_json, parse_optional_ts,
-    parse_required_ts,
+    decode_bool, decode_int, decode_json, decode_ts, decode_uuid, encode_json, encode_u64, invalid,
 };
-#[cfg(test)]
-use self::row::DOWNLOAD_SELECT;
-use self::row::{DOWNLOAD_SELECT_ALL, row_to_chunk, row_to_download};
-use self::schema::{SCHEMA, SCHEMA_VERSION, require_current_schema, set_schema_version};
+use self::row::{DOWNLOAD_SELECT, optional_ts, row_to_chunk, row_to_download};
 use crate::error::Result;
 use crate::path::path_to_utf8;
 use crate::types::{
-    ArchivePackage, ChunkInfo, ChunkStatus, Download, DownloadId, DownloadKind, DownloadStatus,
-    PackageExtractState, PackageId, PackageItem, PackageKind, TorrentFile, TorrentSource,
-    is_sensitive_header,
+    ArchivePackage, ChunkInfo, Download, DownloadId, DownloadKind, PackageExtractState, PackageId,
+    PackageItem, TorrentSource, TorrentStats, is_sensitive_header,
 };
 use parking_lot::Mutex;
 use rusqlite::{Connection, Transaction, params};
@@ -26,33 +21,52 @@ pub(crate) struct Database {
     conn: Mutex<Connection>,
 }
 
+#[derive(Debug)]
+pub(crate) struct DeleteJournal {
+    pub(crate) download_id: DownloadId,
+    pub(crate) protected_root: PathBuf,
+    pub(crate) quarantine_root: PathBuf,
+    pub(crate) moved: Vec<(PathBuf, PathBuf)>,
+}
+
 impl Database {
     pub(crate) fn open(path: &Path) -> Result<Self> {
-        let allow_empty_schema = path == Path::new(":memory:")
-            || !path.exists()
-            || std::fs::metadata(path).is_ok_and(|metadata| metadata.len() == 0);
+        if let Ok(metadata) = std::fs::symlink_metadata(path)
+            && (!metadata.is_file() || metadata.file_type().is_symlink())
+        {
+            return Err(crate::ShioError::Other(
+                "database path is not a real file".into(),
+            ));
+        }
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let conn = Connection::open(path)?;
-        conn.execute_batch(
-            "PRAGMA journal_mode=WAL;
-             PRAGMA synchronous=NORMAL;
-             PRAGMA foreign_keys=ON;
-             PRAGMA busy_timeout=5000;
-             PRAGMA temp_store=MEMORY;",
-        )?;
-        require_current_schema(&conn, allow_empty_schema)?;
-        conn.execute_batch(SCHEMA)?;
-        set_schema_version(&conn, SCHEMA_VERSION)?;
-        Ok(Self {
-            conn: Mutex::new(conn),
-        })
+        #[cfg(unix)]
+        restrict_to_owner(path)?;
+        Self::init(conn, !cfg!(test))
     }
 
     #[cfg(test)]
     pub(crate) fn in_memory() -> Result<Self> {
-        Self::open(Path::new(":memory:"))
+        Self::init(Connection::open_in_memory()?, false)
+    }
+
+    fn init(mut conn: Connection, exclusive: bool) -> Result<Self> {
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL;
+             PRAGMA synchronous=FULL;
+             PRAGMA foreign_keys=ON;
+             PRAGMA busy_timeout=5000;
+             PRAGMA temp_store=MEMORY;",
+        )?;
+        if exclusive {
+            conn.execute_batch("PRAGMA locking_mode=EXCLUSIVE; BEGIN IMMEDIATE; COMMIT;")?;
+        }
+        schema::ensure_schema(&mut conn)?;
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
     }
 
     pub(crate) fn checkpoint(&self) -> Result<()> {
@@ -62,149 +76,94 @@ impl Database {
         Ok(())
     }
 
-    pub(crate) fn insert_download(&self, d: &Download) -> Result<()> {
+    fn write(&self, f: impl FnOnce(&Transaction<'_>) -> Result<()>) -> Result<()> {
         let mut conn = self.conn.lock();
         let tx = conn.transaction()?;
-        insert_download_tx(&tx, d)?;
+        f(&tx)?;
         tx.commit()?;
         Ok(())
     }
 
-    pub(crate) fn update_status(
+    fn execute(&self, sql: &str, params: impl rusqlite::Params) -> Result<()> {
+        self.conn.lock().execute(sql, params)?;
+        Ok(())
+    }
+
+    pub(crate) fn insert_download(&self, download: &Download) -> Result<()> {
+        self.write(|tx| insert_download(tx, download))
+    }
+
+    pub(crate) fn insert_package(
         &self,
-        id: DownloadId,
-        status: DownloadStatus,
-        error: Option<&str>,
+        package: &ArchivePackage,
+        downloads: &[Download],
     ) -> Result<()> {
-        self.conn.lock().execute(
-            "UPDATE downloads SET status=?2, error_msg=?3 WHERE id=?1",
-            params![id.0.to_string(), status.as_str(), error],
-        )?;
-        Ok(())
+        self.write(|tx| {
+            tx.execute(
+                "INSERT INTO packages (
+                    id, name, save_path, auto_extract, extract_state,
+                    error_msg, created_at, completed_at, pinned
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    package.id.0.to_string(),
+                    package.name,
+                    path_to_utf8("packages.save_path", &package.save_path)?,
+                    package.auto_extract,
+                    package.extract_state.as_str(),
+                    package.error_message,
+                    package.created_at.to_rfc3339(),
+                    package.completed_at.map(|t| t.to_rfc3339()),
+                    package.pinned,
+                ],
+            )?;
+            for download in downloads {
+                insert_download(tx, download)?;
+            }
+            for item in &package.items {
+                tx.execute(
+                    "INSERT INTO package_items (package_id, download_id, position, part_number)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![
+                        package.id.0.to_string(),
+                        item.download_id.0.to_string(),
+                        item.position,
+                        item.part_number,
+                    ],
+                )?;
+            }
+            Ok(())
+        })
     }
 
-    pub(crate) fn update_final(
-        &self,
-        id: DownloadId,
-        status: DownloadStatus,
-        downloaded: u64,
-        total_size: Option<u64>,
-    ) -> Result<()> {
-        let downloaded = encode_i64("downloads.downloaded", downloaded)?;
-        let total_size = total_size
-            .map(|value| encode_i64("downloads.total_size", value))
-            .transpose()?;
-        self.conn.lock().execute(
-            "UPDATE downloads SET status=?2, downloaded=?3, total_size=?4 WHERE id=?1",
-            params![id.0.to_string(), status.as_str(), downloaded, total_size,],
-        )?;
-        Ok(())
-    }
-
-    pub(crate) fn update_metadata(
-        &self,
-        id: DownloadId,
-        filename: &str,
-        save_path: &Path,
-    ) -> Result<()> {
-        self.conn.lock().execute(
-            "UPDATE downloads SET filename=?2, save_path=?3 WHERE id=?1",
-            params![
-                id.0.to_string(),
-                filename,
-                path_to_utf8("downloads.save_path", save_path)?,
-            ],
-        )?;
-        Ok(())
-    }
-
-    pub(crate) fn update_torrent_runtime(
-        &self,
-        id: DownloadId,
-        uploaded: u64,
-        ratio: f32,
-        seed_elapsed_secs: u64,
-    ) -> Result<()> {
-        let uploaded = encode_i64("torrent_state.uploaded", uploaded)?;
-        let seed_elapsed_secs = encode_i64("torrent_state.seed_elapsed_secs", seed_elapsed_secs)?;
-        let conn = self.conn.lock();
-        conn.execute(
-            "UPDATE torrent_state
-             SET uploaded = ?2, ratio = ?3, seed_elapsed_secs = ?4
-             WHERE download_id = ?1",
-            params![
-                id.0.to_string(),
-                uploaded,
-                f64::from(ratio),
-                seed_elapsed_secs,
-            ],
-        )?;
-        Ok(())
-    }
-
-    pub(crate) fn update_torrent_metadata(
-        &self,
-        id: DownloadId,
-        is_private: bool,
-        files: &[TorrentFile],
-        trackers: &[String],
-        metadata_bytes: Option<&[u8]>,
-    ) -> Result<()> {
-        let files_json = encode_json("torrent_state.files_json", files)?;
-        let trackers_json = encode_json("torrent_state.trackers_json", trackers)?;
-        self.conn.lock().execute(
-            "UPDATE torrent_state
-             SET is_private = ?2,
-                 files_json = ?3,
-                 trackers_json = ?4,
-                 metadata_bytes = COALESCE(?5, metadata_bytes)
-             WHERE download_id = ?1",
-            params![
-                id.0.to_string(),
-                i32::from(is_private),
-                files_json,
-                trackers_json,
-                metadata_bytes,
-            ],
-        )?;
-        Ok(())
-    }
-
-    pub(crate) fn update_pin(&self, id: DownloadId, pinned: bool) -> Result<()> {
-        self.conn.lock().execute(
-            "UPDATE downloads SET pinned=?2 WHERE id=?1",
-            params![id.0.to_string(), i32::from(pinned)],
-        )?;
-        Ok(())
-    }
-
-    pub(crate) fn update_package_extract_state(
-        &self,
-        id: PackageId,
-        state: PackageExtractState,
-        error: Option<&str>,
-    ) -> Result<()> {
-        self.conn.lock().execute(
-            "UPDATE packages
-             SET extract_state=?2, error_msg=?3,
-                 completed_at=CASE WHEN ?2='completed' THEN ?4 ELSE completed_at END
-             WHERE id=?1",
-            params![
-                id.0.to_string(),
-                state.as_str(),
-                error,
-                chrono::Utc::now().to_rfc3339(),
-            ],
-        )?;
-        Ok(())
-    }
-
-    pub(crate) fn delete_package(&self, id: PackageId) -> Result<()> {
-        self.conn.lock().execute(
-            "DELETE FROM packages WHERE id=?1",
-            params![id.0.to_string()],
-        )?;
-        Ok(())
+    pub(crate) fn update_downloads(&self, downloads: &[Download]) -> Result<()> {
+        self.write(|tx| {
+            for download in downloads {
+                tx.execute(
+                    "UPDATE downloads
+                     SET status=?2, downloaded=?3, total_size=?4, error_msg=?5,
+                         retry_count=?6, started_at=?7, completed_at=?8, pinned=?9
+                     WHERE id=?1",
+                    params![
+                        download.id.0.to_string(),
+                        download.status.as_str(),
+                        encode_u64("downloads.downloaded", download.downloaded)?,
+                        download
+                            .total_size
+                            .map(|size| encode_u64("downloads.total_size", size))
+                            .transpose()?,
+                        download.error_message,
+                        download.retry_count,
+                        download.started_at.map(|t| t.to_rfc3339()),
+                        download.completed_at.map(|t| t.to_rfc3339()),
+                        download.pinned,
+                    ],
+                )?;
+                if let Some(torrent) = download.torrent() {
+                    update_torrent_stats(tx, download.id, &torrent.stats)?;
+                }
+            }
+            Ok(())
+        })
     }
 
     pub(crate) fn update_progress(
@@ -212,193 +171,144 @@ impl Database {
         id: DownloadId,
         downloaded: u64,
         total_size: Option<u64>,
+        stats: Option<&TorrentStats>,
     ) -> Result<()> {
-        let downloaded = encode_i64("downloads.downloaded", downloaded)?;
-        let total_size = total_size
-            .map(|value| encode_i64("downloads.total_size", value))
-            .transpose()?;
+        self.write(|tx| {
+            tx.prepare_cached("UPDATE downloads SET downloaded=?2, total_size=?3 WHERE id=?1")?
+                .execute(params![
+                    id.0.to_string(),
+                    encode_u64("downloads.downloaded", downloaded)?,
+                    total_size
+                        .map(|size| encode_u64("downloads.total_size", size))
+                        .transpose()?,
+                ])?;
+            if let Some(stats) = stats {
+                update_torrent_stats(tx, id, stats)?;
+            }
+            Ok(())
+        })
+    }
+
+    pub(crate) fn update_filename(&self, id: DownloadId, filename: &str) -> Result<()> {
+        self.execute(
+            "UPDATE downloads SET filename=?2 WHERE id=?1",
+            params![id.0.to_string(), filename],
+        )
+    }
+
+    pub(crate) fn update_pinned(&self, id: DownloadId, pinned: bool) -> Result<()> {
+        self.execute(
+            "UPDATE downloads SET pinned=?2 WHERE id=?1",
+            params![id.0.to_string(), pinned],
+        )
+    }
+
+    pub(crate) fn update_torrent_metadata(&self, download: &Download) -> Result<()> {
+        let Some(torrent) = download.torrent() else {
+            return Ok(());
+        };
+        self.write(|tx| {
+            tx.execute(
+                "UPDATE downloads SET filename=?2, total_size=?3 WHERE id=?1",
+                params![
+                    download.id.0.to_string(),
+                    download.filename,
+                    download
+                        .total_size
+                        .map(|size| encode_u64("downloads.total_size", size))
+                        .transpose()?,
+                ],
+            )?;
+            tx.execute(
+                "UPDATE torrent_state
+                 SET is_private=?2, files_json=?3, trackers_json=?4, metadata_bytes=?5
+                 WHERE download_id=?1",
+                params![
+                    download.id.0.to_string(),
+                    torrent.is_private,
+                    encode_json("torrent_state.files_json", &torrent.files)?,
+                    encode_json("torrent_state.trackers_json", &torrent.trackers)?,
+                    torrent.metadata_bytes,
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub(crate) fn update_package(&self, package: &ArchivePackage) -> Result<()> {
+        self.execute(
+            "UPDATE packages SET extract_state=?2, error_msg=?3, completed_at=?4, pinned=?5
+             WHERE id=?1",
+            params![
+                package.id.0.to_string(),
+                package.extract_state.as_str(),
+                package.error_message,
+                package.completed_at.map(|t| t.to_rfc3339()),
+                package.pinned,
+            ],
+        )
+    }
+
+    fn select_downloads(&self, tail: &str, params: impl rusqlite::Params) -> Result<Vec<Download>> {
         let conn = self.conn.lock();
-        let mut stmt =
-            conn.prepare_cached("UPDATE downloads SET downloaded=?2, total_size=?3 WHERE id=?1")?;
-        stmt.execute(params![id.0.to_string(), downloaded, total_size,])?;
-        Ok(())
+        let mut stmt = conn.prepare(&format!("{DOWNLOAD_SELECT} {tail}"))?;
+        stmt.query_and_then(params, row_to_download)?.collect()
+    }
+
+    /// Oldest first, so a restart requeues in insertion order.
+    pub(crate) fn downloads(&self) -> Result<Vec<Download>> {
+        self.select_downloads("ORDER BY d.created_at", [])
     }
 
     #[cfg(test)]
     pub(crate) fn get(&self, id: DownloadId) -> Result<Option<Download>> {
-        let conn = self.conn.lock();
-        let mut stmt = conn.prepare(DOWNLOAD_SELECT)?;
-        let mut rows = stmt.query(params![id.0.to_string()])?;
-        match rows.next()? {
-            Some(row) => Ok(Some(row_to_download(row)?)),
-            None => Ok(None),
-        }
-    }
-
-    pub(crate) fn all(&self) -> Result<Vec<Download>> {
-        let conn = self.conn.lock();
-        let mut stmt = conn.prepare(&format!("{DOWNLOAD_SELECT_ALL} ORDER BY created_at DESC"))?;
-        let mut rows = stmt.query([])?;
-        let mut out = Vec::new();
-        while let Some(row) = rows.next()? {
-            out.push(row_to_download(row)?);
-        }
-        Ok(out)
-    }
-
-    pub(crate) fn insert_archive_package(
-        &self,
-        package: &ArchivePackage,
-        downloads: &[Download],
-    ) -> Result<()> {
-        let mut conn = self.conn.lock();
-        let tx = conn.transaction()?;
-        tx.execute(
-            "INSERT INTO packages (
-                id, name, save_path, kind, auto_extract, extract_state,
-                error_msg, created_at, completed_at, pinned
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-            params![
-                package.id.0.to_string(),
-                package.name,
-                path_to_utf8("packages.save_path", &package.save_path)?,
-                package.kind.as_str(),
-                i32::from(package.auto_extract),
-                package.extract_state.as_str(),
-                package.error_message,
-                package.created_at.to_rfc3339(),
-                package.completed_at.map(|t| t.to_rfc3339()),
-                i32::from(package.pinned),
-            ],
-        )?;
-        for download in downloads {
-            insert_download_tx(&tx, download)?;
-        }
-        for item in &package.items {
-            tx.execute(
-                "INSERT INTO package_items (package_id, download_id, position, part_number)
-                 VALUES (?1, ?2, ?3, ?4)",
-                params![
-                    package.id.0.to_string(),
-                    item.download_id.0.to_string(),
-                    encode_i32("package_items.position", item.position)?,
-                    encode_i32("package_items.part_number", item.part_number)?,
-                ],
-            )?;
-        }
-        tx.commit()?;
-        Ok(())
+        Ok(self
+            .select_downloads("WHERE d.id = ?1", [id.0.to_string()])?
+            .pop())
     }
 
     pub(crate) fn packages(&self) -> Result<Vec<ArchivePackage>> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
-            "SELECT id, name, save_path, kind, auto_extract, extract_state,
+            "SELECT id, name, save_path, auto_extract, extract_state,
                     error_msg, created_at, completed_at, pinned
-             FROM packages ORDER BY created_at DESC",
+             FROM packages ORDER BY created_at",
         )?;
-        let mut rows = stmt.query([])?;
-        let mut packages = Vec::new();
-        while let Some(row) = rows.next()? {
-            let id: String = row.get(0)?;
-            let package_id =
-                PackageId(uuid::Uuid::parse_str(&id).map_err(|e| {
-                    crate::ShioError::Other(format!("invalid package uuid {id}: {e}"))
-                })?);
+        stmt.query_and_then([], |row| {
+            let id = PackageId(decode_uuid("packages.id", &row.get::<_, String>(0)?)?);
             let name: String = row.get(1)?;
             crate::path::validate_leaf_filename(&name)?;
-            let save_path: String = row.get(2)?;
-            let kind: String = row.get(3)?;
-            let kind = match kind.as_str() {
-                "archive_set" => PackageKind::ArchiveSet,
-                other => {
-                    return Err(crate::ShioError::DatabaseValue {
-                        field: "packages.kind",
-                        value: other.to_string(),
-                    });
-                },
-            };
-            let auto_extract: i32 = row.get(4)?;
-            let extract_state: String = row.get(5)?;
-            let extract_state = parse_package_extract_state(&extract_state)?;
-            let error_message: Option<String> = row.get(6)?;
-            let created_at: String = row.get(7)?;
-            let completed_at: Option<String> = row.get(8)?;
-            let pinned: i32 = row.get(9)?;
-            packages.push(ArchivePackage {
-                id: package_id,
+            Ok(ArchivePackage {
+                id,
                 name,
-                save_path: PathBuf::from(save_path),
-                kind,
-                auto_extract: decode_bool_i32("packages.auto_extract", auto_extract)?,
-                extract_state,
-                error_message,
-                created_at: parse_required_ts("packages.created_at", &created_at)?,
-                completed_at: parse_optional_ts("packages.completed_at", completed_at.as_deref())?,
-                pinned: decode_bool_i32("packages.pinned", pinned)?,
-                items: package_items_locked(&conn, package_id)?,
-            });
-        }
-        Ok(packages)
+                save_path: PathBuf::from(row.get::<_, String>(2)?),
+                auto_extract: decode_bool("packages.auto_extract", row.get(3)?)?,
+                extract_state: parse_extract_state(&row.get::<_, String>(4)?)?,
+                error_message: row.get(5)?,
+                created_at: decode_ts("packages.created_at", &row.get::<_, String>(6)?)?,
+                completed_at: optional_ts(row, 7, "packages.completed_at")?,
+                pinned: decode_bool("packages.pinned", row.get(8)?)?,
+                items: package_items(&conn, id)?,
+            })
+        })?
+        .collect()
     }
 
-    pub(crate) fn delete(&self, id: DownloadId) -> Result<()> {
-        self.conn.lock().execute(
-            "DELETE FROM downloads WHERE id=?1",
-            params![id.0.to_string()],
-        )?;
-        Ok(())
+    pub(crate) fn delete_download(&self, id: DownloadId) -> Result<()> {
+        self.execute("DELETE FROM downloads WHERE id=?1", [id.0.to_string()])
     }
 
-    pub(crate) fn insert_chunks(&self, id: DownloadId, chunks: &[ChunkInfo]) -> Result<()> {
-        let mut conn = self.conn.lock();
-        let tx = conn.transaction()?;
-        {
-            let mut stmt = tx.prepare(
-                "INSERT OR REPLACE INTO chunks
-                 (download_id, chunk_index, start_byte, end_byte, downloaded, status)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+    pub(crate) fn delete_package(&self, package: &ArchivePackage) -> Result<()> {
+        self.write(|tx| {
+            tx.execute(
+                "DELETE FROM packages WHERE id=?1",
+                [package.id.0.to_string()],
             )?;
-            for c in chunks {
-                let index = encode_i32("chunks.chunk_index", c.index)?;
-                let start = encode_i64("chunks.start_byte", c.start)?;
-                let end = encode_i64("chunks.end_byte", c.end)?;
-                let downloaded = encode_i64("chunks.downloaded", c.downloaded)?;
-                stmt.execute(params![
-                    id.0.to_string(),
-                    index,
-                    start,
-                    end,
-                    downloaded,
-                    c.status.as_str(),
-                ])?;
+            for id in package.child_ids() {
+                tx.execute("DELETE FROM downloads WHERE id=?1", [id.0.to_string()])?;
             }
-        }
-        tx.commit()?;
-        Ok(())
-    }
-
-    pub(crate) fn update_chunk(
-        &self,
-        id: DownloadId,
-        index: u32,
-        downloaded: u64,
-        status: ChunkStatus,
-    ) -> Result<()> {
-        let index = encode_i32("chunks.chunk_index", index)?;
-        let downloaded = encode_i64("chunks.downloaded", downloaded)?;
-        let conn = self.conn.lock();
-        let mut stmt = conn.prepare_cached(
-            "UPDATE chunks SET downloaded=?3, status=?4
-             WHERE download_id=?1 AND chunk_index=?2",
-        )?;
-        stmt.execute(params![
-            id.0.to_string(),
-            index,
-            downloaded,
-            status.as_str(),
-        ])?;
-        Ok(())
+            Ok(())
+        })
     }
 
     pub(crate) fn chunks(&self, id: DownloadId) -> Result<Vec<ChunkInfo>> {
@@ -407,84 +317,175 @@ impl Database {
             "SELECT chunk_index, start_byte, end_byte, downloaded, status
              FROM chunks WHERE download_id=?1 ORDER BY chunk_index",
         )?;
-        let mut rows = stmt.query(params![id.0.to_string()])?;
-        let mut out = Vec::new();
-        while let Some(row) = rows.next()? {
-            out.push(row_to_chunk(row)?);
-        }
-        Ok(out)
+        stmt.query_and_then([id.0.to_string()], row_to_chunk)?
+            .collect()
     }
 
-    pub(crate) fn delete_chunks(&self, id: DownloadId) -> Result<()> {
-        self.conn.lock().execute(
-            "DELETE FROM chunks WHERE download_id=?1",
-            params![id.0.to_string()],
+    pub(crate) fn update_chunks(&self, id: DownloadId, chunks: &[ChunkInfo]) -> Result<()> {
+        self.write(|tx| {
+            let mut stmt = tx.prepare_cached(
+                "UPDATE chunks SET downloaded=?3, status=?4
+                 WHERE download_id=?1 AND chunk_index=?2",
+            )?;
+            for chunk in chunks {
+                stmt.execute(params![
+                    id.0.to_string(),
+                    chunk.index,
+                    encode_u64("chunks.downloaded", chunk.downloaded)?,
+                    chunk.status.as_str(),
+                ])?;
+            }
+            Ok(())
+        })
+    }
+
+    pub(crate) fn replace_chunks(&self, id: DownloadId, chunks: &[ChunkInfo]) -> Result<()> {
+        self.write(|tx| {
+            tx.execute(
+                "DELETE FROM chunks WHERE download_id=?1",
+                [id.0.to_string()],
+            )?;
+            let mut stmt = tx.prepare_cached(
+                "INSERT INTO chunks
+                 (download_id, chunk_index, start_byte, end_byte, downloaded, status)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            )?;
+            for chunk in chunks {
+                stmt.execute(params![
+                    id.0.to_string(),
+                    chunk.index,
+                    encode_u64("chunks.start_byte", chunk.start)?,
+                    encode_u64("chunks.end_byte", chunk.end)?,
+                    encode_u64("chunks.downloaded", chunk.downloaded)?,
+                    chunk.status.as_str(),
+                ])?;
+            }
+            Ok(())
+        })
+    }
+
+    pub(crate) fn insert_delete_journal(&self, journal: &DeleteJournal) -> Result<()> {
+        let moved = journal
+            .moved
+            .iter()
+            .map(|(original, staged)| {
+                Ok((
+                    path_to_utf8("delete_journals.original", original)?,
+                    path_to_utf8("delete_journals.staged", staged)?,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.execute(
+            "INSERT INTO delete_journals (download_id, protected_root, quarantine_root, moved_json)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                journal.download_id.0.to_string(),
+                path_to_utf8("delete_journals.protected_root", &journal.protected_root)?,
+                path_to_utf8("delete_journals.quarantine_root", &journal.quarantine_root)?,
+                encode_json("delete_journals.moved_json", &moved)?,
+            ],
+        )
+    }
+
+    pub(crate) fn delete_delete_journal(&self, id: DownloadId) -> Result<()> {
+        self.execute(
+            "DELETE FROM delete_journals WHERE download_id=?1",
+            [id.0.to_string()],
+        )
+    }
+
+    pub(crate) fn delete_journals(&self) -> Result<Vec<DeleteJournal>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT download_id, protected_root, quarantine_root, moved_json FROM delete_journals",
         )?;
-        Ok(())
+        stmt.query_and_then([], |row| {
+            Ok(DeleteJournal {
+                download_id: DownloadId(decode_uuid(
+                    "delete_journals.download_id",
+                    &row.get::<_, String>(0)?,
+                )?),
+                protected_root: PathBuf::from(row.get::<_, String>(1)?),
+                quarantine_root: PathBuf::from(row.get::<_, String>(2)?),
+                moved: decode_json("delete_journals.moved_json", &row.get::<_, String>(3)?)?,
+            })
+        })?
+        .collect()
+    }
+
+    pub(crate) fn download_exists(&self, id: DownloadId) -> Result<bool> {
+        Ok(self.conn.lock().query_row(
+            "SELECT EXISTS(SELECT 1 FROM downloads WHERE id=?1)",
+            [id.0.to_string()],
+            |row| row.get(0),
+        )?)
     }
 }
 
-fn insert_download_tx(tx: &Transaction<'_>, d: &Download) -> Result<()> {
-    let total_size = d
-        .total_size
-        .map(|value| encode_i64("downloads.total_size", value))
-        .transpose()?;
-    let downloaded = encode_i64("downloads.downloaded", d.downloaded)?;
-    let retry_count = encode_i32("downloads.retry_count", d.retry_count)?;
-    let max_retries = encode_i32("downloads.max_retries", d.max_retries)?;
+#[cfg(unix)]
+fn restrict_to_owner(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    if std::fs::metadata(path)?.permissions().mode() & 0o777 != 0o600 {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
+fn insert_download(tx: &Transaction<'_>, d: &Download) -> Result<()> {
     tx.execute(
         "INSERT INTO downloads (
             id, filename, save_path, total_size, downloaded, status,
-            priority, error_msg, created_at, started_at, completed_at,
+            error_msg, created_at, started_at, completed_at,
             retry_count, max_retries, pinned, kind
-         ) VALUES (
-            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15
-         )",
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
         params![
             d.id.0.to_string(),
             d.filename,
             path_to_utf8("downloads.save_path", &d.save_path)?,
-            total_size,
-            downloaded,
+            d.total_size
+                .map(|size| encode_u64("downloads.total_size", size))
+                .transpose()?,
+            encode_u64("downloads.downloaded", d.downloaded)?,
             d.status.as_str(),
-            d.priority,
             d.error_message,
             d.created_at.to_rfc3339(),
             d.started_at.map(|t| t.to_rfc3339()),
             d.completed_at.map(|t| t.to_rfc3339()),
-            retry_count,
-            max_retries,
-            i32::from(d.pinned),
+            d.retry_count,
+            d.max_retries,
+            d.pinned,
             d.kind.as_str(),
         ],
     )?;
     match &d.kind {
         DownloadKind::Http(http) => {
-            validate_persisted_headers(&http.headers)?;
-            let headers_json = encode_json("http_state.headers", &http.headers)?;
+            crate::probe::validate_custom_headers(&http.headers)?;
+            if let Some((name, _)) = http
+                .headers
+                .iter()
+                .find(|(name, _)| is_sensitive_header(name))
+            {
+                return Err(invalid("http_state.headers", name));
+            }
             tx.execute(
                 "INSERT INTO http_state (download_id, url, headers, segments, subfolder, auto_extract)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![
                     d.id.0.to_string(),
                     http.url,
-                    headers_json,
-                    i32::from(http.segments),
-                    http.subfolder.as_deref(),
-                    i32::from(http.auto_extract),
+                    encode_json("http_state.headers", &http.headers)?,
+                    http.segments,
+                    http.subfolder,
+                    http.auto_extract,
                 ],
             )?;
         },
         DownloadKind::Torrent(t) => {
-            let (source_kind, source_data): (&str, Vec<u8>) = match &t.source {
-                TorrentSource::Magnet(m) => ("magnet", m.as_bytes().to_vec()),
-                TorrentSource::File(bytes) => ("file", bytes.clone()),
+            let (source_kind, source_data) = match &t.source {
+                TorrentSource::Magnet(magnet) => ("magnet", magnet.as_bytes()),
+                TorrentSource::File(bytes) => ("file", bytes.as_slice()),
             };
-            let files_json = encode_json("torrent_state.files_json", &t.files)?;
-            let trackers_json = encode_json("torrent_state.trackers_json", &t.trackers)?;
-            let uploaded = encode_i64("torrent_state.uploaded", t.uploaded)?;
-            let seed_elapsed_secs =
-                encode_i64("torrent_state.seed_elapsed_secs", t.seed_elapsed_secs)?;
             tx.execute(
                 "INSERT INTO torrent_state (
                     download_id, source_kind, source_data, info_hash, auto_extract, is_private,
@@ -494,14 +495,14 @@ fn insert_download_tx(tx: &Transaction<'_>, d: &Download) -> Result<()> {
                     d.id.0.to_string(),
                     source_kind,
                     source_data,
-                    t.info_hash.to_vec(),
-                    i32::from(t.auto_extract),
-                    i32::from(t.is_private),
-                    files_json,
-                    trackers_json,
-                    uploaded,
-                    f64::from(t.ratio),
-                    seed_elapsed_secs,
+                    t.info_hash.as_slice(),
+                    t.auto_extract,
+                    t.is_private,
+                    encode_json("torrent_state.files_json", &t.files)?,
+                    encode_json("torrent_state.trackers_json", &t.trackers)?,
+                    encode_u64("torrent_state.uploaded", t.stats.uploaded)?,
+                    f64::from(t.stats.ratio),
+                    encode_u64("torrent_state.seed_elapsed_secs", t.stats.seed_elapsed_secs)?,
                     t.metadata_bytes,
                 ],
             )?;
@@ -510,235 +511,210 @@ fn insert_download_tx(tx: &Transaction<'_>, d: &Download) -> Result<()> {
     Ok(())
 }
 
-fn package_items_locked(conn: &Connection, package_id: PackageId) -> Result<Vec<PackageItem>> {
+fn update_torrent_stats(tx: &Transaction<'_>, id: DownloadId, stats: &TorrentStats) -> Result<()> {
+    tx.prepare_cached(
+        "UPDATE torrent_state SET uploaded=?2, ratio=?3, seed_elapsed_secs=?4
+         WHERE download_id=?1",
+    )?
+    .execute(params![
+        id.0.to_string(),
+        encode_u64("torrent_state.uploaded", stats.uploaded)?,
+        f64::from(stats.ratio),
+        encode_u64("torrent_state.seed_elapsed_secs", stats.seed_elapsed_secs)?,
+    ])?;
+    Ok(())
+}
+
+fn package_items(conn: &Connection, package_id: PackageId) -> Result<Vec<PackageItem>> {
     let mut stmt = conn.prepare(
         "SELECT download_id, position, part_number
          FROM package_items WHERE package_id=?1 ORDER BY position",
     )?;
-    let mut rows = stmt.query(params![package_id.0.to_string()])?;
-    let mut items = Vec::new();
-    while let Some(row) = rows.next()? {
-        let download_id: String = row.get(0)?;
-        let download_id = DownloadId(uuid::Uuid::parse_str(&download_id).map_err(|e| {
-            crate::ShioError::Other(format!("invalid package item uuid {download_id}: {e}"))
-        })?);
-        let position: i32 = row.get(1)?;
-        let part_number: i32 = row.get(2)?;
-        items.push(PackageItem {
-            download_id,
-            position: decode_u32("package_items.position", position)?,
-            part_number: decode_u32("package_items.part_number", part_number)?,
-        });
-    }
-    Ok(items)
+    stmt.query_and_then([package_id.0.to_string()], |row| {
+        Ok(PackageItem {
+            download_id: DownloadId(decode_uuid(
+                "package_items.download_id",
+                &row.get::<_, String>(0)?,
+            )?),
+            position: decode_int("package_items.position", row.get(1)?)?,
+            part_number: decode_int("package_items.part_number", row.get(2)?)?,
+        })
+    })?
+    .collect()
 }
 
-fn parse_package_extract_state(value: &str) -> Result<PackageExtractState> {
-    let state = match value {
-        "not_started" => PackageExtractState::NotStarted,
-        "extracting" => PackageExtractState::Extracting,
-        "completed" => PackageExtractState::Completed,
-        "error" => PackageExtractState::Error,
-        "password_required" => PackageExtractState::PasswordRequired,
-        other => {
-            return Err(crate::ShioError::DatabaseValue {
-                field: "packages.extract_state",
-                value: other.to_string(),
-            });
-        },
-    };
-    Ok(state)
-}
-
-fn validate_persisted_headers(headers: &[(String, String)]) -> Result<()> {
-    if let Some((name, _)) = headers
-        .iter()
-        .find(|(name, _)| is_sensitive_header(name.as_str()))
-    {
-        return Err(crate::ShioError::DatabaseValue {
-            field: "http_state.headers",
-            value: format!("sensitive header cannot be persisted: {name}"),
-        });
-    }
-    Ok(())
+fn parse_extract_state(value: &str) -> Result<PackageExtractState> {
+    use PackageExtractState::{Completed, Error, Extracting, NotStarted, PasswordRequired};
+    [NotStarted, Extracting, Completed, Error, PasswordRequired]
+        .into_iter()
+        .find(|state| state.as_str() == value)
+        .ok_or_else(|| invalid("packages.extract_state", &value))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
+    use crate::types::{ChunkStatus, DownloadStatus, TorrentFile, TorrentState};
 
     fn sample() -> Download {
         Download::new(
             "https://example.com/file.zip".to_string(),
-            PathBuf::from("/tmp/file.zip"),
+            PathBuf::from("/tmp"),
         )
     }
 
-    fn db() -> Database {
-        Database::in_memory().unwrap()
+    fn torrent_sample() -> Download {
+        let state = TorrentState::new(
+            TorrentSource::Magnet(
+                "magnet:?xt=urn:btih:cab507494d02ebb1178b38f2e9d7be299c86b862".into(),
+            ),
+            [7; 20],
+        );
+        Download::with_kind(
+            "t".into(),
+            PathBuf::from("/tmp"),
+            DownloadKind::Torrent(state),
+        )
     }
 
     #[test]
-    fn open_creates_schema() {
-        let _ = db();
-    }
+    fn mutable_fields_and_torrent_stats_roundtrip() {
+        let db = Database::in_memory().unwrap();
+        let mut http = sample();
+        let mut torrent = torrent_sample();
+        torrent.torrent_mut().unwrap().metadata_bytes = Some(b"metadata".to_vec());
+        db.insert_download(&http).unwrap();
+        db.insert_download(&torrent).unwrap();
 
-    #[test]
-    fn insert_and_get_roundtrip() {
-        let db = db();
-        let d = sample();
-        db.insert_download(&d).unwrap();
-        let got = db.get(d.id).unwrap().unwrap();
-        assert_eq!(got.id, d.id);
-        assert_eq!(got.url(), d.url());
-    }
-
-    #[test]
-    fn get_missing_returns_none() {
-        assert!(db().get(DownloadId::new()).unwrap().is_none());
-    }
-
-    #[test]
-    fn update_status_persists() {
-        let db = db();
-        let d = sample();
-        db.insert_download(&d).unwrap();
-        db.update_status(d.id, DownloadStatus::Completed, None)
+        http.status = DownloadStatus::Error;
+        http.error_message = Some("connection reset".into());
+        http.downloaded = 12_345;
+        http.completed_at = Some(chrono::Utc::now());
+        torrent.torrent_mut().unwrap().stats.uploaded = 2048;
+        torrent.torrent_mut().unwrap().stats.seed_elapsed_secs = 300;
+        db.update_downloads(&[http.clone(), torrent.clone()])
             .unwrap();
+
+        let stored_http = db.get(http.id).unwrap().unwrap();
+        assert_eq!(stored_http.status, DownloadStatus::Error);
         assert_eq!(
-            db.get(d.id).unwrap().unwrap().status,
-            DownloadStatus::Completed
+            stored_http.error_message.as_deref(),
+            Some("connection reset")
+        );
+        assert_eq!(stored_http.downloaded, 12_345);
+        assert!(stored_http.completed_at.is_some());
+        let stored = db.get(torrent.id).unwrap().unwrap();
+        assert_eq!(stored.torrent().unwrap().stats.uploaded, 2048);
+        assert_eq!(stored.torrent().unwrap().stats.seed_elapsed_secs, 300);
+        assert_eq!(
+            stored.torrent().unwrap().metadata_bytes.as_deref(),
+            Some(&b"metadata"[..])
         );
     }
 
     #[test]
-    fn update_progress_persists() {
-        let db = db();
+    fn chunk_batches_replace_and_update_atomically() {
+        let db = Database::in_memory().unwrap();
         let d = sample();
         db.insert_download(&d).unwrap();
-        db.update_progress(d.id, 12_345, Some(100_000)).unwrap();
-        let got = db.get(d.id).unwrap().unwrap();
-        assert_eq!(got.downloaded, 12_345);
-        assert_eq!(got.total_size, Some(100_000));
-    }
+        let chunk = |index, downloaded, status| ChunkInfo {
+            index,
+            start: u64::from(index) * 100,
+            end: u64::from(index) * 100 + 99,
+            downloaded,
+            status,
+        };
+        db.replace_chunks(
+            d.id,
+            &[
+                chunk(0, 0, ChunkStatus::Pending),
+                chunk(1, 0, ChunkStatus::Pending),
+            ],
+        )
+        .unwrap();
+        db.update_chunks(
+            d.id,
+            &[
+                chunk(0, 100, ChunkStatus::Completed),
+                chunk(1, 50, ChunkStatus::Downloading),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            db.chunks(d.id)
+                .unwrap()
+                .iter()
+                .map(|c| c.downloaded)
+                .collect::<Vec<_>>(),
+            [100, 50]
+        );
 
-    #[test]
-    fn delete_cascades_chunks() {
-        let db = db();
-        let d = sample();
-        db.insert_download(&d).unwrap();
-        let chunks = vec![ChunkInfo {
-            index: 0,
-            start: 0,
-            end: 99,
-            downloaded: 0,
-            status: ChunkStatus::Pending,
-        }];
-        db.insert_chunks(d.id, &chunks).unwrap();
-        db.delete(d.id).unwrap();
+        db.replace_chunks(d.id, &[chunk(0, 0, ChunkStatus::Pending)])
+            .unwrap();
+        assert_eq!(db.chunks(d.id).unwrap().len(), 1);
+
+        db.delete_download(d.id).unwrap();
         assert!(db.chunks(d.id).unwrap().is_empty());
     }
 
     #[test]
-    fn all_returns_inserted() {
-        let db = db();
-        db.insert_download(&sample()).unwrap();
-        db.insert_download(&sample()).unwrap();
-        assert_eq!(db.all().unwrap().len(), 2);
+    fn package_delete_removes_package_and_children() {
+        let db = Database::in_memory().unwrap();
+        let first = sample();
+        let second = sample();
+        let package = ArchivePackage {
+            id: PackageId::new(),
+            name: "archive".into(),
+            save_path: PathBuf::from("/tmp"),
+            auto_extract: false,
+            extract_state: PackageExtractState::NotStarted,
+            error_message: None,
+            created_at: chrono::Utc::now(),
+            completed_at: None,
+            pinned: false,
+            items: [&first, &second]
+                .iter()
+                .zip(0..)
+                .map(|(d, position)| PackageItem {
+                    download_id: d.id,
+                    position,
+                    part_number: position + 1,
+                })
+                .collect(),
+        };
+        db.insert_package(&package, &[first, second]).unwrap();
+        assert_eq!(db.packages().unwrap(), std::slice::from_ref(&package));
+
+        db.delete_package(&package).unwrap();
+
+        assert_eq!(db.packages().unwrap(), Vec::<ArchivePackage>::new());
+        assert_eq!(db.downloads().unwrap(), Vec::<Download>::new());
     }
 
     #[test]
-    fn chunks_roundtrip_with_update() {
-        let db = db();
-        let d = sample();
+    fn torrent_metadata_update_persists() {
+        let db = Database::in_memory().unwrap();
+        let mut d = torrent_sample();
         db.insert_download(&d).unwrap();
-        let chunks = vec![
-            ChunkInfo {
-                index: 0,
-                start: 0,
-                end: 99,
-                downloaded: 0,
-                status: ChunkStatus::Pending,
-            },
-            ChunkInfo {
-                index: 1,
-                start: 100,
-                end: 199,
-                downloaded: 50,
-                status: ChunkStatus::Downloading,
-            },
-        ];
-        db.insert_chunks(d.id, &chunks).unwrap();
-        db.update_chunk(d.id, 0, 100, ChunkStatus::Completed)
-            .unwrap();
+        d.filename = "release".into();
+        d.total_size = Some(1024);
+        let torrent = d.torrent_mut().unwrap();
+        torrent.is_private = true;
+        torrent.files = vec![TorrentFile {
+            path: PathBuf::from("release/archive.zip"),
+            size: 1024,
+            selected: true,
+        }];
+        torrent.trackers = vec!["udp://tracker.example:1337/announce".to_string()];
 
-        let got = db.chunks(d.id).unwrap();
-        assert_eq!(got.len(), 2);
-        assert_eq!(got[0].downloaded, 100);
-        assert_eq!(got[0].status, ChunkStatus::Completed);
-        assert_eq!(got[1].downloaded, 50);
-    }
+        db.update_torrent_metadata(&d).unwrap();
 
-    #[test]
-    fn pin_roundtrips() {
-        let db = db();
-        let d = sample();
-        db.insert_download(&d).unwrap();
-        assert!(!db.get(d.id).unwrap().unwrap().pinned);
-        db.update_pin(d.id, true).unwrap();
-        assert!(db.get(d.id).unwrap().unwrap().pinned);
-    }
-
-    #[test]
-    fn metadata_update_preserves_status() {
-        let db = db();
-        let mut d = sample();
-        d.status = DownloadStatus::Completed;
-        db.insert_download(&d).unwrap();
-        db.update_metadata(d.id, "x.mkv", Path::new("/tmp"))
-            .unwrap();
-        let got = db.get(d.id).unwrap().unwrap();
-        assert_eq!(got.status, DownloadStatus::Completed);
-        assert_eq!(got.filename, "x.mkv");
-    }
-
-    #[test]
-    fn subfolder_and_auto_extract_roundtrip() {
-        let db = db();
-        let mut d = sample();
-        if let Some(http) = d.http_mut() {
-            http.subfolder = Some("pkg".into());
-            http.auto_extract = true;
-        }
-        db.insert_download(&d).unwrap();
-        let got = db.get(d.id).unwrap().unwrap();
-        assert_eq!(
-            got.http().and_then(|h| h.subfolder.clone()),
-            Some("pkg".into())
-        );
-        assert!(got.http().is_some_and(|h| h.auto_extract));
-    }
-
-    #[test]
-    fn invalid_http_headers_json_returns_error() {
-        let db = db();
-        let d = sample();
-        db.insert_download(&d).unwrap();
-        db.conn
-            .lock()
-            .execute(
-                "UPDATE http_state SET headers = ?2 WHERE download_id = ?1",
-                params![d.id.0.to_string(), "not json"],
-            )
-            .unwrap();
-
-        assert!(db.get(d.id).is_err());
+        assert_eq!(db.get(d.id).unwrap().unwrap(), d);
     }
 
     #[test]
     fn sensitive_http_headers_are_not_persisted() {
-        let db = db();
+        let db = Database::in_memory().unwrap();
         let mut d = sample();
         d.http_mut().unwrap().headers = vec![("Authorization".to_string(), "secret".to_string())];
 
@@ -746,326 +722,42 @@ mod tests {
     }
 
     #[test]
-    fn missing_http_headers_json_returns_error() {
-        let db = db();
-        let d = sample();
-        db.insert_download(&d).unwrap();
-        let result = db.conn.lock().execute(
-            "UPDATE http_state SET headers = NULL WHERE download_id = ?1",
-            params![d.id.0.to_string()],
-        );
+    fn hostile_rows_are_rejected() {
+        let hostile = [
+            "UPDATE http_state SET headers = 'not json'",
+            "UPDATE downloads SET created_at = 'not a timestamp'",
+            "UPDATE downloads SET filename = '../file.bin'",
+            "UPDATE http_state SET subfolder = '../release'",
+            "UPDATE torrent_state SET files_json = '[{\"path\":\"../x\",\"size\":1,\"selected\":true}]'",
+        ];
+        for statement in hostile {
+            let db = Database::in_memory().unwrap();
+            db.insert_download(&sample()).unwrap();
+            db.insert_download(&torrent_sample()).unwrap();
+            db.conn.lock().execute(statement, []).unwrap();
 
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn all_returns_error_for_corrupt_download_row() {
-        let db = db();
-        let d = sample();
-        db.insert_download(&d).unwrap();
-        db.conn
-            .lock()
-            .execute(
-                "UPDATE http_state SET headers = ?2 WHERE download_id = ?1",
-                params![d.id.0.to_string(), "not json"],
-            )
-            .unwrap();
-
-        assert!(db.all().is_err());
-    }
-
-    #[test]
-    fn invalid_created_at_returns_error() {
-        let db = db();
-        let d = sample();
-        db.insert_download(&d).unwrap();
-        db.conn
-            .lock()
-            .execute(
-                "UPDATE downloads SET created_at = ?2 WHERE id = ?1",
-                params![d.id.0.to_string(), "not a timestamp"],
-            )
-            .unwrap();
-
-        assert!(db.get(d.id).is_err());
-    }
-
-    #[test]
-    fn negative_downloaded_bytes_return_error() {
-        let db = db();
-        let d = sample();
-        db.insert_download(&d).unwrap();
-        let result = db.conn.lock().execute(
-            "UPDATE downloads SET downloaded = ?2 WHERE id = ?1",
-            params![d.id.0.to_string(), -1],
-        );
-
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn invalid_download_status_returns_error() {
-        let db = db();
-        let d = sample();
-        db.insert_download(&d).unwrap();
-        let result = db.conn.lock().execute(
-            "UPDATE downloads SET status = ?2 WHERE id = ?1",
-            params![d.id.0.to_string(), "not_a_status"],
-        );
-
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn invalid_chunk_status_returns_error() {
-        let db = db();
-        let d = sample();
-        db.insert_download(&d).unwrap();
-        db.insert_chunks(
-            d.id,
-            &[ChunkInfo {
-                index: 0,
-                start: 0,
-                end: 99,
-                downloaded: 0,
-                status: ChunkStatus::Pending,
-            }],
-        )
-        .unwrap();
-        let result = db.conn.lock().execute(
-            "UPDATE chunks SET status = ?2 WHERE download_id = ?1",
-            params![d.id.0.to_string(), "not_a_status"],
-        );
-
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn invalid_http_segments_return_error() {
-        let db = db();
-        let d = sample();
-        db.insert_download(&d).unwrap();
-        let result = db.conn.lock().execute(
-            "UPDATE http_state SET segments = ?2 WHERE download_id = ?1",
-            params![d.id.0.to_string(), 256],
-        );
-
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn unsafe_filename_in_download_row_returns_error() {
-        let db = db();
-        let d = sample();
-        db.insert_download(&d).unwrap();
-        db.conn
-            .lock()
-            .execute(
-                "UPDATE downloads SET filename = ?2 WHERE id = ?1",
-                params![d.id.0.to_string(), "../file.bin"],
-            )
-            .unwrap();
-
-        assert!(db.get(d.id).is_err());
-    }
-
-    #[test]
-    fn unsafe_http_subfolder_in_row_returns_error() {
-        let db = db();
-        let d = sample();
-        db.insert_download(&d).unwrap();
-        db.conn
-            .lock()
-            .execute(
-                "UPDATE http_state SET subfolder = ?2 WHERE download_id = ?1",
-                params![d.id.0.to_string(), "../release"],
-            )
-            .unwrap();
-
-        assert!(db.get(d.id).is_err());
-    }
-
-    #[test]
-    fn corrupt_chunk_row_returns_error() {
-        let db = db();
-        let d = sample();
-        db.insert_download(&d).unwrap();
-        db.insert_chunks(
-            d.id,
-            &[ChunkInfo {
-                index: 0,
-                start: 0,
-                end: 99,
-                downloaded: 0,
-                status: ChunkStatus::Pending,
-            }],
-        )
-        .unwrap();
-        let result = db.conn.lock().execute(
-            "UPDATE chunks SET downloaded = ?2 WHERE download_id = ?1",
-            params![d.id.0.to_string(), -1],
-        );
-
-        assert!(result.is_err());
-    }
-
-    fn torrent_sample() -> Download {
-        Download::try_from_torrent(
-            TorrentSource::Magnet(
-                "magnet:?xt=urn:btih:cab507494d02ebb1178b38f2e9d7be299c86b862".into(),
-            ),
-            PathBuf::from("/tmp"),
-        )
-        .expect("valid magnet")
-    }
-
-    #[test]
-    fn torrent_insert_and_get_roundtrip() {
-        let db = db();
-        let mut d = torrent_sample();
-        d.torrent_mut().unwrap().auto_extract = true;
-        d.torrent_mut().unwrap().metadata_bytes = Some(b"metadata".to_vec());
-        db.insert_download(&d).unwrap();
-        let got = db.get(d.id).unwrap().unwrap();
-        assert!(got.kind.is_torrent());
-        let t = got.torrent().unwrap();
-        assert_eq!(t.info_hash, d.torrent().unwrap().info_hash);
-        assert!(t.auto_extract);
-        assert_eq!(t.metadata_bytes.as_deref(), Some(&b"metadata"[..]));
-        match &t.source {
-            TorrentSource::Magnet(m) => assert!(m.starts_with("magnet:")),
-            TorrentSource::File(_) => panic!("expected magnet"),
+            assert!(db.downloads().is_err(), "{statement}");
         }
     }
 
+    #[cfg(unix)]
     #[test]
-    fn torrent_update_runtime_persists() {
-        let db = db();
-        let d = torrent_sample();
-        db.insert_download(&d).unwrap();
+    fn database_and_sidecars_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
 
-        db.update_torrent_runtime(d.id, 2048, 0.75, 300).unwrap();
-
-        let got = db.get(d.id).unwrap().unwrap();
-        let t = got.torrent().unwrap();
-        assert_eq!(t.uploaded, 2048);
-        assert!((t.ratio - 0.75).abs() < 1e-5);
-        assert_eq!(t.seed_elapsed_secs, 300);
-    }
-
-    #[test]
-    fn missing_torrent_required_runtime_returns_error() {
-        let db = db();
-        let d = torrent_sample();
-        db.insert_download(&d).unwrap();
-        let result = db.conn.lock().execute(
-            "UPDATE torrent_state SET uploaded = NULL WHERE download_id = ?1",
-            params![d.id.0.to_string()],
-        );
-
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn torrent_update_metadata_persists() {
-        let db = db();
-        let d = torrent_sample();
-        db.insert_download(&d).unwrap();
-
-        let files = vec![TorrentFile {
-            path: PathBuf::from("release/archive.zip"),
-            size: 1024,
-            downloaded: 1024,
-            selected: true,
-        }];
-        let trackers = vec!["udp://tracker.example:1337/announce".to_string()];
-        db.update_torrent_metadata(d.id, true, &files, &trackers, None)
-            .unwrap();
-
-        let got = db.get(d.id).unwrap().unwrap();
-        let torrent = got.torrent().unwrap();
-        assert!(torrent.is_private);
-        assert_eq!(torrent.files, files);
-        assert_eq!(torrent.trackers, trackers);
-    }
-
-    #[test]
-    fn unsafe_torrent_file_path_in_row_returns_error() {
-        let db = db();
-        let d = torrent_sample();
-        db.insert_download(&d).unwrap();
-        let files = serde_json::to_string(&[TorrentFile {
-            path: PathBuf::from("../outside.bin"),
-            size: 1,
-            downloaded: 0,
-            selected: true,
-        }])
-        .unwrap();
-        db.conn
-            .lock()
-            .execute(
-                "UPDATE torrent_state SET files_json = ?2 WHERE download_id = ?1",
-                params![d.id.0.to_string(), files],
-            )
-            .unwrap();
-
-        assert!(db.get(d.id).is_err());
-    }
-
-    #[test]
-    fn torrent_and_http_coexist_in_all() {
-        let db = db();
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("state.db");
+        std::fs::write(&path, b"").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let db = Database::open(&path).unwrap();
         db.insert_download(&sample()).unwrap();
-        db.insert_download(&torrent_sample()).unwrap();
-        let all = db.all().unwrap();
-        assert_eq!(all.len(), 2);
-        assert_eq!(all.iter().filter(|d| d.kind.is_http()).count(), 1);
-        assert_eq!(all.iter().filter(|d| d.kind.is_torrent()).count(), 1);
-    }
 
-    #[test]
-    fn schema_creates_side_tables() {
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        let _db = Database::open(tmp.path()).unwrap();
-        let conn = Connection::open(tmp.path()).unwrap();
-
-        for table in ["downloads", "http_state", "torrent_state", "chunks"] {
-            let exists: bool = conn
-                .prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1")
-                .unwrap()
-                .exists([table])
-                .unwrap();
-            assert!(exists, "{table} must exist");
+        for suffix in ["", "-wal", "-shm"] {
+            let candidate = PathBuf::from(format!("{}{suffix}", path.display()));
+            if candidate.exists() {
+                let mode = std::fs::metadata(&candidate).unwrap().permissions().mode() & 0o777;
+                assert_eq!(mode, 0o600, "{}", candidate.display());
+            }
         }
-
-        let has_kind: bool = conn
-            .prepare("SELECT 1 FROM pragma_table_info('downloads') WHERE name='kind'")
-            .unwrap()
-            .exists([])
-            .unwrap();
-        assert!(has_kind, "downloads.kind must exist");
-
-        let has_url_on_downloads: bool = conn
-            .prepare("SELECT 1 FROM pragma_table_info('downloads') WHERE name='url'")
-            .unwrap()
-            .exists([])
-            .unwrap();
-        assert!(
-            !has_url_on_downloads,
-            "downloads.url must NOT exist (moved to http_state)"
-        );
-    }
-
-    #[test]
-    fn open_sets_schema_user_version() {
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-
-        let _db = Database::open(tmp.path()).unwrap();
-
-        let conn = Connection::open(tmp.path()).unwrap();
-        let version: i64 = conn
-            .query_row("PRAGMA user_version", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(version, SCHEMA_VERSION);
     }
 }

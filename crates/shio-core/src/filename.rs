@@ -1,11 +1,6 @@
-use std::sync::OnceLock;
+use crate::path::{MAX_COMPONENT_BYTES, is_forbidden_char, is_reserved_name};
 
-use regex::Regex;
-
-const RESERVED_DEVICE_NAMES: &[&str] = &[
-    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
-    "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
-];
+pub(crate) const FALLBACK_FILENAME: &str = "download";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArchivePart {
@@ -14,275 +9,255 @@ pub struct ArchivePart {
 }
 
 pub fn parse_archive_part(filename: &str) -> Option<ArchivePart> {
-    let lower = filename.to_ascii_lowercase();
-    let marker = ".part";
-    let suffix = ".rar";
-    if !lower.ends_with(suffix) {
+    let (base, digits) = rar_part(filename)?;
+    if digits.len() < 2 {
         return None;
     }
-    let suffix_start = lower.len().checked_sub(suffix.len())?;
-    let before_suffix = &lower[..suffix_start];
-    let marker_start = before_suffix.rfind(marker)?;
-    let digits = &before_suffix[marker_start + marker.len()..];
-    if digits.len() < 2 || !digits.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    let part_number = digits.parse().ok()?;
-    if part_number == 0 {
-        return None;
-    }
-    let base = filename.get(..marker_start)?;
+    let part_number = digits.parse().ok().filter(|&number| number > 0)?;
     let base_name = sanitize_filename(base);
-    if base_name.is_empty() || base_name == "download" {
-        return None;
-    }
-    Some(ArchivePart {
+    (base_name != FALLBACK_FILENAME).then_some(ArchivePart {
         base_name,
         part_number,
     })
 }
 
-fn multipart_patterns() -> &'static [Regex] {
-    static PATTERNS: OnceLock<Vec<Regex>> = OnceLock::new();
-    PATTERNS.get_or_init(|| {
-        vec![
-            Regex::new(r"(?i)\.part\d+\.rar$").unwrap(),
-            Regex::new(r"(?i)\.7z\.\d+$").unwrap(),
-            Regex::new(r"(?i)\.zip\.\d+$").unwrap(),
-        ]
-    })
+/// `base.partNN.rar` → (`base`, `NN`).
+pub(crate) fn rar_part(name: &str) -> Option<(&str, &str)> {
+    let stem = strip_suffix_ignore_ascii_case(name, ".rar")?;
+    let (base, part) = stem.rsplit_once('.')?;
+    let digits = part
+        .get(..4)
+        .filter(|marker| marker.eq_ignore_ascii_case("part"))
+        .and_then(|_| part.get(4..))?;
+    is_number(digits).then_some((base, digits))
 }
 
-pub fn extract_filename(url: &str, headers: Option<&reqwest::header::HeaderMap>) -> String {
-    if let Some(name) = headers
-        .and_then(|headers| headers.get(reqwest::header::CONTENT_DISPOSITION))
-        .and_then(|cd| cd.to_str().ok())
-        .and_then(parse_content_disposition)
-    {
-        return sanitize_filename(&name);
-    }
+/// `base.7z.NNN` → (`base`, `NNN`).
+pub(crate) fn sevenz_volume(name: &str) -> Option<(&str, &str)> {
+    let (stem, digits) = name.rsplit_once('.')?;
+    let base = strip_suffix_ignore_ascii_case(stem, ".7z")?;
+    is_number(digits).then_some((base, digits))
+}
 
-    if let Ok(parsed) = url::Url::parse(url) {
-        let path_name = parsed
-            .path_segments()
-            .and_then(|mut s| s.next_back())
-            .map(percent_decode)
-            .filter(|s| !s.is_empty() && s != "/");
+pub(crate) fn strip_suffix_ignore_ascii_case<'a>(value: &'a str, suffix: &str) -> Option<&'a str> {
+    let split = value.len().checked_sub(suffix.len())?;
+    value
+        .get(split..)?
+        .eq_ignore_ascii_case(suffix)
+        .then(|| &value[..split])
+}
 
-        let fragment_name = parsed
+fn is_number(digits: &str) -> bool {
+    !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Direct multi-file hosts put the real name in a `#name.ext` fragment when the path has none.
+pub fn extract_filename(url: &str) -> String {
+    let name = url::Url::parse(url).ok().and_then(|url| {
+        let path = path_filename(&url);
+        let fragment = url
             .fragment()
-            .map(percent_decode)
-            .filter(|s| !s.is_empty());
-
-        let prefer_fragment = match (&path_name, &fragment_name) {
-            (Some(p), Some(f)) => !p.contains('.') && f.contains('.'),
-            (None, Some(f)) => f.contains('.'),
-            _ => false,
-        };
-
-        if prefer_fragment && let Some(name) = fragment_name {
-            return sanitize_filename(&name);
+            .map(decode_lossy)
+            .filter(|fragment| fragment.contains('.'));
+        match (path, fragment) {
+            (Some(path), Some(fragment)) if !path.contains('.') => Some(fragment),
+            (None, fragment) => fragment,
+            (path, _) => path,
         }
+    });
+    name.map_or_else(
+        || FALLBACK_FILENAME.to_owned(),
+        |name| sanitize_filename(&name),
+    )
+}
 
-        if let Some(name) = path_name {
-            return sanitize_filename(&name);
-        }
-    }
-
-    "download".to_string()
+pub(crate) fn path_filename(url: &url::Url) -> Option<String> {
+    url.path_segments()?
+        .next_back()
+        .map(decode_lossy)
+        .filter(|name| !name.is_empty())
 }
 
 pub fn sanitize_filename(name: &str) -> String {
-    let cleaned: String = name.replace(['/', '\\'], "_").replace("..", "_");
-
-    let mut result: String = cleaned
+    let mapped: String = name
+        .replace("..", "_")
         .chars()
         .map(|c| {
-            if c.is_control() || "<>:\"|?*".contains(c) {
+            if c == '/' || is_forbidden_char(c) {
                 '_'
             } else {
                 c
             }
         })
         .collect();
-
-    while result.ends_with('.') || result.ends_with(' ') {
-        result.pop();
+    let mut name = truncate_keeping_extension(trim(&mapped));
+    if name.is_empty() {
+        return FALLBACK_FILENAME.to_owned();
     }
-    let result_trim_start = result.trim_start();
-    if result_trim_start.len() != result.len() {
-        result = result_trim_start.to_string();
+    if is_reserved_name(&name) {
+        name.insert(0, '_');
+        name = trim(truncate_utf8(&name, MAX_COMPONENT_BYTES)).to_owned();
     }
+    name
+}
 
-    let stem = result.split('.').next().unwrap_or("").to_uppercase();
-    if RESERVED_DEVICE_NAMES.contains(&stem.as_str()) {
-        result = format!("_{result}");
+fn trim(name: &str) -> &str {
+    name.trim_start().trim_end_matches(['.', ' '])
+}
+
+fn truncate_keeping_extension(name: &str) -> String {
+    if name.len() <= MAX_COMPONENT_BYTES {
+        return name.to_owned();
     }
-
-    if result.is_empty() {
-        return "download".to_string();
+    match name.rsplit_once('.') {
+        Some((head, ext)) if !ext.is_empty() && ext.len() < 16 => {
+            let head = truncate_utf8(head, MAX_COMPONENT_BYTES - ext.len() - 1);
+            format!("{}.{ext}", head.trim_end_matches('.'))
+        },
+        _ => trim(truncate_utf8(name, MAX_COMPONENT_BYTES)).to_owned(),
     }
+}
 
-    if result.chars().count() > 240 {
-        let ext = result.rsplit_once('.').map_or("", |(_, e)| e);
-        if !ext.is_empty() && ext.len() < 16 {
-            let keep = 240usize.saturating_sub(ext.len() + 1);
-            let head: String = result.chars().take(keep).collect();
-            result = format!("{head}.{ext}");
-        } else {
-            result = result.chars().take(240).collect();
-        }
+fn truncate_utf8(value: &str, max_bytes: usize) -> &str {
+    let mut end = value.len().min(max_bytes);
+    while !value.is_char_boundary(end) {
+        end -= 1;
     }
-
-    result
+    &value[..end]
 }
 
 pub fn subfolder_value(create_subfolder: bool, subfolder_name: &str) -> Option<String> {
-    if !create_subfolder {
-        return None;
-    }
-
     let trimmed = subfolder_name.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-
-    let sanitized = sanitize_filename(trimmed);
-    (!sanitized.is_empty()).then_some(sanitized)
+    (create_subfolder && !trimmed.is_empty()).then(|| sanitize_filename(trimmed))
 }
 
 pub fn suggest_folder_name(filenames: &[&str]) -> Option<String> {
-    if filenames.is_empty() {
+    let (first, rest) = filenames.split_first()?;
+    let first = archive_stem(first);
+    let common = rest.iter().fold(first.len(), |end, name| {
+        first[..end]
+            .char_indices()
+            .zip(archive_stem(name).chars())
+            .find(|((_, a), b)| a != b)
+            .map_or_else(
+                || end.min(archive_stem(name).len()),
+                |((index, _), _)| index,
+            )
+    });
+    let prefix = first[..common]
+        .trim_end_matches(|c: char| matches!(c, '.' | '_' | '-') || c.is_whitespace());
+    if prefix.len() < 3 || prefix.chars().all(|c| c.is_ascii_digit()) {
         return None;
     }
-
-    let stems: Vec<String> = filenames
-        .iter()
-        .map(|name| strip_multipart_and_extension(name))
-        .collect();
-
-    let prefix = longest_common_prefix(&stems);
-    let trimmed =
-        prefix.trim_end_matches(|c: char| c == '.' || c == '_' || c == '-' || c.is_whitespace());
-
-    if trimmed.len() < 3 {
-        return None;
-    }
-    if trimmed.eq_ignore_ascii_case("download") {
-        return None;
-    }
-    if trimmed.chars().all(|c| c.is_ascii_digit()) {
-        return None;
-    }
-
-    let sanitized = sanitize_filename(trimmed);
-    if sanitized.len() < 3 || sanitized == "download" {
-        return None;
-    }
-    Some(sanitized)
+    let name = sanitize_filename(prefix);
+    (name.len() >= 3 && !name.eq_ignore_ascii_case(FALLBACK_FILENAME)).then_some(name)
 }
 
-pub fn is_archive_filename(name: &str) -> bool {
-    multipart_patterns()
-        .iter()
-        .any(|pattern| pattern.is_match(name))
-        || crate::extract::Format::of(std::path::Path::new(name)).is_some()
+fn archive_stem(name: &str) -> &str {
+    rar_part(name).or_else(|| sevenz_volume(name)).map_or_else(
+        || name.rsplit_once('.').map_or(name, |(stem, _)| stem),
+        |(base, _)| base,
+    )
 }
 
-pub(crate) fn has_unsupported_archive_extension(name: &str) -> bool {
-    let lower = name.to_lowercase();
-    if lower.ends_with(".tar.gz") || lower.ends_with(".tar.zst") {
-        return false;
-    }
-    if lower.ends_with(".tar.bz2") || lower.ends_with(".tar.xz") {
-        return true;
-    }
-    let ext = lower.rsplit('.').next().unwrap_or("");
-    matches!(ext, "gz" | "bz2" | "xz" | "zst" | "lz4")
+pub(crate) struct ContentDisposition {
+    pub(crate) attachment: bool,
+    pub(crate) filename: Option<String>,
 }
 
-fn strip_multipart_and_extension(name: &str) -> String {
-    let mut stripped: String = name.to_string();
-    for pat in multipart_patterns() {
-        if let Some(m) = pat.find(&stripped) {
-            stripped.truncate(m.start());
-            break;
+/// RFC 6266 `Content-Disposition`; `filename*` (RFC 8187) wins over `filename`.
+pub(crate) fn parse_content_disposition(value: &str) -> ContentDisposition {
+    let parts = split_parameters(value);
+    let attachment = parts
+        .first()
+        .is_some_and(|kind| kind.trim().eq_ignore_ascii_case("attachment"));
+    let mut plain = None;
+    let mut extended = None;
+    for (name, value) in parts.iter().skip(1).filter_map(|part| part.split_once('=')) {
+        let (name, value) = (name.trim(), value.trim());
+        if name.eq_ignore_ascii_case("filename*") {
+            extended = extended.or_else(|| decode_extended_value(value.trim_matches('"')));
+        } else if name.eq_ignore_ascii_case("filename") {
+            plain = plain.or_else(|| Some(unquote(value)));
         }
     }
-    if let Some(dot) = stripped.rfind('.') {
-        stripped.truncate(dot);
+    ContentDisposition {
+        attachment,
+        filename: extended
+            .or(plain)
+            .filter(|name| !name.trim().is_empty())
+            .map(|name| sanitize_filename(&name)),
     }
-    stripped
 }
 
-fn longest_common_prefix(strings: &[String]) -> String {
-    let Some(first) = strings.first() else {
-        return String::new();
+fn split_parameters(value: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let (mut start, mut quoted, mut escaped) = (0, false, false);
+    for (index, c) in value.char_indices() {
+        match c {
+            _ if escaped => escaped = false,
+            '\\' if quoted => escaped = true,
+            '"' => quoted = !quoted,
+            ';' if !quoted => {
+                parts.push(&value[start..index]);
+                start = index + 1;
+            },
+            _ => {},
+        }
+    }
+    parts.push(&value[start..]);
+    parts
+}
+
+fn unquote(value: &str) -> String {
+    let Some(quoted) = value.strip_prefix('"') else {
+        return value.to_owned();
     };
-    let mut end = first.chars().count();
-    for s in &strings[1..] {
-        let common = first
-            .chars()
-            .zip(s.chars())
-            .take_while(|(a, b)| a == b)
-            .count();
-        end = end.min(common);
-        if end == 0 {
-            break;
+    let mut out = String::with_capacity(quoted.len());
+    let mut chars = quoted.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => break,
+            '\\' => out.extend(chars.next()),
+            c => out.push(c),
         }
     }
-    first.chars().take(end).collect()
+    out
 }
 
-fn parse_content_disposition(value: &str) -> Option<String> {
-    if let Some(pos) = value.find("filename*=") {
-        let rest = &value[pos + 10..];
-        if let Some(quote_pos) = rest.find('\'') {
-            let after_quotes = &rest[quote_pos + 1..];
-            if let Some(quote_pos2) = after_quotes.find('\'') {
-                let encoded = after_quotes[quote_pos2 + 1..]
-                    .trim_end_matches(';')
-                    .trim()
-                    .trim_matches('"');
-                return Some(percent_decode(encoded));
-            }
-        }
+fn decode_extended_value(value: &str) -> Option<String> {
+    let mut fields = value.splitn(3, '\'');
+    let (charset, _language, encoded) = (fields.next()?, fields.next()?, fields.next()?);
+    let bytes = percent_decode(encoded);
+    if charset.eq_ignore_ascii_case("utf-8") {
+        String::from_utf8(bytes).ok()
+    } else if charset.eq_ignore_ascii_case("iso-8859-1") {
+        Some(bytes.into_iter().map(char::from).collect())
+    } else {
+        None
     }
-
-    if let Some(pos) = value.find("filename=") {
-        let rest = &value[pos + 9..];
-        let name = rest
-            .trim()
-            .trim_start_matches('"')
-            .split('"')
-            .next()
-            .unwrap_or_else(|| rest.trim())
-            .trim_end_matches(';')
-            .trim();
-        if !name.is_empty() {
-            return Some(name.to_string());
-        }
-    }
-
-    None
 }
 
-fn percent_decode(input: &str) -> String {
+fn decode_lossy(input: &str) -> String {
+    String::from_utf8_lossy(&percent_decode(input)).into_owned()
+}
+
+fn percent_decode(input: &str) -> Vec<u8> {
     let bytes = input.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
         if let [b'%', hi, lo, ..] = bytes[i..]
-            && let (Some(h), Some(l)) = (hex_digit(hi), hex_digit(lo))
+            && let (Some(hi), Some(lo)) = (hex_digit(hi), hex_digit(lo))
         {
-            out.push(h << 4 | l);
+            out.push((hi << 4) | lo);
             i += 3;
-            continue;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
         }
-        out.push(bytes[i]);
-        i += 1;
     }
-    String::from_utf8_lossy(&out).into_owned()
+    out
 }
 
 const fn hex_digit(b: u8) -> Option<u8> {
@@ -297,90 +272,117 @@ const fn hex_digit(b: u8) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use reqwest::header::{CONTENT_DISPOSITION, HeaderMap, HeaderValue};
 
     #[test]
-    fn sanitize_filename_handles_safety_and_preservation_cases() {
-        for input in ["../etc/passwd", "..\\windows\\system32"] {
-            let out = sanitize_filename(input);
-            assert!(!out.contains(".."), "got {out}");
-            assert!(!out.contains('/'), "got {out}");
-            assert!(!out.contains('\\'), "got {out}");
-        }
-
-        let control = sanitize_filename("a\0b\tc");
-        assert!(!control.contains('\0'));
-        assert!(!control.contains('\t'));
-
-        for reserved in ["CON", "NUL", "PRN", "AUX", "COM1", "LPT1", "con.txt"] {
-            let out = sanitize_filename(reserved);
-            assert!(out.starts_with('_'), "reserved name leaked: {out}");
-        }
-
+    fn sanitize_filename_neutralizes_hostile_names_idempotently() {
         for (input, expected) in [
-            ("ubuntu-24.04.iso", "ubuntu-24.04.iso"),
-            ("a file.txt", "a file.txt"),
+            ("../etc/passwd", "__etc_passwd"),
+            ("..\\windows\\system32", "__windows_system32"),
+            ("a\0b\tc", "a_b_c"),
+            (r#"bad<>:"|?*.txt"#, "bad_______.txt"),
+            ("invoice\u{202E}fdp.exe", "invoice_fdp.exe"),
+            ("zero\u{200B}width", "zero_width"),
+            ("CON", "_CON"),
+            ("con.txt", "_con.txt"),
+            ("CON .txt", "_CON .txt"),
+            ("COM0", "_COM0"),
+            ("lpt³.log", "_lpt³.log"),
+            ("CONIN$", "_CONIN$"),
+            ("COM10", "COM10"),
+            ("name.  ", "name"),
+            ("  .", "download"),
             ("", "download"),
+            ("ubuntu-24.04.iso", "ubuntu-24.04.iso"),
+            ("a\u{200D}b.png", "a\u{200D}b.png"),
         ] {
-            assert_eq!(sanitize_filename(input), expected);
+            let once = sanitize_filename(input);
+            assert_eq!(once, expected, "{input:?}");
+            assert_eq!(sanitize_filename(&once), once, "{input:?}");
         }
-
-        let invalid = sanitize_filename(r#"bad<>:"|?*.txt"#);
-        for c in ['<', '>', ':', '"', '|', '?', '*'] {
-            assert!(!invalid.contains(c), "char {c} leaked into {invalid}");
-        }
-
-        let trimmed = sanitize_filename("name.  ");
-        assert!(!trimmed.ends_with(' '));
-        assert!(!trimmed.ends_with('.'));
     }
 
     #[test]
-    fn subfolder_value_handles_enabled_disabled_and_blank_names() {
-        assert_eq!(subfolder_value(false, "archive"), None);
-        assert_eq!(subfolder_value(true, "   "), None);
+    fn sanitize_filename_caps_length_idempotently() {
+        for input in [
+            "a".repeat(500),
+            format!("{}.pdf", "a".repeat(500)),
+            format!("{}.zip", "💾".repeat(240)),
+            format!("{}{}", "a".repeat(239), ". b"),
+            format!("{}.{}", "a".repeat(300), ".".repeat(5)),
+            format!("CON.{}", "x".repeat(300)),
+        ] {
+            let once = sanitize_filename(&input);
+            assert!(once.len() <= MAX_COMPONENT_BYTES, "{} bytes", once.len());
+            assert_eq!(sanitize_filename(&once), once);
+            crate::path::validate_leaf_filename(&once).expect("sanitized name is valid");
+        }
+        let long = sanitize_filename(&format!("{}.pdf", "a".repeat(500)));
         assert_eq!(
-            subfolder_value(true, "  bad/name  ").as_deref(),
-            Some("bad_name")
+            std::path::Path::new(&long).extension(),
+            Some("pdf".as_ref())
         );
     }
 
     #[test]
-    fn sanitize_filename_caps_length_and_preserves_extension() {
-        let long = "a".repeat(500);
-        let out = sanitize_filename(&long);
-        assert!(
-            out.chars().count() <= 240,
-            "got {} chars",
-            out.chars().count()
-        );
-
-        let long = format!("{}.pdf", "a".repeat(500));
-        let out = sanitize_filename(&long);
-        assert!(out.chars().count() <= 240);
-        assert!(
-            std::path::Path::new(&out)
-                .extension()
-                .is_some_and(|ext| ext.eq_ignore_ascii_case("pdf")),
-            "extension lost: {out}"
-        );
-    }
-
-    #[test]
-    fn extract_filename_uses_headers_url_fragments_and_fallbacks() {
-        for header in [
-            r#"attachment; filename="report.pdf""#,
-            "attachment; filename=report.pdf",
-            "attachment; filename*=UTF-8''report.pdf",
+    fn content_disposition_parses_rfc6266_shapes() {
+        for (header, attachment, filename) in [
+            (
+                r#"attachment; filename="report.pdf""#,
+                true,
+                Some("report.pdf"),
+            ),
+            (
+                "attachment; filename=report.pdf; size=3",
+                true,
+                Some("report.pdf"),
+            ),
+            (
+                r#"attachment; filename*=UTF-8''r%C3%A9sum%C3%A9.pdf; filename="resume.pdf""#,
+                true,
+                Some("résumé.pdf"),
+            ),
+            (
+                r#"attachment; filename="fallback.pdf"; filename*=utf-8''real.pdf"#,
+                true,
+                Some("real.pdf"),
+            ),
+            (
+                "Attachment; FILENAME=\"Upper.pdf\"",
+                true,
+                Some("Upper.pdf"),
+            ),
+            (
+                "attachment; filename*=iso-8859-1'en'caf%E9.txt",
+                true,
+                Some("café.txt"),
+            ),
+            (
+                r#"attachment; filename="a\"b;c.txt"; x=1"#,
+                true,
+                Some("a_b;c.txt"),
+            ),
+            (
+                r#"inline; filename="attachment.html""#,
+                false,
+                Some("attachment.html"),
+            ),
+            ("attachment; x-filename=evil.exe", true, None),
+            ("attachment; filename*=koi8-r''x.txt", true, None),
+            (
+                r#"attachment; filename="../../.bashrc""#,
+                true,
+                Some("____.bashrc"),
+            ),
+            ("attachment", true, None),
         ] {
-            let mut headers = HeaderMap::new();
-            headers.insert(CONTENT_DISPOSITION, HeaderValue::from_static(header));
-            assert_eq!(
-                extract_filename("https://example.com/", Some(&headers)),
-                "report.pdf"
-            );
+            let parsed = parse_content_disposition(header);
+            assert_eq!(parsed.attachment, attachment, "{header}");
+            assert_eq!(parsed.filename.as_deref(), filename, "{header}");
         }
+    }
 
+    #[test]
+    fn extract_filename_uses_url_path_and_fragments() {
         for (url, expected) in [
             ("https://example.com/path/file.zip", "file.zip"),
             ("https://example.com/path/my%20file.zip", "my file.zip"),
@@ -392,66 +394,44 @@ mod tests {
             ("https://example.com/", "download"),
             ("not a url", "download"),
         ] {
-            assert_eq!(extract_filename(url, None), expected);
+            assert_eq!(extract_filename(url), expected, "{url}");
         }
     }
 
     #[test]
     fn parse_archive_part_accepts_numbered_rar_parts_only() {
-        assert_eq!(
-            parse_archive_part("Game.part01.rar"),
+        let part = |base: &str, part_number| {
             Some(ArchivePart {
-                base_name: "Game".to_string(),
-                part_number: 1,
+                base_name: base.into(),
+                part_number,
             })
-        );
-        assert_eq!(
-            parse_archive_part("Game.part001.rar"),
-            Some(ArchivePart {
-                base_name: "Game".to_string(),
-                part_number: 1,
-            })
-        );
-        assert_eq!(parse_archive_part("Game.rar"), None);
-        assert_eq!(parse_archive_part("Game.part01.zip"), None);
-        assert_eq!(parse_archive_part("Game.part00.rar"), None);
+        };
+        assert_eq!(parse_archive_part("Game.part01.rar"), part("Game", 1));
+        assert_eq!(parse_archive_part("Game.PART002.RAR"), part("Game", 2));
+        for name in [
+            "Game.rar",
+            "Game.part1.rar",
+            "Game.part01.zip",
+            "Game.part00.rar",
+        ] {
+            assert_eq!(parse_archive_part(name), None, "{name}");
+        }
     }
 
     #[test]
-    fn suggest_folder_name_handles_common_archive_sets_and_fallbacks() {
+    fn suggest_folder_name_handles_archive_sets_and_fallbacks() {
         for (names, expected) in [
             (&["foo.part01.rar", "foo.part02.rar"][..], Some("foo")),
-            (&["foo.part07.rar", "foo.part08.rar"][..], Some("foo")),
             (&["archive.7z.001", "archive.7z.002"][..], Some("archive")),
             (&["data.r00", "data.r01", "data.rar"][..], Some("data")),
             (&["movie.mp4"][..], Some("movie")),
             (&["a.txt"][..], None),
             (&["alpha.zip", "beta.zip"][..], None),
             (&["foo_-_.part01.rar", "foo_-_.part02.rar"][..], Some("foo")),
+            (&["2024.zip", "2024.rar"][..], None),
+            (&[][..], None),
         ] {
-            assert_eq!(
-                suggest_folder_name(names),
-                expected.map(str::to_string),
-                "names: {names:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn archive_filename_detection_handles_known_archive_extensions() {
-        for name in ["foo.zip", "foo.rar", "foo.7z", "foo.tar.gz", "foo.tar.zst"] {
-            assert!(is_archive_filename(name), "{name}");
-        }
-        for name in [
-            "video.mp4",
-            "doc.pdf",
-            "song.mp3",
-            "foo.tar.bz2",
-            "foo.tar.xz",
-            "foo.gz",
-            "foo.lz4",
-        ] {
-            assert!(!is_archive_filename(name), "{name}");
+            assert_eq!(suggest_folder_name(names).as_deref(), expected, "{names:?}");
         }
     }
 }

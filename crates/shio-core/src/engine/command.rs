@@ -1,10 +1,13 @@
-use super::{HttpArchiveSetRequest, HttpDownloadRequest, TorrentDownloadRequest};
-use crate::config::TorrentConfig;
-use crate::types::{DownloadId, HttpPreviewResult, MagnetPreviewResult, TorrentSource};
-use std::path::PathBuf;
-use std::sync::Arc;
-use tokio::sync::{Notify, mpsc, oneshot};
+use std::fmt;
 
+use tokio::sync::{mpsc, oneshot};
+
+use super::{HttpArchiveSetRequest, HttpDownloadRequest, TorrentDownloadRequest};
+use crate::config::AppConfig;
+use crate::types::{DownloadId, HttpPreviewResult, MagnetPreviewResult};
+
+/// Replies only report errors; state arrives as `ProgressEvent`s once durable.
+/// Row commands also accept a package's row id and apply to every part that fits.
 pub enum EngineCommand {
     AddHttp {
         request: HttpDownloadRequest,
@@ -44,31 +47,28 @@ pub enum EngineCommand {
         password: Option<String>,
         reply: oneshot::Sender<crate::Result<()>>,
     },
+    ForceRecheck {
+        id: DownloadId,
+        reply: oneshot::Sender<crate::Result<()>>,
+    },
+    StopSeeding {
+        id: DownloadId,
+        reply: oneshot::Sender<crate::Result<()>>,
+    },
+    SetPin {
+        id: DownloadId,
+        pinned: bool,
+        reply: oneshot::Sender<crate::Result<()>>,
+    },
     PauseAll {
         reply: oneshot::Sender<crate::Result<()>>,
     },
     ResumeAll {
         reply: oneshot::Sender<crate::Result<()>>,
     },
-    SetSpeedLimit(Option<u64>),
-    SetMaxConcurrent(u8),
-    SetTorrentConfig(TorrentConfig),
-    SetPin {
-        id: DownloadId,
-        pinned: bool,
-        reply: oneshot::Sender<crate::Result<()>>,
-    },
-    UpdateMetadata {
-        id: DownloadId,
-        filename: String,
-        save_path: PathBuf,
-        reply: oneshot::Sender<crate::Result<()>>,
-    },
-    AddTorrent {
-        source: TorrentSource,
-        save_path: PathBuf,
-        start_paused: bool,
-        auto_extract: bool,
+    /// Torrent port, DHT and `UPnP` apply when the torrent session next opens; the rest at once.
+    SetConfig {
+        config: AppConfig,
         reply: oneshot::Sender<crate::Result<()>>,
     },
     ResolveMagnetPreview {
@@ -81,213 +81,140 @@ pub enum EngineCommand {
         url: String,
         reply: mpsc::Sender<HttpPreviewResult>,
     },
-    CancelHttpPreview {
-        request_id: u64,
-    },
-    ForceRecheck {
-        id: DownloadId,
-        reply: oneshot::Sender<crate::Result<()>>,
-    },
-    StopSeeding {
-        id: DownloadId,
-        reply: oneshot::Sender<crate::Result<()>>,
-    },
-    Shutdown {
-        ack: Arc<Notify>,
-    },
+    /// Cancels either kind of preview; it may arrive before the preview it cancels.
+    CancelPreview { request_id: u64 },
+    /// Replies once every worker's final state is durable.
+    Shutdown { reply: oneshot::Sender<()> },
 }
 
-impl std::fmt::Debug for EngineCommand {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for EngineCommand {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::AddHttp { request, .. } => f
-                .debug_struct("AddHttp")
-                .field("id", &request.id)
-                .field("filename", &request.filename)
-                .finish(),
-            Self::AddHttpArchiveSet { request, .. } => f
-                .debug_struct("AddHttpArchiveSet")
-                .field("id", &request.package.id)
-                .field("name", &request.package.name)
-                .field("parts", &request.parts.len())
-                .finish(),
-            Self::AddTorrentPrepared { request, .. } => f
-                .debug_struct("AddTorrentPrepared")
-                .field("filename", &request.filename)
-                .finish(),
+            Self::AddHttp { request, .. } => f.debug_tuple("AddHttp").field(request).finish(),
+            Self::AddHttpArchiveSet { request, .. } => {
+                f.debug_tuple("AddHttpArchiveSet").field(request).finish()
+            },
+            Self::AddTorrentPrepared { request, .. } => {
+                f.debug_tuple("AddTorrentPrepared").field(request).finish()
+            },
             Self::Pause { id, .. } => f.debug_tuple("Pause").field(id).finish(),
             Self::Resume { id, .. } => f.debug_tuple("Resume").field(id).finish(),
             Self::Cancel { id, .. } => f.debug_tuple("Cancel").field(id).finish(),
             Self::Remove {
                 id, delete_files, ..
             } => f
-                .debug_struct("Remove")
-                .field("id", id)
-                .field("delete_files", delete_files)
+                .debug_tuple("Remove")
+                .field(id)
+                .field(delete_files)
                 .finish(),
             Self::Retry { id, .. } => f.debug_tuple("Retry").field(id).finish(),
             Self::RetryExtract { id, password, .. } => f
-                .debug_struct("RetryExtract")
-                .field("id", id)
-                .field("password", &password.as_ref().map(|_| "<redacted>"))
-                .finish(),
-            Self::PauseAll { .. } => f.write_str("PauseAll"),
-            Self::ResumeAll { .. } => f.write_str("ResumeAll"),
-            Self::SetSpeedLimit(limit) => f.debug_tuple("SetSpeedLimit").field(limit).finish(),
-            Self::SetMaxConcurrent(max) => f.debug_tuple("SetMaxConcurrent").field(max).finish(),
-            Self::SetTorrentConfig(config) => {
-                f.debug_tuple("SetTorrentConfig").field(config).finish()
-            },
-            Self::SetPin { id, pinned, .. } => {
-                f.debug_tuple("SetPin").field(id).field(pinned).finish()
-            },
-            Self::UpdateMetadata {
-                id,
-                filename,
-                save_path,
-                ..
-            } => f
-                .debug_struct("UpdateMetadata")
-                .field("id", id)
-                .field("filename", filename)
-                .field("save_path", save_path)
-                .finish(),
-            Self::AddTorrent {
-                source,
-                save_path,
-                start_paused,
-                auto_extract,
-                ..
-            } => f
-                .debug_struct("AddTorrent")
-                .field("source", &torrent_source_debug(source))
-                .field("save_path", save_path)
-                .field("start_paused", start_paused)
-                .field("auto_extract", auto_extract)
-                .finish(),
-            Self::ResolveMagnetPreview { request_id, .. } => f
-                .debug_struct("ResolveMagnetPreview")
-                .field("request_id", request_id)
-                .field("magnet", &"<redacted>")
-                .field("reply", &"<sender>")
-                .finish(),
-            Self::ResolveHttpPreview { request_id, .. } => f
-                .debug_struct("ResolveHttpPreview")
-                .field("request_id", request_id)
-                .field("url", &"<redacted>")
-                .field("reply", &"<sender>")
-                .finish(),
-            Self::CancelHttpPreview { request_id } => f
-                .debug_struct("CancelHttpPreview")
-                .field("request_id", request_id)
+                .debug_tuple("RetryExtract")
+                .field(id)
+                .field(&password.as_ref().map(|_| "<redacted>"))
                 .finish(),
             Self::ForceRecheck { id, .. } => f.debug_tuple("ForceRecheck").field(id).finish(),
             Self::StopSeeding { id, .. } => f.debug_tuple("StopSeeding").field(id).finish(),
-            Self::Shutdown { .. } => f
-                .debug_struct("Shutdown")
-                .field("ack", &"<notify>")
+            Self::SetPin { id, pinned, .. } => {
+                f.debug_tuple("SetPin").field(id).field(pinned).finish()
+            },
+            Self::PauseAll { .. } => f.write_str("PauseAll"),
+            Self::ResumeAll { .. } => f.write_str("ResumeAll"),
+            Self::SetConfig { config, .. } => f.debug_tuple("SetConfig").field(config).finish(),
+            Self::ResolveMagnetPreview { request_id, .. } => f
+                .debug_tuple("ResolveMagnetPreview")
+                .field(request_id)
                 .finish(),
+            Self::ResolveHttpPreview { request_id, .. } => f
+                .debug_tuple("ResolveHttpPreview")
+                .field(request_id)
+                .finish(),
+            Self::CancelPreview { request_id } => {
+                f.debug_tuple("CancelPreview").field(request_id).finish()
+            },
+            Self::Shutdown { .. } => f.write_str("Shutdown"),
         }
-    }
-}
-
-impl EngineCommand {
-    pub fn shutdown() -> (Self, Arc<Notify>) {
-        let ack = Arc::new(Notify::new());
-        (Self::Shutdown { ack: ack.clone() }, ack)
-    }
-}
-
-pub(super) fn ack(reply: oneshot::Sender<crate::Result<()>>, result: crate::Result<()>) {
-    if reply.send(result).is_err() {
-        tracing::debug!("engine command acknowledgement dropped");
-    }
-}
-
-fn torrent_source_debug(source: &TorrentSource) -> String {
-    match source {
-        TorrentSource::Magnet(_) => "magnet:<redacted>".to_string(),
-        TorrentSource::File(bytes) => format!("torrent-file:{} bytes", bytes.len()),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::{
+        Download, DownloadKind, HttpState, ProxyConfig, ProxyProtocol, TorrentSource,
+    };
 
     #[test]
-    fn http_preview_command_debug_redacts_url() {
-        const TOKEN: &str = "secret-command-token";
-        let (reply, _rx) = mpsc::channel(1);
-        let cmd = EngineCommand::ResolveHttpPreview {
-            request_id: 55,
-            url: format!("https://example.com/file.bin?token={TOKEN}"),
-            reply,
+    fn debug_output_never_contains_secrets() {
+        const SECRET: &str = "s3cret-token";
+        let url = format!("https://example.com/file.bin?token={SECRET}");
+        let magnet =
+            format!("magnet:?xt=urn:btih:cab507494d02ebb1178b38f2e9d7be299c86b862&tr={SECRET}");
+        let part =
+            crate::HttpArchivePartRequest::new(url.clone(), "a.part01.rar".into(), 1, 1).unwrap();
+        let part2 =
+            crate::HttpArchivePartRequest::new(format!("{url}&2"), "a.part02.rar".into(), 2, 1)
+                .unwrap();
+        let config = AppConfig {
+            proxy: Some(ProxyConfig {
+                protocol: ProxyProtocol::Http,
+                host: "proxy".into(),
+                port: 8080,
+                username: Some(SECRET.into()),
+                password: Some(SECRET.into()),
+            }),
+            ..AppConfig::default()
         };
+        let mut http = HttpState::new(url.clone());
+        http.headers.push(("Authorization".into(), SECRET.into()));
+        let download =
+            Download::with_kind("f".into(), std::env::temp_dir(), DownloadKind::Http(http));
+        let commands = [
+            EngineCommand::AddHttp {
+                request: HttpDownloadRequest::new(url.clone(), std::env::temp_dir()),
+                reply: oneshot::channel().0,
+            },
+            EngineCommand::AddHttpArchiveSet {
+                request: HttpArchiveSetRequest::new(
+                    "a".into(),
+                    std::env::temp_dir(),
+                    vec![part, part2],
+                    false,
+                )
+                .unwrap(),
+                reply: oneshot::channel().0,
+            },
+            EngineCommand::AddTorrentPrepared {
+                request: TorrentDownloadRequest::new(
+                    TorrentSource::Magnet(magnet.clone()),
+                    std::env::temp_dir(),
+                ),
+                reply: oneshot::channel().0,
+            },
+            EngineCommand::RetryExtract {
+                id: DownloadId::new(),
+                password: Some(SECRET.into()),
+                reply: oneshot::channel().0,
+            },
+            EngineCommand::SetConfig {
+                config,
+                reply: oneshot::channel().0,
+            },
+            EngineCommand::ResolveMagnetPreview {
+                request_id: 1,
+                magnet,
+                reply: mpsc::channel(1).0,
+            },
+            EngineCommand::ResolveHttpPreview {
+                request_id: 2,
+                url,
+                reply: mpsc::channel(1).0,
+            },
+        ];
 
-        let debug = format!("{cmd:?}");
-
-        assert!(debug.contains("ResolveHttpPreview"));
-        assert!(!debug.contains(TOKEN));
-    }
-
-    #[test]
-    fn add_command_debug_redacts_http_url() {
-        const TOKEN: &str = "secret-add-token";
-        let download = HttpDownloadRequest::new(
-            format!("https://example.com/file.bin?token={TOKEN}"),
-            PathBuf::from("downloads"),
-        );
-        let (reply, _ack) = oneshot::channel();
-        let cmd = EngineCommand::AddHttp {
-            request: download,
-            reply,
-        };
-
-        let debug = format!("{cmd:?}");
-
-        assert!(debug.contains("AddHttp"));
-        assert!(!debug.contains(TOKEN));
-        assert!(!debug.contains("https://example.com"));
-    }
-
-    #[test]
-    fn torrent_command_debug_redacts_source_data() {
-        const TOKEN: &str = "secret-magnet-token";
-        let (reply, _ack) = oneshot::channel();
-        let cmd = EngineCommand::AddTorrent {
-            source: TorrentSource::Magnet(format!(
-                "magnet:?xt=urn:btih:cab507494d02ebb1178b38f2e9d7be299c86b862&tr={TOKEN}"
-            )),
-            save_path: PathBuf::from("downloads"),
-            start_paused: true,
-            auto_extract: false,
-            reply,
-        };
-
-        let debug = format!("{cmd:?}");
-
-        assert!(debug.contains("AddTorrent"));
-        assert!(!debug.contains(TOKEN));
-        assert!(!debug.contains("magnet:?"));
-    }
-
-    #[test]
-    fn magnet_preview_command_debug_redacts_magnet() {
-        const TOKEN: &str = "secret-preview-token";
-        let (reply, _rx) = mpsc::channel(1);
-        let cmd = EngineCommand::ResolveMagnetPreview {
-            request_id: 7,
-            magnet: format!(
-                "magnet:?xt=urn:btih:cab507494d02ebb1178b38f2e9d7be299c86b862&tr={TOKEN}"
-            ),
-            reply,
-        };
-
-        let debug = format!("{cmd:?}");
-
-        assert!(debug.contains("ResolveMagnetPreview"));
-        assert!(!debug.contains(TOKEN));
-        assert!(!debug.contains("magnet:?"));
+        let debug = commands.iter().map(|command| format!("{command:?}"));
+        for debug in debug.chain([format!("{download:?}")]) {
+            assert!(!debug.contains(SECRET), "{debug}");
+        }
     }
 }

@@ -1,37 +1,33 @@
+mod chunk;
 mod config;
 mod db;
 mod engine;
 mod error;
 mod extract;
 mod filename;
-mod format;
 mod path;
+mod probe;
 mod torrent;
 mod types;
+mod worker;
 
-pub(crate) mod chunk;
-pub(crate) mod probe;
-pub(crate) mod queue;
-pub(crate) mod worker;
-
-pub use config::{
-    AppConfig, ThemeConfig, WindowConfig, WindowMaterialPreference, validate_theme_id,
-};
+pub use chunk::MAX_SEGMENTS;
+pub use config::{AppConfig, ThemeConfig, TorrentConfig, WindowConfig, validate_theme_id};
 pub use engine::{
     DownloadEngine, EngineCommand, HttpArchivePartRequest, HttpArchiveSetRequest,
-    HttpDownloadRequest, ProgressStream, TorrentDownloadRequest,
+    HttpDownloadRequest, ProgressEvent, ProgressStream, TorrentDownloadRequest,
 };
 pub use error::{Result, ShioError};
 pub use filename::{
-    ArchivePart, extract_filename, is_archive_filename, parse_archive_part, sanitize_filename,
-    subfolder_value, suggest_folder_name,
+    ArchivePart, extract_filename, parse_archive_part, sanitize_filename, subfolder_value,
+    suggest_folder_name,
 };
-pub use format::{format_eta, format_speed};
-pub use torrent::{SeedPolicy, TorrentManifest, parse_torrent_manifest};
+pub use torrent::{
+    MAX_TORRENT_METADATA_BYTES, SeedPolicy, TorrentManifest, parse_torrent_manifest,
+};
 pub use types::{
-    ArchivePackage, ChunkInfo, ChunkStatus, Download, DownloadId, DownloadKind, DownloadProgress,
-    DownloadStatus, HttpPreview, HttpPreviewResult, HttpPreviewState, HttpState,
-    MagnetPreviewManifest, MagnetPreviewResult, PackageExtractState, PackageId, PackageItem,
-    PackageKind, ProgressDetail, ProxyConfig, ProxyProtocol, TorrentFile, TorrentProgressSnapshot,
-    TorrentSource, TorrentState,
+    ArchivePackage, Download, DownloadId, DownloadKind, DownloadProgress, DownloadStatus,
+    HttpPreview, HttpPreviewResult, HttpPreviewState, HttpState, MagnetPreviewManifest,
+    MagnetPreviewResult, PackageExtractState, PackageId, PackageItem, ProxyConfig, ProxyProtocol,
+    TorrentFile, TorrentSource, TorrentState, TorrentStats,
 };

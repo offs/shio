@@ -1,318 +1,70 @@
-use crate::style::Palette;
-use iced::widget::button;
-use iced::{Border, Color, Shadow, Theme};
+use super::{DANGER_ALPHA, Palette, RADIUS_CONTROL, SOFT_ALPHA, alpha};
+use iced::widget::button::{Status, Style};
+use iced::{Border, Theme};
 
-pub(crate) fn btn_primary(p: &Palette) -> impl Fn(&Theme, button::Status) -> button::Style {
-    let p = *p;
-    move |_theme, status| {
-        let base = button::Style {
-            background: Some(p.bg_elevated.into()),
-            text_color: p.text_primary,
-            border: Border {
-                color: p.border_default,
-                width: 1.0,
-                radius: 4.0.into(),
-            },
-            shadow: Shadow::default(),
-            ..button::Style::default()
-        };
-        match status {
-            button::Status::Active => base,
-            button::Status::Hovered => button::Style {
-                background: Some(p.bg_hover.into()),
-                ..base
-            },
-            button::Status::Pressed => button::Style {
-                background: Some(p.bg_active.into()),
-                ..base
-            },
-            button::Status::Disabled => button::Style {
-                text_color: p.text_ghost,
-                border: Border {
-                    color: Color {
-                        a: 0.04,
-                        ..p.border_default
-                    },
-                    ..base.border
-                },
-                ..base
-            },
-        }
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Button {
+    Primary,
+    Secondary,
+    Ghost,
+    Danger,
+    MenuItem { highlighted: bool },
+    MenuDanger,
+    Nav { active: bool },
+    Close,
 }
 
-pub(crate) fn btn_secondary(p: &Palette) -> impl Fn(&Theme, button::Status) -> button::Style {
-    let p = *p;
-    move |_theme, status| {
-        let base = button::Style {
-            background: None,
-            text_color: p.text_secondary,
+pub(crate) fn button(p: Palette, kind: Button) -> impl Fn(&Theme, Status) -> Style {
+    move |_, status| {
+        let level = match status {
+            Status::Pressed => 2,
+            Status::Hovered => 1,
+            Status::Active | Status::Disabled => 0,
+        };
+        let hot = level > 0;
+        let overlay = [None, Some(p.hover), Some(p.pressed)][level];
+        let menu_fill = [None, Some(p.selected()), Some(p.pressed)][level];
+        let emphasis = if hot {
+            p.text_primary
+        } else {
+            p.text_secondary
+        };
+
+        let (background, text_color) = match kind {
+            Button::Primary => (Some(alpha(p.accent, SOFT_ALPHA[level])), p.accent_text),
+            Button::Secondary => (Some([p.hover, p.pressed, p.pressed][level]), p.text_primary),
+            Button::Ghost | Button::Nav { active: false } => (overlay, emphasis),
+            Button::Danger => (
+                Some(alpha(p.error, DANGER_ALPHA * [1.0, 1.5, 2.0][level])),
+                p.error,
+            ),
+            Button::MenuItem { highlighted } => (
+                menu_fill.or_else(|| highlighted.then_some(p.selected())),
+                p.text_primary,
+            ),
+            Button::MenuDanger => (menu_fill, if hot { p.text_primary } else { p.error }),
+            Button::Nav { active: true } => (Some(overlay.unwrap_or(p.hover)), p.text_primary),
+            Button::Close if hot => (Some(p.error), p.on_error),
+            Button::Close => (None, p.text_secondary),
+        };
+
+        let style = Style {
+            background: background.map(Into::into),
+            text_color,
             border: Border {
-                radius: 4.0.into(),
+                radius: RADIUS_CONTROL.into(),
                 ..Border::default()
             },
-            shadow: Shadow::default(),
-            ..button::Style::default()
+            ..Style::default()
         };
-        match status {
-            button::Status::Active => base,
-            button::Status::Hovered => button::Style {
-                background: Some(p.bg_hover.into()),
-                text_color: p.text_primary,
-                ..base
-            },
-            button::Status::Pressed => button::Style {
-                background: Some(p.bg_active.into()),
-                text_color: p.text_primary,
-                ..base
-            },
-            button::Status::Disabled => button::Style {
-                text_color: p.text_ghost,
-                ..base
-            },
-        }
-    }
-}
-
-pub(crate) fn btn_ghost(p: &Palette) -> impl Fn(&Theme, button::Status) -> button::Style {
-    let p = *p;
-    move |_theme, status| {
-        let base = button::Style {
-            background: None,
-            text_color: p.text_secondary,
-            border: Border {
-                radius: 4.0.into(),
-                ..Border::default()
-            },
-            shadow: Shadow::default(),
-            ..button::Style::default()
-        };
-        match status {
-            button::Status::Active => base,
-            button::Status::Hovered => button::Style {
-                background: Some(p.overlay_hover.into()),
-                text_color: p.text_primary,
-                ..base
-            },
-            button::Status::Pressed => button::Style {
-                background: Some(
-                    Color {
-                        a: p.overlay_hover.a * 1.6,
-                        ..p.overlay_hover
-                    }
-                    .into(),
-                ),
-                text_color: p.text_primary,
-                ..base
-            },
-            button::Status::Disabled => button::Style {
-                text_color: p.text_ghost,
-                ..base
-            },
-        }
-    }
-}
-
-pub(crate) fn sidebar_item(
-    p: &Palette,
-    active: bool,
-) -> impl Fn(&Theme, button::Status) -> button::Style {
-    let p = *p;
-    move |_theme, status| {
-        let base = button::Style {
-            background: None,
-            text_color: if active {
-                p.text_primary
-            } else {
-                p.text_secondary
-            },
-            border: Border {
-                radius: 4.0.into(),
-                ..Border::default()
-            },
-            shadow: Shadow::default(),
-            ..button::Style::default()
-        };
-        if active {
-            return button::Style {
-                background: Some(
-                    Color {
-                        a: 0.14,
-                        ..p.accent
-                    }
-                    .into(),
-                ),
-                text_color: p.text_primary,
-                ..base
-            };
-        }
-        match status {
-            button::Status::Hovered => button::Style {
-                background: Some(p.bg_hover.into()),
-                text_color: p.text_primary,
-                ..base
-            },
-            button::Status::Pressed => button::Style {
-                background: Some(p.bg_active.into()),
-                text_color: p.text_primary,
-                ..base
-            },
-            _ => base,
-        }
-    }
-}
-
-pub(crate) fn btn_icon(p: &Palette) -> impl Fn(&Theme, button::Status) -> button::Style {
-    let p = *p;
-    move |_theme, status| {
-        let base = button::Style {
-            background: None,
-            text_color: p.text_tertiary,
-            border: Border {
-                radius: 4.0.into(),
-                ..Border::default()
-            },
-            shadow: Shadow::default(),
-            ..button::Style::default()
-        };
-        match status {
-            button::Status::Hovered => button::Style {
-                background: Some(p.overlay_hover.into()),
-                text_color: p.text_secondary,
-                ..base
-            },
-            button::Status::Pressed => button::Style {
-                background: Some(
-                    Color {
-                        a: p.overlay_hover.a * 1.6,
-                        ..p.overlay_hover
-                    }
-                    .into(),
-                ),
-                text_color: p.text_secondary,
-                ..base
-            },
-            button::Status::Active | button::Status::Disabled => base,
-        }
-    }
-}
-
-pub(crate) fn btn_danger(p: &Palette) -> impl Fn(&Theme, button::Status) -> button::Style {
-    let p = *p;
-    move |_theme, status| {
-        let base = button::Style {
-            background: Some(p.error.into()),
-            text_color: p.text_primary,
-            border: Border {
-                color: p.error,
-                width: 1.0,
-                radius: 4.0.into(),
-            },
-            shadow: Shadow::default(),
-            ..button::Style::default()
-        };
-        match status {
-            button::Status::Active => base,
-            button::Status::Hovered => button::Style {
-                background: Some(Color { a: 0.88, ..p.error }.into()),
-                ..base
-            },
-            button::Status::Pressed => button::Style {
-                background: Some(Color { a: 0.76, ..p.error }.into()),
-                ..base
-            },
-            button::Status::Disabled => button::Style {
-                background: Some(Color { a: 0.3, ..p.error }.into()),
-                text_color: p.text_ghost,
-                border: Border {
-                    color: Color { a: 0.3, ..p.error },
-                    ..base.border
-                },
-                ..base
-            },
-        }
-    }
-}
-
-pub(crate) fn btn_dropdown(p: &Palette) -> impl Fn(&Theme, button::Status) -> button::Style {
-    let p = *p;
-    move |_theme, status| {
-        let base = button::Style {
-            background: None,
-            text_color: p.text_secondary,
-            border: Border {
-                radius: 4.0.into(),
-                ..Border::default()
-            },
-            shadow: Shadow::default(),
-            ..button::Style::default()
-        };
-        match status {
-            button::Status::Hovered => button::Style {
-                background: Some(p.bg_hover.into()),
-                text_color: p.text_primary,
-                ..base
-            },
-            button::Status::Pressed => button::Style {
-                background: Some(p.bg_active.into()),
-                text_color: p.text_primary,
-                ..base
-            },
-            button::Status::Active | button::Status::Disabled => base,
-        }
-    }
-}
-
-pub(crate) fn btn_dropdown_active(p: &Palette) -> impl Fn(&Theme, button::Status) -> button::Style {
-    let p = *p;
-    move |_theme, _status| button::Style {
-        background: Some(
-            Color {
-                a: 0.14,
-                ..p.accent
-            }
-            .into(),
-        ),
-        text_color: p.text_primary,
-        border: Border {
-            radius: 4.0.into(),
-            ..Border::default()
-        },
-        shadow: Shadow::default(),
-        ..button::Style::default()
-    }
-}
-
-pub(crate) fn tab(p: &Palette, active: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
-    let p = *p;
-    move |_theme, status| {
-        if active {
-            button::Style {
-                background: None,
-                text_color: p.text_primary,
-                border: Border {
-                    color: p.accent,
-                    width: 0.0,
-                    radius: 0.0.into(),
-                },
-                ..button::Style::default()
+        if status == Status::Disabled {
+            Style {
+                background: style.background.map(|b| b.scale_alpha(0.5)),
+                text_color: alpha(style.text_color, 0.5),
+                ..style
             }
         } else {
-            button::Style {
-                background: match status {
-                    button::Status::Hovered => Some(p.bg_hover.into()),
-                    _ => None,
-                },
-                text_color: match status {
-                    button::Status::Hovered => p.text_secondary,
-                    _ => p.text_tertiary,
-                },
-                border: Border {
-                    radius: 0.0.into(),
-                    ..Border::default()
-                },
-                ..button::Style::default()
-            }
+            style
         }
     }
 }

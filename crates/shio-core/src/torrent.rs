@@ -1,23 +1,40 @@
-mod selection;
+mod metainfo;
 mod session;
+mod staging;
 
 use std::path::Path;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-use self::selection::{
-    selected_bytes, selected_file_indexes, selected_size, snapshot_with_selection, upload_ratio,
+use librqbit::{
+    AddTorrent, AddTorrentOptions, ManagedTorrent, ManagedTorrentState, Session, TorrentStatsState,
 };
-pub(crate) use self::session::{open_session, pause_torrent_in_session, stop_torrent_in_session};
-use librqbit::Session;
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
-use crate::error::{Result, ShioError};
-use crate::types::{
-    Download, DownloadId, DownloadProgress, DownloadStatus, MagnetPreviewManifest, ProgressDetail,
-    TorrentFile, TorrentProgressSnapshot, TorrentSource,
+use self::metainfo::staged_files;
+pub use self::metainfo::{MAX_TORRENT_METADATA_BYTES, TorrentManifest, parse_torrent_manifest};
+pub(crate) use self::metainfo::{parse_magnet_info_hash, validate_torrent_state};
+pub(crate) use self::session::{
+    librqbit_rate_limit, open_session, resolve_magnet_preview, stop_torrent_in_session,
 };
+use self::session::{pause_torrent_in_session, resolve_magnet, torrent_id};
+use self::staging::ensure_owned_staging;
+pub(crate) use self::staging::{
+    cleanup_staging, prepare_completed_recheck, published_files, staging_root,
+};
+use crate::config::AppConfig;
+use crate::engine::{ActiveSlot, MetadataCommit};
+use crate::error::{Result, ShioError};
+use crate::extract::Readiness;
+use crate::types::{
+    Download, DownloadProgress, DownloadStatus, TorrentSource, TorrentState, TorrentStats,
+};
+
+const DOWNLOAD_TICK: Duration = Duration::from_millis(500);
+const METADATA_TICK: Duration = Duration::from_secs(1);
+const SEED_TICK: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "mode", rename_all = "snake_case")]
@@ -39,33 +56,27 @@ impl Default for SeedPolicy {
 }
 
 impl SeedPolicy {
-    pub fn validate(self) -> Result<Self> {
-        fn validate_ratio(ratio: f32) -> Result<()> {
-            if ratio.is_finite() && ratio >= 0.0 {
-                return Ok(());
-            }
-            Err(ShioError::Other(
-                "seed ratio must be finite and non-negative".into(),
-            ))
-        }
-
+    pub(crate) fn validate(self) -> Result<()> {
         match self {
-            Self::StopAtRatio { ratio } | Self::RatioOrTime { ratio, .. } => {
-                validate_ratio(ratio)?;
+            Self::StopAtRatio { ratio } | Self::RatioOrTime { ratio, .. }
+                if !ratio.is_finite() || ratio < 0.0 =>
+            {
+                Err(ShioError::Config(
+                    "seed ratio must be finite and non-negative".into(),
+                ))
             },
-            Self::StopAtTime { .. } | Self::SeedForever | Self::NeverSeed => {},
+            _ => Ok(()),
         }
-        Ok(self)
     }
 
-    pub fn should_stop(&self, ratio: f32, seed_elapsed_secs: u64) -> bool {
+    fn should_stop(self, ratio: f32, seed_elapsed_secs: u64) -> bool {
         match self {
-            Self::StopAtRatio { ratio: r } => ratio >= *r,
-            Self::StopAtTime { seconds: s } => seed_elapsed_secs >= *s,
+            Self::StopAtRatio { ratio: limit } => ratio >= limit,
+            Self::StopAtTime { seconds } => seed_elapsed_secs >= seconds,
             Self::RatioOrTime {
-                ratio: r,
-                seconds: s,
-            } => ratio >= *r || seed_elapsed_secs >= *s,
+                ratio: limit,
+                seconds,
+            } => ratio >= limit || seed_elapsed_secs >= seconds,
             Self::SeedForever => false,
             Self::NeverSeed => true,
         }
@@ -76,365 +87,354 @@ pub(crate) struct TorrentWorkerDeps {
     pub(crate) session: Arc<Session>,
     pub(crate) progress_tx: mpsc::Sender<DownloadProgress>,
     pub(crate) cancel: CancellationToken,
-    pub(crate) seed_policy: SeedPolicy,
-    pub(crate) config: crate::config::AppConfig,
-    pub(crate) on_download_phase_finished: Box<dyn FnOnce() + Send + 'static>,
+    pub(crate) config: watch::Receiver<AppConfig>,
+    pub(crate) slot: ActiveSlot,
+    pub(crate) metadata: MetadataCommit,
 }
 
-impl std::fmt::Debug for TorrentWorkerDeps {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("TorrentWorkerDeps")
-            .field("seed_policy", &self.seed_policy)
-            .finish_non_exhaustive()
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TorrentManifest {
-    pub info_hash: [u8; 20],
-    pub name: String,
-    pub total_size: u64,
-    pub is_private: bool,
-    pub files: Vec<TorrentFile>,
-    pub trackers: Vec<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum TorrentWorkerExit {
-    Completed,
-    SeedingStopped,
-    Paused,
-    Cancelled,
-}
-
-pub(crate) async fn run_torrent(
-    mut download: Download,
-    deps: TorrentWorkerDeps,
-) -> Result<TorrentWorkerExit> {
+pub(crate) async fn run_torrent(download: Download, deps: TorrentWorkerDeps) -> Result<()> {
     let TorrentWorkerDeps {
         session,
         progress_tx,
         cancel,
-        seed_policy,
         config,
-        on_download_phase_finished,
+        slot,
+        metadata,
     } = deps;
-    let id = download.id;
-    let torrent = download
+    let state = download
         .torrent()
-        .ok_or_else(|| ShioError::Other("run_torrent: expected torrent kind".into()))?
-        .clone();
-
-    if cancel.is_cancelled() {
-        return Ok(TorrentWorkerExit::Cancelled);
-    }
-
-    let add = add_torrent_from_state(&torrent);
-    let opts = librqbit::AddTorrentOptions {
-        overwrite: true,
-        paused: false,
-        only_files: selected_file_indexes(&torrent.files)?,
-        output_folder: Some(
-            crate::path::path_to_utf8("downloads.save_path", &download.save_path)?.to_string(),
-        ),
-        ..Default::default()
-    };
-
-    let response = session
-        .add_torrent(add, Some(opts))
-        .await
-        .map_err(|e| ShioError::Other(format!("add_torrent: {e}")))?;
-    let handle = response
-        .into_handle()
-        .ok_or_else(|| ShioError::Other("add_torrent returned list-only".into()))?;
-
-    emit_status(
-        &progress_tx,
-        id,
-        DownloadStatus::FetchingMetadata,
-        download.downloaded,
-        download.total_size,
-    )
-    .await;
-
-    if !wait_for_torrent_metadata(&handle, id, &progress_tx, &cancel).await? {
-        pause_torrent_for_interrupt(&session, torrent.info_hash, id).await;
-        return Ok(TorrentWorkerExit::Cancelled);
-    }
-
-    let initial_stats = handle.stats();
-    let (resolved_name, snapshot) = build_torrent_snapshot(&handle, &initial_stats)?;
-    let snapshot = snapshot_with_selection(&snapshot, &torrent.files);
-    apply_torrent_snapshot(&mut download, &resolved_name, &snapshot);
-    emit_torrent_metadata(
-        &progress_tx,
-        download.id,
-        download.total_size.or(Some(initial_stats.total_bytes)),
-        &resolved_name,
-        snapshot,
-        DownloadStatus::FetchingMetadata,
-    )
-    .await;
-
-    if phase_after_metadata(TorrentWorkerCancellation::from_token(&cancel))
-        == TorrentWorkerPhase::Paused
-    {
-        pause_torrent_for_interrupt(&session, torrent.info_hash, id).await;
-        return Ok(TorrentWorkerExit::Paused);
-    }
-
-    if handle.is_paused() {
-        session
-            .unpause(&handle)
-            .await
-            .map_err(|e| ShioError::Other(format!("unpause: {e}")))?;
-    }
-
-    emit_status(
-        &progress_tx,
-        id,
-        DownloadStatus::Downloading,
-        download.downloaded,
-        download.total_size,
-    )
-    .await;
-
-    if run_download_phase(
-        &session,
-        &progress_tx,
-        &cancel,
-        &handle,
-        id,
-        torrent.info_hash,
-        download.torrent().map(|torrent| torrent.files.as_slice()),
-    )
-    .await?
-        == DownloadPhaseExit::Cancelled
-    {
-        return Ok(TorrentWorkerExit::Cancelled);
-    }
-
-    run_auto_extract(&download, &config, &progress_tx, id).await?;
-
-    let persisted_seed_elapsed = torrent.seed_elapsed_secs;
-    let selected_bytes = download
-        .torrent()
-        .map_or(0, |torrent| selected_bytes(&torrent.files));
-    on_download_phase_finished();
-
-    run_seeding_phase(SeedingPhase {
-        session: &session,
-        progress_tx: &progress_tx,
-        cancel: &cancel,
-        seed_policy,
-        handle: &handle,
-        id,
-        info_hash: torrent.info_hash,
-        persisted_seed_elapsed,
-        selected_bytes,
-        selected_files: download.torrent().map(|torrent| torrent.files.as_slice()),
-        downloaded: download.downloaded,
-        total_size: download.total_size,
-    })
-    .await
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DownloadPhaseExit {
-    Finished,
-    Cancelled,
-}
-
-async fn run_download_phase(
-    session: &Session,
-    progress_tx: &mpsc::Sender<DownloadProgress>,
-    cancel: &CancellationToken,
-    handle: &librqbit::ManagedTorrent,
-    id: DownloadId,
-    info_hash: [u8; 20],
-    selected_files: Option<&[TorrentFile]>,
-) -> Result<DownloadPhaseExit> {
-    let mut tick = tokio::time::interval(std::time::Duration::from_millis(500));
-    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-    loop {
-        tokio::select! {
-            () = cancel.cancelled() => {
-                pause_torrent_for_interrupt(session, info_hash, id).await;
-                return Ok(DownloadPhaseExit::Cancelled);
-            },
-            _ = tick.tick() => {
-                let stats = handle.stats();
-                emit_torrent_progress(
-                    progress_tx,
-                    id,
-                    &stats,
-                    DownloadStatus::Downloading,
-                    0,
-                    None,
-                    selected_files,
-                )
-                .await;
-                if matches!(stats.state, librqbit::TorrentStatsState::Error) {
-                    return Err(ShioError::Other(
-                        stats.error.unwrap_or_else(|| "torrent error".into()),
-                    ));
-                }
-                if stats.finished {
-                    return Ok(DownloadPhaseExit::Finished);
-                }
-            }
-        }
-    }
-}
-
-async fn run_auto_extract(
-    download: &Download,
-    config: &crate::config::AppConfig,
-    progress_tx: &mpsc::Sender<DownloadProgress>,
-    id: DownloadId,
-) -> Result<()> {
-    if !download
-        .torrent()
-        .is_some_and(|torrent| torrent.auto_extract)
-        || !crate::worker::extraction_ready(download).await
-    {
-        return Ok(());
-    }
-
-    emit_status(
-        progress_tx,
-        id,
-        DownloadStatus::Extracting,
-        download.downloaded,
-        download.total_size,
-    )
-    .await;
-    let extract_result = crate::worker::run_extract(download, config, None).await;
-    let status = crate::worker::status_for_extract_result(&extract_result);
-    emit_status(
-        progress_tx,
-        id,
-        status,
-        download.downloaded,
-        download.total_size,
-    )
-    .await;
-    extract_result
-}
-
-struct SeedingPhase<'a> {
-    session: &'a Session,
-    progress_tx: &'a mpsc::Sender<DownloadProgress>,
-    cancel: &'a CancellationToken,
-    seed_policy: SeedPolicy,
-    handle: &'a librqbit::ManagedTorrent,
-    id: DownloadId,
-    info_hash: [u8; 20],
-    persisted_seed_elapsed: u64,
-    selected_bytes: u64,
-    selected_files: Option<&'a [TorrentFile]>,
-    downloaded: u64,
-    total_size: Option<u64>,
-}
-
-async fn run_seeding_phase(phase: SeedingPhase<'_>) -> Result<TorrentWorkerExit> {
-    let SeedingPhase {
+        .ok_or_else(|| ShioError::Other("expected a torrent download".into()))?;
+    let mut worker = Worker {
+        info_hash: state.info_hash,
+        base: state.stats,
+        last_uploaded: 0,
+        selected: Vec::new(),
+        selected_bytes: 0,
+        download,
         session,
         progress_tx,
         cancel,
-        seed_policy,
-        handle,
-        id,
-        info_hash,
-        persisted_seed_elapsed,
-        selected_bytes,
-        selected_files,
-        downloaded,
-        total_size,
-    } = phase;
+        config,
+    };
+    let result = worker.run(slot, &metadata).await;
+    if result.is_err()
+        && let Err(error) = pause_torrent_in_session(&worker.session, worker.info_hash).await
+    {
+        tracing::warn!(download = %worker.download.id, "pause torrent after interrupt failed: {error}");
+    }
+    result
+}
 
-    if matches!(seed_policy, SeedPolicy::NeverSeed) {
-        stop_torrent_in_session(session, info_hash).await?;
-        emit_torrent_progress(
-            progress_tx,
-            id,
-            &handle.stats(),
-            DownloadStatus::Completed,
-            persisted_seed_elapsed,
-            Some(selected_bytes),
-            selected_files,
-        )
-        .await;
-        return Ok(TorrentWorkerExit::Completed);
+struct Worker {
+    download: Download,
+    info_hash: [u8; 20],
+    session: Arc<Session>,
+    progress_tx: mpsc::Sender<DownloadProgress>,
+    cancel: CancellationToken,
+    config: watch::Receiver<AppConfig>,
+    /// Counters from earlier runs; librqbit restarts its own in every session.
+    base: TorrentStats,
+    last_uploaded: u64,
+    selected: Vec<(usize, u64)>,
+    selected_bytes: u64,
+}
+
+impl Worker {
+    const fn torrent(&self) -> &TorrentState {
+        self.download
+            .torrent()
+            .expect("run_torrent only builds a worker for torrent downloads")
     }
 
-    emit_status(
-        progress_tx,
-        id,
-        DownloadStatus::Seeding,
-        downloaded,
-        total_size,
-    )
-    .await;
+    async fn run(&mut self, slot: ActiveSlot, metadata: &MetadataCommit) -> Result<()> {
+        let bytes = self.metadata(metadata).await?;
+        let staged = staged_files(self.torrent(), &bytes)?;
+        self.selected = self
+            .torrent()
+            .files
+            .iter()
+            .zip(&staged)
+            .filter(|(file, _)| file.selected)
+            .map(|(file, staged)| (staged.index, file.size))
+            .collect();
+        self.selected_bytes = self.selected.iter().map(|&(_, size)| size).sum();
+        let everything = self.selected.len() == staged.len()
+            && staged.iter().enumerate().all(|(i, file)| file.index == i);
+        let only_files =
+            (!everything).then(|| self.selected.iter().map(|&(index, _)| index).collect());
 
-    let seed_start = std::time::Instant::now();
-    let mut seed_tick = tokio::time::interval(std::time::Duration::from_secs(2));
-    seed_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let payload = ensure_owned_staging(&self.download).await?;
+        let was_published = staging::is_published(&self.download).await?;
+        if !was_published {
+            staging::check_destinations(&self.download, &staged).await?;
+        }
+        let handle = self
+            .until_cancelled(self.handle(bytes, &payload, only_files))
+            .await??;
+        self.download_phase(&handle).await?;
+        if !was_published {
+            let never_seeds = matches!(
+                self.config.borrow().torrent.seed_policy,
+                SeedPolicy::NeverSeed
+            );
+            staging::publish_payload(&self.download, &staged, never_seeds).await?;
+            self.auto_extract(&handle).await?;
+        }
+        drop(slot);
+        self.seed(&handle).await
+    }
 
-    loop {
-        tokio::select! {
-            () = cancel.cancelled() => {
-                let stats = handle.stats();
-                let seed_elapsed = accumulated_seed_elapsed_secs(persisted_seed_elapsed, seed_start);
-                emit_torrent_progress(
-                    progress_tx,
-                    id,
-                    &stats,
-                    DownloadStatus::Paused,
-                    seed_elapsed,
-                    Some(selected_bytes),
-                    selected_files,
-                )
-                .await;
-                return Ok(TorrentWorkerExit::Paused);
+    /// Magnet metadata is validated and committed before librqbit sees it, so unvalidated
+    /// metadata never reaches the disk.
+    async fn metadata(&mut self, commit: &MetadataCommit) -> Result<Vec<u8>> {
+        let state = self.torrent();
+        let magnet = match (&state.source, &state.metadata_bytes) {
+            (TorrentSource::File(bytes), _) | (TorrentSource::Magnet(_), Some(bytes)) => {
+                return Ok(bytes.clone());
             },
-            _ = seed_tick.tick() => {
-                let stats = handle.stats();
-                let seed_elapsed = accumulated_seed_elapsed_secs(persisted_seed_elapsed, seed_start);
-                let ratio = upload_ratio(stats.uploaded_bytes, selected_bytes);
-                emit_torrent_progress(
-                    progress_tx,
-                    id,
-                    &stats,
-                    DownloadStatus::Seeding,
-                    seed_elapsed,
-                    Some(selected_bytes),
-                    selected_files,
-                )
-                .await;
-                if seed_policy.should_stop(ratio, seed_elapsed) {
-                    stop_torrent_in_session(session, info_hash).await?;
-                    emit_torrent_progress(
-                        progress_tx,
-                        id,
-                        &stats,
-                        DownloadStatus::Completed,
-                        seed_elapsed,
-                        Some(selected_bytes),
-                        selected_files,
-                    )
-                    .await;
-                    return Ok(TorrentWorkerExit::SeedingStopped);
-                }
+            (TorrentSource::Magnet(magnet), None) => magnet.clone(),
+        };
+        let bytes = self.resolve_metadata(&magnet).await?;
+        let manifest = parse_torrent_manifest(&bytes)?;
+        if let Some(state) = self.download.torrent_mut() {
+            state.files.clone_from(&manifest.files);
+        }
+        commit.commit(manifest, bytes.clone()).await?;
+        Ok(bytes)
+    }
+
+    async fn resolve_metadata(&self, magnet: &str) -> Result<Vec<u8>> {
+        let started = Instant::now();
+        let resolve = resolve_magnet(&self.session, magnet);
+        tokio::pin!(resolve);
+        loop {
+            self.send(DownloadProgress {
+                id: self.download.id,
+                status: DownloadStatus::FetchingMetadata,
+                downloaded: self.download.downloaded,
+                total_size: self.download.total_size,
+                speed: 0,
+                torrent: Some(TorrentStats {
+                    metadata_wait_secs: started.elapsed().as_secs(),
+                    ..self.base
+                }),
+            })
+            .await;
+            tokio::select! {
+                () = self.cancel.cancelled() => return Err(ShioError::Cancelled),
+                bytes = &mut resolve => return bytes,
+                () = tokio::time::sleep(METADATA_TICK) => {},
             }
         }
     }
-}
 
-async fn pause_torrent_for_interrupt(session: &Session, info_hash: [u8; 20], id: DownloadId) {
-    if let Err(e) = pause_torrent_in_session(session, info_hash).await {
-        tracing::warn!(download = %id, "pause torrent after interrupt failed: {e}");
+    /// Reuses the session's entry when it matches this download, otherwise replaces it: librqbit
+    /// answers a re-add with the existing entry and ignores the new folder and file selection.
+    async fn handle(
+        &self,
+        bytes: Vec<u8>,
+        output_folder: &Path,
+        only_files: Option<Vec<usize>>,
+    ) -> Result<Arc<ManagedTorrent>> {
+        if let Some(handle) = self.session.get(torrent_id(self.info_hash)) {
+            if handle.output_folder() == output_folder && handle.only_files() == only_files {
+                let errored =
+                    handle.with_state(|state| matches!(state, ManagedTorrentState::Error(_)));
+                if handle.is_paused() || errored {
+                    self.session
+                        .unpause(&handle)
+                        .await
+                        .map_err(|e| ShioError::Other(format!("resume torrent: {e:#}")))?;
+                }
+                return Ok(handle);
+            }
+            stop_torrent_in_session(&self.session, self.info_hash).await?;
+        }
+        let output_folder = output_folder
+            .to_str()
+            .ok_or_else(|| ShioError::Other("torrent download folder is not valid UTF-8".into()))?;
+        let options = AddTorrentOptions {
+            // The staging folder belongs to this download, so librqbit may reuse its files.
+            overwrite: true,
+            only_files,
+            output_folder: Some(output_folder.to_owned()),
+            ..Default::default()
+        };
+        self.session
+            .add_torrent(AddTorrent::from_bytes(bytes), Some(options))
+            .await
+            .map_err(|e| ShioError::Other(format!("add torrent: {e:#}")))?
+            .into_handle()
+            .ok_or_else(|| ShioError::Other("add torrent: librqbit returned no handle".into()))
+    }
+
+    async fn download_phase(&mut self, handle: &Arc<ManagedTorrent>) -> Result<()> {
+        loop {
+            let stats = handle.stats();
+            self.check_state(handle, &stats).await?;
+            self.send(self.progress(
+                &stats,
+                DownloadStatus::Downloading,
+                self.base.seed_elapsed_secs,
+            ))
+            .await;
+            if stats.finished {
+                return Ok(());
+            }
+            self.until_cancelled(tokio::time::sleep(DOWNLOAD_TICK))
+                .await?;
+        }
+    }
+
+    async fn auto_extract(&self, handle: &ManagedTorrent) -> Result<()> {
+        if !self.torrent().auto_extract {
+            return Ok(());
+        }
+        match crate::worker::extraction_readiness(&self.download).await {
+            None => return Ok(()),
+            Some(Readiness::Ready) => {},
+            Some(Readiness::PasswordRequired) => return Err(ShioError::PasswordRequired),
+            Some(Readiness::Incomplete) => {
+                return Err(ShioError::Extract("archive set is incomplete".into()));
+            },
+        }
+        self.send(self.progress(
+            &handle.stats(),
+            DownloadStatus::Extracting,
+            self.base.seed_elapsed_secs,
+        ))
+        .await;
+        let config = self.config.borrow().clone();
+        crate::worker::run_extract(
+            std::slice::from_ref(&self.download),
+            &config,
+            None,
+            self.cancel.clone(),
+        )
+        .await
+    }
+
+    async fn seed(&mut self, handle: &Arc<ManagedTorrent>) -> Result<()> {
+        let started = Instant::now();
+        let mut status = DownloadStatus::Downloading;
+        loop {
+            let stats = handle.stats();
+            self.check_state(handle, &stats).await?;
+            let seed_elapsed = self
+                .base
+                .seed_elapsed_secs
+                .saturating_add(started.elapsed().as_secs());
+            let uploaded = self.base.uploaded.saturating_add(stats.uploaded_bytes);
+            let policy = self.config.borrow().torrent.seed_policy;
+            if policy.should_stop(ratio(uploaded, self.selected_bytes), seed_elapsed) {
+                self.send(self.progress(&stats, status, seed_elapsed)).await;
+                self.leave_session().await;
+                return Ok(());
+            }
+            status = DownloadStatus::Seeding;
+            self.send(self.progress(&stats, status, seed_elapsed)).await;
+            self.until_cancelled(tokio::time::sleep(SEED_TICK)).await?;
+        }
+    }
+
+    /// The payload is published, so failing to leave the session must not fail the download.
+    async fn leave_session(&self) {
+        let left = match stop_torrent_in_session(&self.session, self.info_hash).await {
+            Ok(()) => cleanup_staging(&self.download).await,
+            Err(error) => {
+                if let Err(pause_error) =
+                    pause_torrent_in_session(&self.session, self.info_hash).await
+                {
+                    tracing::warn!(download = %self.download.id, "pause finished torrent failed: {pause_error}");
+                }
+                Err(error)
+            },
+        };
+        if let Err(error) = left {
+            tracing::warn!(download = %self.download.id, "finished torrent left session state behind: {error}");
+        }
+    }
+
+    async fn check_state(
+        &mut self,
+        handle: &Arc<ManagedTorrent>,
+        stats: &librqbit::TorrentStats,
+    ) -> Result<()> {
+        match stats.state {
+            TorrentStatsState::Error => Err(ShioError::Other(format!(
+                "torrent: {}",
+                stats.error.as_deref().unwrap_or("unknown error")
+            ))),
+            // A pause from an earlier run of this download can land after this run resumed it.
+            TorrentStatsState::Paused => {
+                self.base.uploaded = self.base.uploaded.saturating_add(self.last_uploaded);
+                self.last_uploaded = 0;
+                self.session
+                    .unpause(handle)
+                    .await
+                    .map_err(|e| ShioError::Other(format!("resume torrent: {e:#}")))
+            },
+            TorrentStatsState::Live => {
+                self.last_uploaded = stats.uploaded_bytes;
+                Ok(())
+            },
+            TorrentStatsState::Initializing { .. } => Ok(()),
+        }
+    }
+
+    fn progress(
+        &self,
+        stats: &librqbit::TorrentStats,
+        status: DownloadStatus,
+        seed_elapsed_secs: u64,
+    ) -> DownloadProgress {
+        let live = stats.live.as_ref();
+        let download_speed = live.map_or(0, |live| mbps_to_bps(live.download_speed.mbps));
+        let upload_speed = live.map_or(0, |live| mbps_to_bps(live.upload_speed.mbps));
+        let downloaded = if stats.file_progress.is_empty() {
+            self.download.downloaded
+        } else {
+            self.selected
+                .iter()
+                .map(|&(index, size)| {
+                    stats
+                        .file_progress
+                        .get(index)
+                        .map_or(0, |&have| have.min(size))
+                })
+                .fold(0, u64::saturating_add)
+        };
+        let uploaded = self.base.uploaded.saturating_add(stats.uploaded_bytes);
+        DownloadProgress {
+            id: self.download.id,
+            status,
+            downloaded,
+            total_size: Some(self.selected_bytes),
+            speed: if status == DownloadStatus::Seeding {
+                upload_speed
+            } else {
+                download_speed
+            },
+            torrent: Some(TorrentStats {
+                peers: live.map_or(0, |live| live.snapshot.peer_stats.live),
+                uploaded,
+                upload_speed,
+                ratio: ratio(uploaded, self.selected_bytes),
+                seed_elapsed_secs,
+                metadata_wait_secs: 0,
+            }),
+        }
+    }
+
+    async fn send(&self, progress: DownloadProgress) {
+        let _ = self.progress_tx.send(progress).await;
+    }
+
+    async fn until_cancelled<T>(&self, future: impl Future<Output = T>) -> Result<T> {
+        tokio::select! {
+            () = self.cancel.cancelled() => Err(ShioError::Cancelled),
+            value = future => Ok(value),
+        }
     }
 }
 
@@ -442,814 +442,145 @@ fn mbps_to_bps(mbps: f64) -> u64 {
     (mbps * 1024.0 * 1024.0) as u64
 }
 
-fn compute_ratio(stats: &librqbit::TorrentStats) -> f32 {
-    upload_ratio(stats.uploaded_bytes, stats.progress_bytes)
-}
-
-fn add_torrent_from_state(torrent: &crate::types::TorrentState) -> librqbit::AddTorrent<'_> {
-    match &torrent.source {
-        TorrentSource::File(bytes) => librqbit::AddTorrent::from_bytes(bytes.clone()),
-        TorrentSource::Magnet(magnet) => torrent.metadata_bytes.as_ref().map_or_else(
-            || librqbit::AddTorrent::from_url(magnet.clone()),
-            |bytes| librqbit::AddTorrent::from_bytes(bytes.clone()),
-        ),
+fn ratio(uploaded: u64, selected_bytes: u64) -> f32 {
+    if selected_bytes == 0 {
+        return 0.0;
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TorrentWorkerCancellation {
-    Requested,
-    Clear,
-}
-
-impl TorrentWorkerCancellation {
-    fn from_token(token: &CancellationToken) -> Self {
-        if token.is_cancelled() {
-            Self::Requested
-        } else {
-            Self::Clear
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TorrentWorkerPhase {
-    Downloading,
-    Paused,
-}
-
-const fn phase_after_metadata(cancellation: TorrentWorkerCancellation) -> TorrentWorkerPhase {
-    match cancellation {
-        TorrentWorkerCancellation::Requested => TorrentWorkerPhase::Paused,
-        TorrentWorkerCancellation::Clear => TorrentWorkerPhase::Downloading,
-    }
-}
-
-async fn wait_for_torrent_metadata(
-    handle: &librqbit::ManagedTorrent,
-    id: DownloadId,
-    progress_tx: &mpsc::Sender<DownloadProgress>,
-    cancel: &CancellationToken,
-) -> Result<bool> {
-    let init = handle.wait_until_initialized();
-    tokio::pin!(init);
-    let metadata_started = std::time::Instant::now();
-    let mut metadata_tick = tokio::time::interval(std::time::Duration::from_secs(5));
-    metadata_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    loop {
-        tokio::select! {
-            res = &mut init => {
-                res.map_err(|e| ShioError::Other(format!("metadata init: {e}")))?;
-                return Ok(true);
-            }
-            _ = metadata_tick.tick() => {
-                emit_torrent_wait(
-                    progress_tx,
-                    id,
-                    DownloadStatus::FetchingMetadata,
-                    metadata_started.elapsed().as_secs(),
-                )
-                .await;
-            }
-            () = cancel.cancelled() => {
-                return Ok(false);
-            }
-        }
-    }
-}
-
-fn build_torrent_snapshot(
-    handle: &librqbit::ManagedTorrent,
-    stats: &librqbit::TorrentStats,
-) -> Result<(String, TorrentProgressSnapshot)> {
-    let metadata: Result<ResolvedTorrentMetadata> = handle
-        .with_metadata(|metadata| {
-            let selected = handle.only_files();
-            let files = metadata
-                .file_infos
-                .iter()
-                .enumerate()
-                .map(|(index, file)| {
-                    validate_torrent_file_path(&file.relative_filename)?;
-                    Ok(TorrentFile {
-                        path: file.relative_filename.clone(),
-                        size: file.len,
-                        downloaded: stats.file_progress.get(index).copied().unwrap_or(0),
-                        selected: selected
-                            .as_ref()
-                            .is_none_or(|selected| selected.contains(&index)),
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?;
-            let trackers = handle
-                .shared()
-                .trackers
-                .iter()
-                .map(url::Url::to_string)
-                .collect::<Vec<_>>();
-            let name = metadata
-                .name
-                .clone()
-                .filter(|name| !name.is_empty())
-                .unwrap_or_else(|| "torrent".to_string());
-            let is_private = metadata.info.private;
-            Ok(ResolvedTorrentMetadata {
-                name,
-                is_private,
-                files,
-                trackers,
-                metadata_bytes: metadata.torrent_bytes.to_vec(),
-            })
-        })
-        .map_err(|e| ShioError::Other(format!("torrent metadata: {e}")))?;
-
-    let metadata = metadata?;
-    Ok((
-        crate::sanitize_filename(&metadata.name),
-        TorrentProgressSnapshot {
-            is_private: metadata.is_private,
-            files: metadata.files,
-            trackers: metadata.trackers,
-            metadata_bytes: Some(metadata.metadata_bytes),
-        },
-    ))
-}
-
-#[derive(Debug)]
-struct ResolvedTorrentMetadata {
-    name: String,
-    is_private: bool,
-    files: Vec<TorrentFile>,
-    trackers: Vec<String>,
-    metadata_bytes: Vec<u8>,
-}
-
-fn apply_torrent_snapshot(
-    download: &mut Download,
-    filename: &str,
-    snapshot: &TorrentProgressSnapshot,
-) {
-    download.filename = filename.to_string();
-    download.downloaded = selected_downloaded(&snapshot.files);
-    download.total_size = Some(selected_size(&snapshot.files));
-    if let Some(torrent) = download.torrent_mut() {
-        torrent.is_private = snapshot.is_private;
-        torrent.files.clone_from(&snapshot.files);
-        torrent.trackers.clone_from(&snapshot.trackers);
-        if let Some(metadata_bytes) = snapshot.metadata_bytes.as_ref() {
-            torrent.metadata_bytes = Some(metadata_bytes.clone());
-        }
-    }
-}
-
-fn selected_downloaded(files: &[TorrentFile]) -> u64 {
-    files
-        .iter()
-        .filter(|file| file.selected)
-        .map(|file| file.downloaded)
-        .sum()
-}
-
-fn selected_progress(files: &[TorrentFile], file_progress: &[u64]) -> u64 {
-    files
-        .iter()
-        .zip(file_progress)
-        .filter(|(file, _)| file.selected)
-        .map(|(_, downloaded)| *downloaded)
-        .sum()
-}
-
-async fn emit_status(
-    tx: &mpsc::Sender<DownloadProgress>,
-    id: DownloadId,
-    status: DownloadStatus,
-    downloaded: u64,
-    total_size: Option<u64>,
-) {
-    let _ = tx
-        .send(status_progress(id, status, downloaded, total_size))
-        .await;
-}
-
-const fn status_progress(
-    id: DownloadId,
-    status: DownloadStatus,
-    downloaded: u64,
-    total_size: Option<u64>,
-) -> DownloadProgress {
-    DownloadProgress {
-        id,
-        downloaded,
-        total_size,
-        speed: 0,
-        avg_speed: 0,
-        status,
-        detail: ProgressDetail::empty_torrent(),
-        filename: None,
-        torrent_snapshot: None,
-    }
-}
-
-async fn emit_torrent_metadata(
-    tx: &mpsc::Sender<DownloadProgress>,
-    id: DownloadId,
-    total_size: Option<u64>,
-    filename: &str,
-    snapshot: TorrentProgressSnapshot,
-    status: DownloadStatus,
-) {
-    let _ = tx
-        .send(DownloadProgress {
-            id,
-            downloaded: selected_downloaded(&snapshot.files),
-            total_size,
-            speed: 0,
-            avg_speed: 0,
-            status,
-            detail: ProgressDetail::empty_torrent(),
-            filename: Some(filename.to_string()),
-            torrent_snapshot: Some(snapshot),
-        })
-        .await;
-}
-
-async fn emit_torrent_progress(
-    tx: &mpsc::Sender<DownloadProgress>,
-    id: DownloadId,
-    stats: &librqbit::TorrentStats,
-    status: DownloadStatus,
-    seed_elapsed_secs: u64,
-    ratio_bytes: Option<u64>,
-    selected_files: Option<&[TorrentFile]>,
-) {
-    let live = stats.live.as_ref();
-    let download_speed = live.map_or(0, |l| mbps_to_bps(l.download_speed.mbps));
-    let upload_speed = live.map_or(0, |l| mbps_to_bps(l.upload_speed.mbps));
-    let peers_connected = live.map_or(0, |l| l.snapshot.peer_stats.live as u32);
-    let ratio = ratio_bytes.map_or_else(
-        || compute_ratio(stats),
-        |bytes| upload_ratio(stats.uploaded_bytes, bytes),
-    );
-    let primary_speed = if status == DownloadStatus::Seeding {
-        upload_speed
-    } else {
-        download_speed
-    };
-    let downloaded = selected_files.map_or(stats.progress_bytes, |files| {
-        selected_progress(files, &stats.file_progress)
-    });
-    let total_size = selected_files.map_or(stats.total_bytes, selected_bytes);
-
-    let _ = tx
-        .send(DownloadProgress {
-            id,
-            downloaded,
-            total_size: Some(total_size),
-            speed: primary_speed,
-            avg_speed: primary_speed,
-            status,
-            detail: ProgressDetail::Torrent {
-                peers_connected,
-                seeders: 0,
-                leechers: 0,
-                uploaded: stats.uploaded_bytes,
-                upload_speed,
-                ratio,
-                seed_elapsed_secs,
-                metadata_wait_secs: 0,
-            },
-            filename: None,
-            torrent_snapshot: None,
-        })
-        .await;
-}
-
-async fn emit_torrent_wait(
-    tx: &mpsc::Sender<DownloadProgress>,
-    id: DownloadId,
-    status: DownloadStatus,
-    metadata_wait_secs: u64,
-) {
-    let _ = tx
-        .send(DownloadProgress {
-            id,
-            downloaded: 0,
-            total_size: None,
-            speed: 0,
-            avg_speed: 0,
-            status,
-            detail: ProgressDetail::Torrent {
-                peers_connected: 0,
-                seeders: 0,
-                leechers: 0,
-                uploaded: 0,
-                upload_speed: 0,
-                ratio: 0.0,
-                seed_elapsed_secs: 0,
-                metadata_wait_secs,
-            },
-            filename: None,
-            torrent_snapshot: None,
-        })
-        .await;
-}
-
-pub(crate) fn parse_magnet_info_hash(magnet: &str) -> Result<[u8; 20]> {
-    let m = librqbit::Magnet::parse(magnet)
-        .map_err(|e| ShioError::Other(format!("invalid magnet: {e}")))?;
-    m.as_id20()
-        .map(|h| h.0)
-        .ok_or_else(|| ShioError::Other("magnet missing v1 info hash".into()))
-}
-
-pub fn parse_torrent_manifest(bytes: &[u8]) -> Result<TorrentManifest> {
-    let meta: librqbit::TorrentMetaV1Owned = librqbit::torrent_from_bytes(bytes)
-        .map_err(|e| ShioError::Other(format!("invalid .torrent: {e}")))?;
-    let name = meta
-        .info
-        .name
-        .as_ref()
-        .and_then(|name| std::str::from_utf8(name.as_ref()).ok())
-        .filter(|name| !name.is_empty())
-        .map_or_else(|| "torrent".to_string(), crate::sanitize_filename);
-    let files = meta
-        .info
-        .iter_file_details()
-        .map_err(|e| ShioError::Other(format!("torrent files: {e}")))?
-        .map(|file| {
-            let path = file
-                .filename
-                .to_pathbuf()
-                .map_err(|e| ShioError::Other(format!("torrent file path: {e}")))?;
-            validate_torrent_file_path(&path)?;
-            Ok(TorrentFile {
-                path,
-                size: file.len,
-                downloaded: 0,
-                selected: true,
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let trackers = meta
-        .iter_announce()
-        .filter_map(|tracker| std::str::from_utf8(tracker.as_ref()).ok())
-        .filter(|tracker| !tracker.is_empty())
-        .map(str::to_string)
-        .collect::<Vec<_>>();
-    let total_size = files.iter().map(|file| file.size).sum();
-
-    Ok(TorrentManifest {
-        info_hash: meta.info_hash.0,
-        name,
-        total_size,
-        is_private: meta.info.private,
-        files,
-        trackers,
-    })
-}
-
-pub(crate) fn magnet_preview_manifest_from_bytes(bytes: &[u8]) -> Result<MagnetPreviewManifest> {
-    let manifest = parse_torrent_manifest(bytes)?;
-    Ok(MagnetPreviewManifest {
-        name: manifest.name,
-        total_size: manifest.total_size,
-        is_private: manifest.is_private,
-        files: manifest.files,
-        trackers: manifest.trackers,
-        metadata_bytes: bytes.to_vec(),
-    })
-}
-
-pub(crate) async fn resolve_magnet_preview(
-    session: &Arc<Session>,
-    magnet: &str,
-) -> Result<MagnetPreviewManifest> {
-    let response = session
-        .add_torrent(
-            librqbit::AddTorrent::from_url(magnet),
-            Some(librqbit::AddTorrentOptions {
-                list_only: true,
-                ..Default::default()
-            }),
-        )
-        .await
-        .map_err(|e| ShioError::Other(format!("magnet metadata: {e}")))?;
-
-    let torrent_bytes = match response {
-        librqbit::AddTorrentResponse::AlreadyManaged(_, handle) => handle
-            .with_metadata(|metadata| metadata.torrent_bytes.clone())
-            .map_err(|e| ShioError::Other(format!("magnet metadata: {e}")))?,
-        librqbit::AddTorrentResponse::ListOnly(librqbit::ListOnlyResponse {
-            torrent_bytes,
-            ..
-        }) => torrent_bytes,
-        librqbit::AddTorrentResponse::Added(_, _) => {
-            return Err(ShioError::Other(
-                "magnet preview unexpectedly started a download".into(),
-            ));
-        },
-    };
-
-    magnet_preview_manifest_from_bytes(&torrent_bytes)
-}
-
-fn validate_torrent_file_path(path: &Path) -> Result<()> {
-    crate::path::validate_relative_path(path).map_err(|e| ShioError::Other(e.to_string()))
-}
-
-fn accumulated_seed_elapsed_secs(persisted_secs: u64, seed_started_at: std::time::Instant) -> u64 {
-    persisted_secs.saturating_add(seed_started_at.elapsed().as_secs())
+    (uploaded as f64 / selected_bytes as f64) as f32
 }
 
 #[cfg(test)]
 mod tests {
-    use self::session::listen_port_range;
     use super::*;
-    use librqbit::SessionOptions;
 
-    const UBUNTU_MAGNET: &str =
-        "magnet:?xt=urn:btih:cab507494d02ebb1178b38f2e9d7be299c86b862&dn=ubuntu";
-
-    fn sample_torrent_bytes() -> Vec<u8> {
-        let pieces = b"abcdefghijklmnopqrst";
-        let mut bytes = b"d8:announce35:udp://tracker.example:1337/announce4:infod5:filesld6:lengthi123e4:pathl7:foo.txteed6:lengthi456e4:pathl3:bar7:baz.mkveee4:name7:release12:piece lengthi16384e6:pieces20:".to_vec();
-        bytes.extend_from_slice(pieces);
-        bytes.extend_from_slice(b"ee");
-        bytes
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn torrent_file_with_known_files_reaches_metadata_progress() {
-        let tmp = tempfile::TempDir::new().expect("tempdir");
-        let session = Session::new_with_opts(
-            tmp.path().join("rqbit-output"),
-            SessionOptions {
-                disable_dht: true,
-                persistence: None,
-                listen_port_range: None,
-                enable_upnp_port_forwarding: false,
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("session");
-        let (progress_tx, mut progress_rx) = mpsc::channel(8);
-        let cancel = CancellationToken::new();
-        let mut download = Download::try_from_torrent(
-            TorrentSource::File(sample_torrent_bytes()),
-            tmp.path().join("downloads"),
-        )
-        .expect("valid torrent fixture");
-        download.status = DownloadStatus::Queued;
-
-        let deps = TorrentWorkerDeps {
-            session,
-            progress_tx,
-            cancel: cancel.clone(),
-            seed_policy: SeedPolicy::NeverSeed,
-            config: crate::config::AppConfig::default(),
-            on_download_phase_finished: Box::new(|| {}),
+    #[test]
+    fn seed_policy_stops_at_its_limits() {
+        let both = SeedPolicy::RatioOrTime {
+            ratio: 1.0,
+            seconds: 60,
         };
-
-        let task = tokio::spawn(run_torrent(download, deps));
-        let saw_metadata = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            while let Some(progress) = progress_rx.recv().await {
-                if progress.status == DownloadStatus::FetchingMetadata
-                    && progress.torrent_snapshot.is_some()
-                {
-                    return true;
-                }
-            }
-            false
-        })
-        .await
-        .expect("metadata timeout");
-        cancel.cancel();
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), task).await;
-
-        assert!(saw_metadata);
-    }
-
-    #[test]
-    fn parses_valid_magnet_info_hash() {
-        let h = parse_magnet_info_hash(UBUNTU_MAGNET).expect("parse");
-        assert_eq!(h.len(), 20);
-    }
-
-    #[test]
-    fn rejects_invalid_magnet() {
-        assert!(parse_magnet_info_hash("not a magnet").is_err());
-    }
-
-    #[test]
-    fn rejects_invalid_torrent_bytes() {
-        assert!(parse_torrent_manifest(&[0u8; 16]).is_err());
-    }
-
-    #[test]
-    fn parses_torrent_manifest_files_and_trackers() {
-        let manifest = parse_torrent_manifest(&sample_torrent_bytes()).expect("manifest");
-
-        assert_eq!(manifest.name, "release");
-        assert_eq!(manifest.total_size, 579);
-        assert_eq!(manifest.files.len(), 2);
-        assert_eq!(manifest.files[0].path, std::path::PathBuf::from("foo.txt"));
-        assert_eq!(
-            manifest.files[1].path,
-            std::path::PathBuf::from("bar/baz.mkv")
-        );
-        assert!(manifest.files.iter().all(|file| file.selected));
-        assert_eq!(
-            manifest.trackers,
-            vec!["udp://tracker.example:1337/announce".to_string()]
-        );
-    }
-
-    #[test]
-    fn torrent_path_validation_rejects_unsafe_paths() {
-        for path in [
-            std::path::PathBuf::from("../evil.bin"),
-            std::path::PathBuf::from("/tmp/evil.bin"),
-            std::path::PathBuf::from("release/../evil.bin"),
-            std::path::PathBuf::from(""),
-            std::path::PathBuf::from("CON"),
-            std::path::PathBuf::from("folder/NUL.txt"),
-        ] {
-            assert!(validate_torrent_file_path(&path).is_err(), "{path:?}");
-        }
-    }
-
-    #[test]
-    fn torrent_path_validation_accepts_nested_relative_paths() {
-        assert!(validate_torrent_file_path(std::path::Path::new("release/cd1/file.bin")).is_ok());
-    }
-
-    #[test]
-    fn magnet_preview_manifest_uses_torrent_metadata() {
-        let manifest =
-            magnet_preview_manifest_from_bytes(&sample_torrent_bytes()).expect("preview manifest");
-
-        assert_eq!(manifest.name, "release");
-        assert_eq!(manifest.total_size, 579);
-        assert_eq!(manifest.files.len(), 2);
-        assert!(manifest.files.iter().all(|file| file.selected));
-        assert_eq!(
-            manifest.trackers,
-            vec!["udp://tracker.example:1337/announce".to_string()]
-        );
-    }
-
-    #[test]
-    fn magnet_preview_manifest_retains_metadata_bytes() {
-        let bytes = sample_torrent_bytes();
-        let manifest = magnet_preview_manifest_from_bytes(&bytes).expect("preview manifest");
-
-        assert_eq!(manifest.metadata_bytes, bytes);
-    }
-
-    #[test]
-    fn selected_file_indexes_returns_only_unchecked_filter() {
-        let mut manifest = parse_torrent_manifest(&sample_torrent_bytes()).expect("manifest");
-        assert_eq!(selected_file_indexes(&manifest.files).unwrap(), None);
-
-        manifest.files[0].selected = false;
-
-        assert_eq!(
-            selected_file_indexes(&manifest.files).unwrap(),
-            Some(vec![1])
-        );
-    }
-
-    #[test]
-    fn selected_file_indexes_rejects_empty_selection() {
-        let mut manifest = parse_torrent_manifest(&sample_torrent_bytes()).expect("manifest");
-        for file in &mut manifest.files {
-            file.selected = false;
-        }
-
-        assert!(selected_file_indexes(&manifest.files).is_err());
-    }
-
-    #[test]
-    fn snapshot_keeps_existing_deselected_files() {
-        let mut download = Download::try_from_torrent(
-            TorrentSource::File(sample_torrent_bytes()),
-            std::path::PathBuf::from("/tmp"),
-        )
-        .expect("valid torrent fixture");
-        download
-            .torrent_mut()
-            .expect("torrent")
-            .files
-            .get_mut(0)
-            .expect("file")
-            .selected = false;
-
-        let snapshot = TorrentProgressSnapshot {
-            is_private: false,
-            files: vec![
-                TorrentFile {
-                    path: std::path::PathBuf::from("foo.txt"),
-                    size: 123,
-                    downloaded: 0,
-                    selected: true,
-                },
-                TorrentFile {
-                    path: std::path::PathBuf::from("bar/baz.mkv"),
-                    size: 456,
-                    downloaded: 0,
-                    selected: true,
-                },
-            ],
-            trackers: Vec::new(),
-            metadata_bytes: None,
-        };
-
-        let snapshot =
-            snapshot_with_selection(&snapshot, &download.torrent().expect("torrent").files);
-        apply_torrent_snapshot(&mut download, "release", &snapshot);
-
-        let files = &download.torrent().expect("torrent").files;
-        assert!(!files[0].selected);
-        assert_eq!(download.total_size, Some(456));
-    }
-
-    #[test]
-    fn metadata_snapshot_preserves_requested_selection() {
-        let existing = vec![
-            TorrentFile {
-                path: std::path::PathBuf::from("foo.txt"),
-                size: 123,
-                downloaded: 0,
-                selected: false,
-            },
-            TorrentFile {
-                path: std::path::PathBuf::from("bar/baz.mkv"),
-                size: 456,
-                downloaded: 0,
-                selected: true,
-            },
-        ];
-        let snapshot = TorrentProgressSnapshot {
-            is_private: false,
-            files: vec![
-                TorrentFile {
-                    path: std::path::PathBuf::from("foo.txt"),
-                    size: 123,
-                    downloaded: 7,
-                    selected: true,
-                },
-                TorrentFile {
-                    path: std::path::PathBuf::from("bar/baz.mkv"),
-                    size: 456,
-                    downloaded: 9,
-                    selected: true,
-                },
-            ],
-            trackers: Vec::new(),
-            metadata_bytes: None,
-        };
-
-        let preserved = snapshot_with_selection(&snapshot, &existing);
-
-        assert!(!preserved.files[0].selected);
-        assert_eq!(preserved.files[1].downloaded, 9);
-    }
-
-    #[test]
-    fn listen_port_range_clamps_high_ports() {
-        assert_eq!(listen_port_range(6881), 6881..6891);
-        assert_eq!(listen_port_range(u16::MAX), 65525..65535);
-    }
-
-    #[test]
-    fn seed_policy_should_stop_for_each_mode() {
-        let cases = [
-            (SeedPolicy::StopAtRatio { ratio: 1.0 }, 0.9, 999_999, false),
+        for (policy, ratio, elapsed, expected) in [
+            (SeedPolicy::StopAtRatio { ratio: 1.0 }, 0.9, u64::MAX, false),
             (SeedPolicy::StopAtRatio { ratio: 1.0 }, 1.0, 0, true),
             (SeedPolicy::StopAtTime { seconds: 60 }, 99.0, 59, false),
             (SeedPolicy::StopAtTime { seconds: 60 }, 0.0, 60, true),
-            (
-                SeedPolicy::RatioOrTime {
-                    ratio: 1.0,
-                    seconds: 60,
-                },
-                0.5,
-                30,
-                false,
-            ),
-            (
-                SeedPolicy::RatioOrTime {
-                    ratio: 1.0,
-                    seconds: 60,
-                },
-                1.0,
-                0,
-                true,
-            ),
-            (
-                SeedPolicy::RatioOrTime {
-                    ratio: 1.0,
-                    seconds: 60,
-                },
-                0.0,
-                60,
-                true,
-            ),
-            (SeedPolicy::SeedForever, 999.0, 999_999, false),
+            (both, 0.5, 30, false),
+            (both, 1.0, 0, true),
+            (both, 0.0, 60, true),
+            (SeedPolicy::SeedForever, 999.0, u64::MAX, false),
             (SeedPolicy::NeverSeed, 0.0, 0, true),
-            (SeedPolicy::default(), 1.0, 0, true),
-            (SeedPolicy::default(), 0.0, 7 * 24 * 60 * 60, true),
-            (SeedPolicy::default(), 0.5, 60, false),
-        ];
-
-        for (policy, ratio, elapsed, expected) in cases {
+        ] {
             assert_eq!(policy.should_stop(ratio, elapsed), expected, "{policy:?}");
         }
     }
 
     #[test]
-    fn seed_policy_validation_rejects_invalid_ratios_and_allows_zero_limits() {
-        for policy in [
-            SeedPolicy::StopAtRatio { ratio: f32::NAN },
-            SeedPolicy::StopAtRatio {
-                ratio: f32::INFINITY,
-            },
-            SeedPolicy::StopAtRatio { ratio: -0.1 },
-            SeedPolicy::RatioOrTime {
-                ratio: -0.1,
-                seconds: 60,
-            },
-        ] {
-            assert!(policy.validate().is_err(), "{policy:?}");
+    fn seed_policy_rejects_invalid_ratios() {
+        for ratio in [f32::NAN, f32::INFINITY, -0.1] {
+            assert!(SeedPolicy::StopAtRatio { ratio }.validate().is_err());
+            assert!(
+                SeedPolicy::RatioOrTime { ratio, seconds: 0 }
+                    .validate()
+                    .is_err()
+            );
         }
-
         assert!(SeedPolicy::StopAtRatio { ratio: 0.0 }.validate().is_ok());
-        assert!(SeedPolicy::StopAtTime { seconds: 0 }.validate().is_ok());
+    }
+
+    const PAYLOAD: &[u8] = &[7; 40_000];
+
+    async fn staged_torrent(root: &Path, name: &str) -> (Download, Arc<Session>) {
+        let source = root.join("source");
+        std::fs::create_dir_all(&source).expect("source dir");
+        std::fs::write(source.join(name), PAYLOAD).expect("payload");
+        let created = librqbit::create_torrent(
+            &source.join(name),
+            librqbit::CreateTorrentOptions {
+                name: None,
+                trackers: Vec::new(),
+                piece_length: Some(16_384),
+            },
+            &librqbit::spawn_utils::BlockingSpawner::new(1),
+        )
+        .await
+        .expect("create torrent");
+        let bytes = created.as_bytes().expect("torrent bytes").to_vec();
+        let download = metainfo::tests::torrent_download(bytes, root.join("downloads"));
+        let staged = ensure_owned_staging(&download).await.expect("staging");
+        std::fs::write(staged.join(name), PAYLOAD).expect("staged payload");
+        let session = Session::new_with_opts(
+            root.join("session"),
+            librqbit::SessionOptions {
+                dht: None,
+                persistence: None,
+                listen: None,
+                disable_local_service_discovery: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("session");
+        (download, session)
+    }
+
+    async fn run_never_seed(
+        download: &Download,
+        session: &Arc<Session>,
+    ) -> (Result<()>, Vec<DownloadProgress>) {
+        let mut config = AppConfig::default();
+        config.torrent.seed_policy = SeedPolicy::NeverSeed;
+        let (_config_tx, config_rx) = watch::channel(config);
+        let (progress_tx, mut progress_rx) = mpsc::channel(64);
+        let deps = TorrentWorkerDeps {
+            session: session.clone(),
+            progress_tx,
+            cancel: CancellationToken::new(),
+            config: config_rx,
+            slot: ActiveSlot::detached(),
+            metadata: MetadataCommit::detached(),
+        };
+        let result =
+            tokio::time::timeout(Duration::from_secs(30), run_torrent(download.clone(), deps))
+                .await
+                .expect("worker timeout");
+        let mut progress = Vec::new();
+        while let Ok(update) = progress_rx.try_recv() {
+            progress.push(update);
+        }
+        (result, progress)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn never_seed_publishes_and_keeps_final_progress() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (download, session) = staged_torrent(temp.path(), "data.bin").await;
+
+        let (result, progress) = run_never_seed(&download, &session).await;
+
+        result.expect("worker");
+        let last = progress.last().expect("progress");
+        assert_eq!(last.downloaded, PAYLOAD.len() as u64);
+        assert_eq!(last.total_size, Some(PAYLOAD.len() as u64));
+        let published = temp.path().join("downloads/data.bin");
+        assert_eq!(std::fs::read(published).expect("published"), PAYLOAD);
+        assert!(!staging_root(&download).exists());
+        let info_hash = download.torrent().expect("torrent").info_hash;
+        assert!(session.get(torrent_id(info_hash)).is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resuming_a_published_torrent_does_not_extract_again() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (mut download, session) = staged_torrent(temp.path(), "data.rar").await;
+        download.torrent_mut().expect("torrent").auto_extract = true;
+
+        let (first, _) = run_never_seed(&download, &session).await;
+        let (resumed, _) = run_never_seed(&download, &session).await;
+
         assert!(
-            SeedPolicy::RatioOrTime {
-                ratio: 0.0,
-                seconds: 0,
-            }
-            .validate()
-            .is_ok()
+            first.is_err(),
+            "the bogus archive must fail its first extraction"
         );
-    }
-
-    #[test]
-    fn selected_bytes_sums_only_selected_files() {
-        let files = vec![
-            TorrentFile {
-                path: std::path::PathBuf::from("a.bin"),
-                size: 100,
-                downloaded: 100,
-                selected: true,
-            },
-            TorrentFile {
-                path: std::path::PathBuf::from("b.bin"),
-                size: 900,
-                downloaded: 0,
-                selected: false,
-            },
-        ];
-
-        assert_eq!(selected_bytes(&files), 100);
-    }
-
-    #[test]
-    fn upload_ratio_uses_selected_bytes() {
-        assert_eq!(upload_ratio(50, 100), 0.5);
-        assert_eq!(upload_ratio(100, 100), 1.0);
-    }
-
-    #[test]
-    fn upload_ratio_is_zero_when_selected_bytes_unknown() {
-        assert_eq!(upload_ratio(500, 0), 0.0);
-    }
-
-    #[test]
-    fn accumulated_seed_elapsed_adds_persisted_offset() {
-        let started = std::time::Instant::now()
-            .checked_sub(std::time::Duration::from_secs(12))
-            .expect("instant subtraction should be in range");
-
-        assert!(accumulated_seed_elapsed_secs(300, started) >= 312);
-    }
-
-    #[test]
-    fn accumulated_seed_elapsed_saturates_at_u64_max() {
-        let started = std::time::Instant::now()
-            .checked_sub(std::time::Duration::from_secs(12))
-            .expect("instant subtraction should be in range");
-
-        assert_eq!(accumulated_seed_elapsed_secs(u64::MAX, started), u64::MAX);
-    }
-
-    #[test]
-    fn metadata_phase_does_not_resume_after_cancellation() {
-        assert_eq!(
-            phase_after_metadata(TorrentWorkerCancellation::Requested),
-            TorrentWorkerPhase::Paused
-        );
+        resumed.expect("resume skips extraction of the published payload");
     }
 }

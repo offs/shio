@@ -5,7 +5,8 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 repository.workspace = true
-description = "download engine"
+description = "Download engine used by the Shio desktop application"
+publish = false
 
 [dependencies]
 tokio = { workspace = true }
@@ -22,10 +23,8 @@ thiserror = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
 url = { workspace = true }
-bytesize = { workspace = true }
-regex = { workspace = true }
 directories = { workspace = true }
-async-trait = { workspace = true }
+tempfile = { workspace = true }
 librqbit = { workspace = true }
 
 zip = { workspace = true }
@@ -33,11 +32,15 @@ sevenz-rust2 = { workspace = true }
 tar = { workspace = true }
 flate2 = { workspace = true }
 zstd = { workspace = true }
-unrar = { workspace = true }
+rars = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_System_IO", "Win32_System_Ioctl"] }
 
 [dev-dependencies]
-tempfile = "3.27.0"
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+rars = { workspace = true, features = ["write"] }
+sevenz-rust2 = { workspace = true, features = ["compress"] }
+tokio = { workspace = true, features = ["net"] }
 
 [lints]
 workspace = true

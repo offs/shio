@@ -1,16 +1,10 @@
-use std::path::PathBuf;
+use crate::link::is_magnet;
+use std::ffi::OsString;
+#[cfg(not(any(windows, target_os = "linux")))]
+use std::io;
+use std::path::{Path, PathBuf};
 
-#[cfg(windows)]
-const REGISTERED_APP_NAME: &str = "Shio";
-#[cfg(windows)]
-const TORRENT_PROG_ID: &str = "Shio.Torrent";
-#[cfg(windows)]
-const MAGNET_PROG_ID: &str = "Shio.Magnet";
-
-#[cfg(any(windows, target_os = "linux"))]
-const TORRENT_MIME: &str = "application/x-bittorrent";
-#[cfg(target_os = "linux")]
-const MAGNET_MIME: &str = "x-scheme-handler/magnet";
+pub(crate) const UNREGISTER_FLAG: &str = "--unregister-associations";
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct AssociationLaunch {
@@ -18,206 +12,278 @@ pub(crate) struct AssociationLaunch {
     pub(crate) torrent_files: Vec<PathBuf>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct AssociationError {
-    message: String,
-}
-
-impl AssociationError {
-    fn new(message: impl Into<String>) -> Self {
-        Self {
-            message: message.into(),
-        }
-    }
-}
-
-impl std::fmt::Display for AssociationError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.message)
-    }
-}
-
-impl std::error::Error for AssociationError {}
-
-pub(crate) fn association_launch_from_args<I>(args: I) -> AssociationLaunch
-where
-    I: IntoIterator<Item = std::ffi::OsString>,
-{
+pub(crate) fn association_launch_from_args(
+    args: impl IntoIterator<Item = OsString>,
+) -> AssociationLaunch {
     let mut launch = AssociationLaunch::default();
-
     for arg in args.into_iter().skip(1) {
-        if let Some(value) = arg.to_str()
-            && value
-                .trim_start()
-                .to_ascii_lowercase()
-                .starts_with("magnet:")
-        {
-            launch.magnets.push(value.trim().to_string());
-            continue;
+        if let Some(value) = arg.to_str().map(str::trim) {
+            if is_magnet(value) {
+                launch.magnets.push(value.to_owned());
+                continue;
+            }
+            if !is_windows_drive_path(value)
+                && let Ok(url) = url::Url::parse(value)
+            {
+                // `file:name` parses as `/name`, and a host would be a remote (UNC) share.
+                if value
+                    .get(..7)
+                    .is_some_and(|scheme| scheme.eq_ignore_ascii_case("file://"))
+                    && url.host().is_none()
+                    && let Ok(path) = url.to_file_path()
+                    && is_torrent_path(&path)
+                {
+                    launch.torrent_files.push(path);
+                }
+                continue;
+            }
         }
-
         let path = PathBuf::from(arg);
-        if path
-            .extension()
-            .and_then(std::ffi::OsStr::to_str)
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("torrent"))
+        if is_torrent_path(&path)
+            && let Ok(path) = std::path::absolute(path)
         {
             launch.torrent_files.push(path);
         }
     }
-
     launch
 }
 
-pub(crate) const fn successful_association_message() -> &'static str {
-    if default_app_settings_available() {
-        "registered shio; choose shio for .torrent and magnet in Windows Default Apps"
-    } else {
-        "file associations registered"
-    }
+const fn is_windows_drive_path(value: &str) -> bool {
+    matches!(value.as_bytes(), [drive, b':', b'\\' | b'/', ..] if drive.is_ascii_alphabetic())
 }
 
-pub(crate) fn complete_download_association_setup() -> Result<(), AssociationError> {
-    register_download_associations()?;
-    if default_app_settings_available() {
-        open_default_app_settings()?;
-    }
-    Ok(())
+fn is_torrent_path(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("torrent"))
 }
 
-fn register_download_associations() -> Result<(), AssociationError> {
-    #[cfg(windows)]
-    {
-        windows::register_download_associations()
-    }
+pub(crate) const ASSOCIATION_SETUP_SUPPORTED: bool = cfg!(any(windows, target_os = "linux"));
 
-    #[cfg(target_os = "linux")]
-    {
-        linux::register_download_associations()
-    }
+pub(crate) const ASSOCIATION_SUCCESS_MESSAGE: &str = if cfg!(windows) {
+    "registered shio; choose it for .torrent and magnet in default apps"
+} else {
+    "shio now opens .torrent files and magnet links"
+};
 
-    #[cfg(all(not(windows), not(target_os = "linux")))]
-    {
-        Err(AssociationError::new(
-            "file association setup is only implemented on Windows and Linux",
-        ))
-    }
+#[cfg(windows)]
+pub(crate) use windows::{
+    register as register_associations, unregister as unregister_associations,
+};
+
+#[cfg(target_os = "linux")]
+pub(crate) use linux::{register as register_associations, unregister as unregister_associations};
+
+#[cfg(not(any(windows, target_os = "linux")))]
+pub(crate) fn register_associations() -> io::Result<()> {
+    Err(io::Error::from(io::ErrorKind::Unsupported))
 }
 
-const fn default_app_settings_available() -> bool {
-    cfg!(windows)
-}
-
-fn open_default_app_settings() -> Result<(), AssociationError> {
-    #[cfg(windows)]
-    {
-        open::that("ms-settings:defaultapps")
-            .map_err(|e| AssociationError::new(format!("open Windows default apps: {e}")))?;
-        Ok(())
-    }
-
-    #[cfg(not(windows))]
-    {
-        Err(AssociationError::new(
-            "default app settings are only implemented on Windows",
-        ))
-    }
+#[cfg(not(any(windows, target_os = "linux")))]
+pub(crate) fn unregister_associations() -> io::Result<()> {
+    Err(io::Error::from(io::ErrorKind::Unsupported))
 }
 
 #[cfg(target_os = "linux")]
 mod linux {
-    use super::{AssociationError, MAGNET_MIME, TORRENT_MIME, default_handler_matches};
-    use crate::platform::APP_USER_MODEL_ID;
-    use std::io::Write;
+    use crate::platform::{APP_ID, ICON_BYTES, reject_non_file, remove_if_exists};
+    use std::ffi::OsString;
+    use std::io::{self, Write};
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     use std::path::{Path, PathBuf};
-    use std::process::Command;
+    use std::process::{Command, Output};
 
-    pub(super) fn register_download_associations() -> Result<(), AssociationError> {
-        let exe = std::env::current_exe()
-            .map_err(|e| AssociationError::new(format!("resolve shio executable: {e}")))?;
-        let applications_dir = applications_dir()?;
-        std::fs::create_dir_all(&applications_dir).map_err(|e| {
-            AssociationError::new(format!("create {}: {e}", applications_dir.display()))
-        })?;
+    const MIME_TYPES: [&str; 2] = ["application/x-bittorrent", "x-scheme-handler/magnet"];
+    const PACKAGED_ENTRY: &str =
+        include_str!("../../../../packaging/linux/com.shio.DownloadManager.desktop");
+    // The icon theme spec asks for at least a 48px hicolor icon.
+    const ICONS: [(&str, &[u8]); 2] = [
+        (
+            "48x48",
+            include_bytes!("../../../../assets/icons/icon-48.png"),
+        ),
+        ("256x256", ICON_BYTES),
+    ];
 
-        let desktop_id = format!("{APP_USER_MODEL_ID}.desktop");
-        let desktop_path = applications_dir.join(&desktop_id);
-        let mut file = std::fs::File::create(&desktop_path).map_err(|e| {
-            AssociationError::new(format!("create {}: {e}", desktop_path.display()))
-        })?;
-        file.write_all(desktop_entry(&exe).as_bytes())
-            .map_err(|e| AssociationError::new(format!("write {}: {e}", desktop_path.display())))?;
+    pub(crate) fn register() -> io::Result<()> {
+        let entry = desktop_entry(&stable_executable()?)?;
+        let data = data_home()?;
+        for (size, bytes) in ICONS {
+            write_atomic(&icon_path(&data, size), bytes)?;
+        }
+        let applications = data.join("applications");
+        let desktop_id = desktop_id();
+        write_atomic(&applications.join(&desktop_id), entry.as_bytes())?;
+        update_desktop_database(&applications);
+        for mime in MIME_TYPES {
+            let set = xdg_mime(&["default", &desktop_id, mime])?;
+            if !set.status.success() {
+                return Err(io::Error::other(format!(
+                    "xdg-mime default {mime} failed with {}",
+                    set.status
+                )));
+            }
+            let query = xdg_mime(&["query", "default", mime])?;
+            if !String::from_utf8_lossy(&query.stdout)
+                .lines()
+                .any(|line| line.trim() == desktop_id)
+            {
+                return Err(io::Error::other(format!(
+                    "the desktop did not make shio the default for {mime}"
+                )));
+            }
+        }
+        Ok(())
+    }
 
+    pub(crate) fn unregister() -> io::Result<()> {
+        let data = data_home()?;
+        let applications = data.join("applications");
+        for (size, _) in ICONS {
+            remove_if_exists(&icon_path(&data, size))?;
+        }
+        remove_if_exists(&applications.join(desktop_id()))?;
+        update_desktop_database(&applications);
+        Ok(())
+    }
+
+    fn desktop_id() -> String {
+        format!("{APP_ID}.desktop")
+    }
+
+    fn icon_path(data: &Path, size: &str) -> PathBuf {
+        data.join(format!("icons/hicolor/{size}/apps/{APP_ID}.png"))
+    }
+
+    fn data_home() -> io::Result<PathBuf> {
+        if let Some(data) = std::env::var_os("XDG_DATA_HOME").filter(|d| Path::new(d).is_absolute())
+        {
+            return Ok(data.into());
+        }
+        let home = std::env::var_os("HOME").ok_or_else(|| io::Error::other("HOME is not set"))?;
+        Ok(PathBuf::from(home).join(".local/share"))
+    }
+
+    fn xdg_mime(args: &[&str]) -> io::Result<Output> {
+        Command::new("xdg-mime")
+            .args(args)
+            .output()
+            .map_err(|error| {
+                if error.kind() == io::ErrorKind::NotFound {
+                    io::Error::new(error.kind(), "xdg-mime not found; install xdg-utils")
+                } else {
+                    error
+                }
+            })
+    }
+
+    fn update_desktop_database(applications: &Path) {
         match Command::new("update-desktop-database")
-            .arg(&applications_dir)
+            .arg(applications)
             .status()
         {
             Ok(status) if status.success() => {},
             Ok(status) => tracing::warn!("update-desktop-database failed with {status}"),
-            Err(e) => tracing::warn!("update-desktop-database could not run: {e}"),
+            Err(error) => tracing::warn!("update-desktop-database: {error}"),
         }
-        set_xdg_mime_default(&desktop_id, TORRENT_MIME)?;
-        set_xdg_mime_default(&desktop_id, MAGNET_MIME)?;
-        verify_xdg_mime_default(&desktop_id, TORRENT_MIME)?;
-        verify_xdg_mime_default(&desktop_id, MAGNET_MIME)
     }
 
-    fn applications_dir() -> Result<PathBuf, AssociationError> {
-        if let Some(data_home) = std::env::var_os("XDG_DATA_HOME") {
-            return Ok(PathBuf::from(data_home).join("applications"));
-        }
-        let home =
-            std::env::var_os("HOME").ok_or_else(|| AssociationError::new("HOME is not set"))?;
-        Ok(PathBuf::from(home).join(".local/share/applications"))
-    }
-
-    fn desktop_entry(exe: &Path) -> String {
-        format!(
-            "[Desktop Entry]\nType=Application\nName=Shio\nExec={} %U\nTerminal=false\nMimeType={TORRENT_MIME};{MAGNET_MIME};\nCategories=Network;FileTransfer;\n",
-            shell_quote(&exe.display().to_string())
-        )
-    }
-
-    fn shell_quote(value: &str) -> String {
-        format!("'{}'", value.replace('\'', "'\\''"))
-    }
-
-    fn set_xdg_mime_default(desktop_id: &str, mime: &str) -> Result<(), AssociationError> {
-        let status = Command::new("xdg-mime")
-            .arg("default")
-            .arg(desktop_id)
-            .arg(mime)
-            .status()
-            .map_err(|e| AssociationError::new(format!("run xdg-mime: {e}")))?;
-        if status.success() {
-            return Ok(());
-        }
-        Err(AssociationError::new(format!(
-            "xdg-mime default {desktop_id} {mime} failed with {status}"
-        )))
-    }
-
-    fn verify_xdg_mime_default(desktop_id: &str, mime: &str) -> Result<(), AssociationError> {
-        let output = Command::new("xdg-mime")
-            .arg("query")
-            .arg("default")
-            .arg(mime)
-            .output()
-            .map_err(|e| AssociationError::new(format!("query xdg-mime default {mime}: {e}")))?;
-        if !output.status.success() {
-            return Err(AssociationError::new(format!(
-                "xdg-mime query default {mime} failed with {}",
-                output.status
+    fn stable_executable() -> io::Result<PathBuf> {
+        let path = select_executable(
+            std::env::var_os("APPIMAGE"),
+            std::env::var_os("APPDIR"),
+            std::env::current_exe()?,
+        )?;
+        let metadata = std::fs::symlink_metadata(&path)?;
+        if !metadata.is_file() || metadata.permissions().mode() & 0o111 == 0 {
+            return Err(io::Error::other(format!(
+                "{} is not a regular executable file",
+                path.display()
             )));
         }
+        Ok(path)
+    }
 
-        let actual = String::from_utf8_lossy(&output.stdout);
-        if default_handler_matches(desktop_id, &actual) {
-            return Ok(());
+    // APPIMAGE is inherited by everything started from inside an image, so it names shio
+    // only while this executable lives in that image's own APPDIR mount.
+    fn select_executable(
+        appimage: Option<OsString>,
+        appdir: Option<OsString>,
+        current: PathBuf,
+    ) -> io::Result<PathBuf> {
+        let inside = appdir.is_some_and(|appdir| current.starts_with(appdir));
+        if let Some(appimage) = appimage.filter(|_| inside).map(PathBuf::from) {
+            return if appimage.is_absolute() {
+                Ok(appimage)
+            } else {
+                Err(io::Error::other("APPIMAGE is not an absolute path"))
+            };
         }
-        Err(AssociationError::new(format!(
-            "desktop did not make shio the default for {mime}"
-        )))
+        let transient = current
+            .components()
+            .any(|part| part.as_os_str().to_string_lossy().starts_with(".mount_"));
+        if transient {
+            return Err(io::Error::other(
+                "cannot register a transient AppImage mount path",
+            ));
+        }
+        Ok(current)
+    }
+
+    fn desktop_entry(exe: &Path) -> io::Result<String> {
+        let exe = exe
+            .to_str()
+            .filter(|exe| !exe.chars().any(char::is_control))
+            .ok_or_else(|| io::Error::other("the shio executable path is not plain UTF-8"))?;
+        let launch = format!(
+            "TryExec={}\nExec={} %U",
+            exe.replace('\\', "\\\\"),
+            exec_quote(exe)
+        );
+        Ok(PACKAGED_ENTRY.replacen("Exec=shio %U", &launch, 1))
+    }
+
+    // Exec values are unescaped as desktop strings before being unquoted, so quoted-argument
+    // escapes need their backslash doubled.
+    fn exec_quote(value: &str) -> String {
+        let mut quoted = String::with_capacity(value.len() + 2);
+        quoted.push('"');
+        for c in value.chars() {
+            match c {
+                '"' | '`' | '$' => {
+                    quoted.push_str("\\\\");
+                    quoted.push(c);
+                },
+                '\\' => quoted.push_str("\\\\\\\\"),
+                '%' => quoted.push_str("%%"),
+                _ => quoted.push(c),
+            }
+        }
+        quoted.push('"');
+        quoted
+    }
+
+    fn write_atomic(path: &Path, contents: &[u8]) -> io::Result<()> {
+        let dir = path
+            .parent()
+            .ok_or_else(|| io::Error::other("path has no parent"))?;
+        std::fs::create_dir_all(dir)?;
+        reject_non_file(path)?;
+        let temporary = dir.join(format!(".{APP_ID}.{}.tmp", std::process::id()));
+        let result = (|| {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o644)
+                .open(&temporary)?;
+            file.write_all(contents)?;
+            file.sync_all()?;
+            std::fs::rename(&temporary, path)?;
+            std::fs::File::open(dir)?.sync_all()
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&temporary);
+        }
+        result
     }
 
     #[cfg(test)]
@@ -225,403 +291,209 @@ mod linux {
         use super::*;
 
         #[test]
-        fn desktop_entry_declares_torrent_and_magnet_handlers() {
-            let entry = desktop_entry(Path::new("/opt/shio/shio"));
+        fn exec_escaping_follows_the_desktop_entry_spec() {
+            let entry = desktop_entry(Path::new("/opt/Shio $beta`\"\\%/shio")).unwrap();
 
-            assert!(entry.contains("application/x-bittorrent;x-scheme-handler/magnet;"));
+            assert!(entry.contains(r#"Exec="/opt/Shio \\$beta\\`\\"\\\\%%/shio" %U"#));
+            assert!(entry.contains("TryExec=/opt/Shio $beta`\"\\\\%/shio\n"));
+            assert!(desktop_entry(Path::new("/opt/shio\n/shio")).is_err());
+        }
+
+        #[test]
+        fn only_our_own_appimage_is_registered() {
+            let mounted = PathBuf::from("/tmp/.mount_shio/usr/bin/shio");
+            let ours = || Some("/tmp/.mount_shio".into());
+
+            assert_eq!(
+                select_executable(Some("/opt/Shio.AppImage".into()), ours(), mounted.clone())
+                    .unwrap(),
+                PathBuf::from("/opt/Shio.AppImage")
+            );
+            assert!(select_executable(None, None, mounted.clone()).is_err());
+            assert!(select_executable(Some("Shio.AppImage".into()), ours(), mounted).is_err());
+            assert_eq!(
+                select_executable(
+                    Some("/opt/Other.AppImage".into()),
+                    Some("/tmp/.mount_other".into()),
+                    PathBuf::from("/usr/bin/shio"),
+                )
+                .unwrap(),
+                PathBuf::from("/usr/bin/shio"),
+                "an APPIMAGE inherited from another image is ignored"
+            );
+        }
+
+        #[test]
+        fn atomic_writer_refuses_a_symbolic_link_target() {
+            let root = std::env::temp_dir().join(format!("shio-desktop-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&root).unwrap();
+            let target = root.join("unrelated.desktop");
+            std::fs::write(&target, b"keep me").unwrap();
+            let link = root.join("shio.desktop");
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+
+            assert!(write_atomic(&link, b"replace me").is_err());
+            assert_eq!(std::fs::read(&target).unwrap(), b"keep me");
+            std::fs::remove_dir_all(root).unwrap();
         }
     }
-}
-
-#[cfg(any(target_os = "linux", test))]
-fn default_handler_matches(desktop_id: &str, output: &str) -> bool {
-    output.lines().any(|line| line.trim() == desktop_id)
-}
-
-#[cfg(windows)]
-const fn current_exe_filename() -> &'static str {
-    "shio.exe"
-}
-
-#[cfg(windows)]
-const fn torrent_content_type() -> &'static str {
-    TORRENT_MIME
-}
-
-#[cfg(windows)]
-const fn magnet_content_type() -> &'static str {
-    "application/x-magnet"
-}
-
-#[cfg(windows)]
-const fn torrent_perceived_type() -> &'static str {
-    "application"
-}
-
-#[cfg(windows)]
-const fn torrent_friendly_type_name() -> &'static str {
-    "Torrent metadata file"
-}
-
-#[cfg(windows)]
-const fn magnet_friendly_type_name() -> &'static str {
-    "Magnet URI"
-}
-
-#[cfg(windows)]
-const fn application_description() -> &'static str {
-    "Download manager for direct links, .torrent files, and magnet links"
-}
-
-#[cfg(windows)]
-const fn application_name() -> &'static str {
-    REGISTERED_APP_NAME
-}
-
-#[cfg(windows)]
-const fn torrent_prog_id() -> &'static str {
-    TORRENT_PROG_ID
-}
-
-#[cfg(windows)]
-const fn magnet_prog_id() -> &'static str {
-    MAGNET_PROG_ID
-}
-
-#[cfg(windows)]
-const fn application_capabilities_path() -> &'static str {
-    "Software\\Shio\\Capabilities"
-}
-
-#[cfg(windows)]
-const fn registered_app_name() -> &'static str {
-    REGISTERED_APP_NAME
-}
-
-#[cfg(windows)]
-const fn registered_app_path() -> &'static str {
-    "Software\\Shio\\Capabilities"
-}
-
-#[cfg(windows)]
-fn shell_open_command(exe: &std::path::Path) -> String {
-    format!("\"{}\" \"%1\"", exe.display())
-}
-
-#[cfg(windows)]
-fn icon_reference(exe: &std::path::Path) -> String {
-    format!("{},0", exe.display())
-}
-
-#[cfg(windows)]
-fn install_location(exe: &std::path::Path) -> Option<String> {
-    exe.parent().map(|path| path.display().to_string())
-}
-
-#[cfg(windows)]
-fn application_exe_registry_key() -> String {
-    format!(
-        "Software\\Classes\\Applications\\{}",
-        current_exe_filename()
-    )
-}
-
-#[cfg(windows)]
-fn torrent_prog_id_key() -> String {
-    format!("Software\\Classes\\{}", torrent_prog_id())
-}
-
-#[cfg(windows)]
-fn magnet_prog_id_key() -> String {
-    format!("Software\\Classes\\{}", magnet_prog_id())
-}
-
-#[cfg(windows)]
-fn register_download_associations_windows(exe: &std::path::Path) -> Result<(), AssociationError> {
-    let command = shell_open_command(exe);
-    let icon = icon_reference(exe);
-
-    if let Some(install_location) = install_location(exe) {
-        windows::write_key("Software\\Shio", &[("InstallLocation", &install_location)])?;
-    }
-
-    windows::write_key(
-        application_capabilities_path(),
-        &[
-            ("ApplicationDescription", application_description()),
-            ("ApplicationIcon", &icon),
-            ("ApplicationName", application_name()),
-        ],
-    )?;
-    windows::write_key(
-        "Software\\Shio\\Capabilities\\FileAssociations",
-        &[(".torrent", torrent_prog_id())],
-    )?;
-    windows::write_key(
-        "Software\\Shio\\Capabilities\\MIMEAssociations",
-        &[(torrent_content_type(), torrent_prog_id())],
-    )?;
-    windows::write_key(
-        "Software\\Shio\\Capabilities\\UrlAssociations",
-        &[("magnet", magnet_prog_id())],
-    )?;
-    windows::write_key(
-        "Software\\RegisteredApplications",
-        &[(registered_app_name(), registered_app_path())],
-    )?;
-
-    windows::write_key(
-        &application_exe_registry_key(),
-        &[("FriendlyAppName", "Shio")],
-    )?;
-    windows::write_key(
-        &format!("{}\\SupportedTypes", application_exe_registry_key()),
-        &[(".torrent", "")],
-    )?;
-    windows::write_key(
-        &format!("{}\\shell\\open\\command", application_exe_registry_key()),
-        &[("", &command)],
-    )?;
-
-    windows::write_key(
-        &torrent_prog_id_key(),
-        &[
-            ("", "Torrent file"),
-            ("FriendlyTypeName", torrent_friendly_type_name()),
-        ],
-    )?;
-    windows::write_key(
-        &format!("{}\\DefaultIcon", torrent_prog_id_key()),
-        &[("", &icon)],
-    )?;
-    windows::write_key(
-        &format!("{}\\shell\\open\\command", torrent_prog_id_key()),
-        &[("", &command)],
-    )?;
-    windows::write_key(
-        "Software\\Classes\\.torrent",
-        &[
-            ("Content Type", torrent_content_type()),
-            ("PerceivedType", torrent_perceived_type()),
-        ],
-    )?;
-    windows::write_key(
-        "Software\\Classes\\.torrent\\OpenWithProgids",
-        &[(torrent_prog_id(), "")],
-    )?;
-    windows::write_key(
-        &format!(
-            "Software\\Classes\\.torrent\\OpenWithList\\{}",
-            current_exe_filename()
-        ),
-        &[("", "")],
-    )?;
-    windows::write_key(
-        "Software\\Classes\\MIME\\Database\\Content Type\\application/x-bittorrent",
-        &[("Extension", ".torrent")],
-    )?;
-
-    windows::write_key(
-        &magnet_prog_id_key(),
-        &[
-            ("", "Magnet link"),
-            ("FriendlyTypeName", magnet_friendly_type_name()),
-            ("URL Protocol", ""),
-        ],
-    )?;
-    windows::write_key(
-        &format!("{}\\DefaultIcon", magnet_prog_id_key()),
-        &[("", &icon)],
-    )?;
-    windows::write_key(
-        &format!("{}\\shell\\open\\command", magnet_prog_id_key()),
-        &[("", &command)],
-    )?;
-    windows::write_key(
-        "Software\\Classes\\magnet",
-        &[
-            ("", "URL:Magnet URI"),
-            ("Content Type", magnet_content_type()),
-            ("URL Protocol", ""),
-        ],
-    )?;
-    windows::write_key(
-        &format!(
-            "Software\\Classes\\magnet\\OpenWithList\\{}",
-            current_exe_filename()
-        ),
-        &[("", "")],
-    )?;
-    windows::write_key(
-        "Software\\Classes\\magnet\\shell\\open\\command",
-        &[("", &command)],
-    )?;
-
-    windows::notify_associations_changed();
-    Ok(())
 }
 
 #[cfg(windows)]
 mod windows {
-    use super::AssociationError;
-    use windows_sys::Win32::Foundation::ERROR_SUCCESS;
-    use windows_sys::Win32::System::Registry::{
-        HKEY, HKEY_CURRENT_USER, KEY_WRITE, REG_OPTION_NON_VOLATILE, REG_SZ, RegCloseKey,
-        RegCreateKeyExW, RegSetValueExW,
-    };
-    use windows_sys::Win32::UI::Shell::{SHCNE_ASSOCCHANGED, SHCNF_IDLIST, SHChangeNotify};
+    use crate::platform::registry::{delete_tree, delete_value, read_default, write_key};
+    use crate::platform::{app_id_key, icon_path, remove_if_exists};
+    use std::io;
+    use std::path::Path;
 
-    pub(super) fn register_download_associations() -> Result<(), AssociationError> {
-        let exe = std::env::current_exe()
-            .map_err(|e| AssociationError::new(format!("resolve shio executable: {e}")))?;
-        super::register_download_associations_windows(&exe)
-    }
+    const CAPABILITIES: &str = "Software\\Shio\\Capabilities";
+    const TORRENT_PROG_ID: &str = "Software\\Classes\\Shio.Torrent";
+    const MAGNET_PROG_ID: &str = "Software\\Classes\\Shio.Magnet";
+    const APPLICATION: &str = "Software\\Classes\\Applications\\shio.exe";
+    const OPEN_WITH: &str = "Software\\Classes\\.torrent\\OpenWithProgids";
+    const MAGNET: &str = "Software\\Classes\\magnet";
+    const MAGNET_COMMAND: &str = "Software\\Classes\\magnet\\shell\\open\\command";
 
-    pub(super) fn notify_associations_changed() {
-        #[allow(unsafe_code)]
-        unsafe {
-            SHChangeNotify(
-                i32::try_from(SHCNE_ASSOCCHANGED).unwrap_or(i32::MAX),
-                SHCNF_IDLIST,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-            );
+    pub(crate) fn register() -> io::Result<()> {
+        let exe = std::env::current_exe()?;
+        let command = open_command(&exe);
+        let icon = format!("{},0", exe.display());
+        write_key(
+            CAPABILITIES,
+            &[
+                ("ApplicationName", "Shio"),
+                (
+                    "ApplicationDescription",
+                    "download manager for links, torrents and magnets",
+                ),
+                ("ApplicationIcon", &icon),
+            ],
+        )?;
+        write_key(
+            &format!("{CAPABILITIES}\\FileAssociations"),
+            &[(".torrent", "Shio.Torrent")],
+        )?;
+        write_key(
+            &format!("{CAPABILITIES}\\MIMEAssociations"),
+            &[("application/x-bittorrent", "Shio.Torrent")],
+        )?;
+        write_key(
+            &format!("{CAPABILITIES}\\UrlAssociations"),
+            &[("magnet", "Shio.Magnet")],
+        )?;
+        write_key(
+            "Software\\RegisteredApplications",
+            &[("Shio", CAPABILITIES)],
+        )?;
+        for (prog_id, name, extra) in [
+            (TORRENT_PROG_ID, "torrent file", None),
+            (MAGNET_PROG_ID, "magnet link", Some(("URL Protocol", ""))),
+        ] {
+            let mut values = vec![("", name)];
+            values.extend(extra);
+            write_key(prog_id, &values)?;
+            write_key(&format!("{prog_id}\\DefaultIcon"), &[("", &icon)])?;
+            write_key(
+                &format!("{prog_id}\\shell\\open\\command"),
+                &[("", &command)],
+            )?;
         }
-    }
-
-    pub(super) fn write_key(path: &str, values: &[(&str, &str)]) -> Result<(), AssociationError> {
-        #[allow(unsafe_code)]
-        unsafe {
-            let mut hkey: HKEY = std::ptr::null_mut();
-            let path_w = wide_z(path);
-            let status = RegCreateKeyExW(
-                HKEY_CURRENT_USER,
-                path_w.as_ptr(),
-                0,
-                std::ptr::null(),
-                REG_OPTION_NON_VOLATILE,
-                KEY_WRITE,
-                std::ptr::null(),
-                &raw mut hkey,
-                std::ptr::null_mut(),
-            );
-            if status != ERROR_SUCCESS {
-                return Err(AssociationError::new(format!(
-                    "create HKCU\\{path}: {status}"
-                )));
-            }
-            for (name, value) in values {
-                set_string_result(hkey, name, value)
-                    .map_err(|e| AssociationError::new(format!("write HKCU\\{path}: {e}")))?;
-            }
-            RegCloseKey(hkey);
+        write_key(OPEN_WITH, &[("Shio.Torrent", "")])?;
+        write_key(APPLICATION, &[("FriendlyAppName", "Shio")])?;
+        write_key(
+            &format!("{APPLICATION}\\SupportedTypes"),
+            &[(".torrent", "")],
+        )?;
+        write_key(
+            &format!("{APPLICATION}\\shell\\open\\command"),
+            &[("", &command)],
+        )?;
+        // Without any magnet handler Windows offers no choice for magnet links; never take
+        // over one that belongs to another client.
+        if read_default(MAGNET_COMMAND)?.is_none_or(|existing| existing == command) {
+            write_key(MAGNET, &[("", "URL:magnet link"), ("URL Protocol", "")])?;
+            write_key(MAGNET_COMMAND, &[("", &command)])?;
         }
-
+        notify_changed();
         Ok(())
+    }
+
+    pub(crate) fn unregister() -> io::Result<()> {
+        let command = open_command(&std::env::current_exe()?);
+        if read_default(MAGNET_COMMAND)?.is_some_and(|existing| existing == command) {
+            delete_tree(MAGNET)?;
+        }
+        for key in [
+            "Software\\Shio",
+            TORRENT_PROG_ID,
+            MAGNET_PROG_ID,
+            APPLICATION,
+            &app_id_key(),
+        ] {
+            delete_tree(key)?;
+        }
+        delete_value("Software\\RegisteredApplications", "Shio")?;
+        delete_value(OPEN_WITH, "Shio.Torrent")?;
+        if let Some(icon) = icon_path() {
+            remove_if_exists(&icon)?;
+        }
+        notify_changed();
+        Ok(())
+    }
+
+    fn open_command(exe: &Path) -> String {
+        format!("\"{}\" \"%1\"", exe.display())
     }
 
     #[allow(unsafe_code)]
-    /// # Safety
-    /// `hkey` must be a valid open registry key handle with write access.
-    unsafe fn set_string_result(
-        hkey: HKEY,
-        name: &str,
-        value: &str,
-    ) -> Result<(), AssociationError> {
-        let name_w = wide_z(name);
-        let value_w: Vec<u16> = value.encode_utf16().chain(std::iter::once(0)).collect();
-        let byte_len = u32::try_from(value_w.len() * 2).unwrap_or(u32::MAX);
-        let bytes = value_w.as_ptr().cast::<u8>();
-        let status = unsafe { RegSetValueExW(hkey, name_w.as_ptr(), 0, REG_SZ, bytes, byte_len) };
-        if status != ERROR_SUCCESS {
-            return Err(AssociationError::new(format!(
-                "RegSetValueExW({name}) failed: {status}"
-            )));
+    fn notify_changed() {
+        use windows_sys::Win32::UI::Shell::{SHCNE_ASSOCCHANGED, SHCNF_IDLIST, SHChangeNotify};
+        // SAFETY: SHCNE_ASSOCCHANGED takes no item pointers.
+        unsafe {
+            SHChangeNotify(
+                SHCNE_ASSOCCHANGED.cast_signed(),
+                SHCNF_IDLIST,
+                std::ptr::null(),
+                std::ptr::null(),
+            );
         }
-        Ok(())
-    }
-
-    fn wide_z(s: &str) -> Vec<u16> {
-        s.encode_utf16().chain(std::iter::once(0)).collect()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::ffi::OsString;
 
     #[test]
-    fn association_launch_parser_collects_magnets_and_torrents() {
-        let args = [
-            "shio",
-            "magnet:?xt=urn:btih:cab507494d02ebb1178b38f2e9d7be299c86b862",
-            "C:\\downloads\\release.torrent",
-            "https://example.com/file.zip",
-        ]
-        .into_iter()
-        .map(OsString::from);
+    fn launch_args_keep_only_magnets_and_local_torrents() {
+        let magnet = "magnet:?xt=urn:btih:cab507494d02ebb1178b38f2e9d7be299c86b862";
+        let local = std::env::temp_dir().join("Shio files/雪.torrent");
+        let url = url::Url::from_file_path(&local).unwrap();
+        let localhost = url.as_str().replacen("file://", "file://localhost", 1);
+        let launch = association_launch_from_args(
+            [
+                "shio",
+                magnet,
+                "relative/a.torrent",
+                "--flag",
+                "notes.txt",
+                "https://example.com/release.torrent",
+                "file:not-an-absolute-path.torrent",
+                "file://remote.invalid/release.torrent",
+                url.as_str(),
+                &localhost,
+            ]
+            .map(OsString::from),
+        );
 
-        let launch = association_launch_from_args(args);
-
-        assert_eq!(launch.magnets.len(), 1);
+        assert_eq!(launch.magnets, [magnet]);
         assert_eq!(
             launch.torrent_files,
-            vec![PathBuf::from("C:\\downloads\\release.torrent")]
-        );
-    }
-
-    #[test]
-    fn association_launch_parser_ignores_non_association_args() {
-        let args = ["shio", "--flag", "C:\\downloads\\release.txt"]
-            .into_iter()
-            .map(OsString::from);
-
-        assert_eq!(
-            association_launch_from_args(args),
-            AssociationLaunch::default()
-        );
-    }
-
-    #[test]
-    fn xdg_default_verification_accepts_exact_desktop_id() {
-        assert!(default_handler_matches(
-            "com.shio.DownloadManager.desktop",
-            "com.shio.DownloadManager.desktop\n"
-        ));
-    }
-
-    #[test]
-    fn xdg_default_verification_rejects_other_handler() {
-        assert!(!default_handler_matches(
-            "com.shio.DownloadManager.desktop",
-            "transmission-qt.desktop\n"
-        ));
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn windows_command_quotes_exe_and_argument() {
-        let command = shell_open_command(std::path::Path::new("C:\\Program Files\\Shio\\shio.exe"));
-
-        assert_eq!(command, "\"C:\\Program Files\\Shio\\shio.exe\" \"%1\"");
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn windows_registration_uses_specific_prog_ids() {
-        assert_eq!(torrent_prog_id(), "Shio.Torrent");
-        assert_eq!(magnet_prog_id(), "Shio.Magnet");
-        assert_eq!(torrent_content_type(), "application/x-bittorrent");
-        assert_eq!(magnet_content_type(), "application/x-magnet");
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn windows_success_message_keeps_user_choice_explicit() {
-        assert_eq!(
-            successful_association_message(),
-            "registered shio; choose shio for .torrent and magnet in Windows Default Apps"
+            [
+                std::env::current_dir().unwrap().join("relative/a.torrent"),
+                local.clone(),
+                local,
+            ]
         );
     }
 }

@@ -1,30 +1,17 @@
+use crate::chunk::MAX_SEGMENTS;
 use crate::error::{Result, ShioError};
 use crate::types::ProxyConfig;
 use serde::{Deserialize, Serialize};
-use std::io::Write as _;
+use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum WindowMaterialPreference {
-    Acrylic,
-    Solid,
-}
-
-impl WindowMaterialPreference {
-    pub const ALL: [Self; 2] = [Self::Acrylic, Self::Solid];
-}
-
-impl std::fmt::Display for WindowMaterialPreference {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Self::Acrylic => "acrylic",
-            Self::Solid => "solid",
-        })
-    }
-}
+const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
+const MAX_CONCURRENT: u8 = 20;
+const MAX_RETRIES: u32 = 30;
+const MIN_SPEED_LIMIT: u64 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ThemeConfig {
     pub id: String,
 }
@@ -38,19 +25,19 @@ impl Default for ThemeConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct WindowConfig {
-    pub material: WindowMaterialPreference,
+    pub blur: bool,
 }
 
 impl Default for WindowConfig {
     fn default() -> Self {
-        Self {
-            material: WindowMaterialPreference::Acrylic,
-        }
+        Self { blur: true }
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
 pub struct TorrentConfig {
     pub listen_port: u16,
     pub dht: bool,
@@ -63,13 +50,14 @@ impl Default for TorrentConfig {
         Self {
             listen_port: 6881,
             dht: true,
-            upnp: true,
+            upnp: false,
             seed_policy: crate::torrent::SeedPolicy::default(),
         }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct AppConfig {
     pub download_dir: PathBuf,
     pub max_concurrent: u8,
@@ -83,34 +71,28 @@ pub struct AppConfig {
     pub proxy: Option<ProxyConfig>,
     pub default_create_subfolder: bool,
     pub default_auto_extract: bool,
-    pub extract_to_subfolder: bool,
     pub delete_archive_after_extract: bool,
     pub close_to_tray: bool,
-    pub scroll_long_names: bool,
     pub torrent: TorrentConfig,
 }
 
 impl Default for AppConfig {
     fn default() -> Self {
-        let download_dir = dirs_download_dir();
-
         Self {
-            download_dir,
+            download_dir: default_download_dir(),
             max_concurrent: 3,
             default_segments: 8,
-            max_retries: 3,
+            max_retries: 10,
             speed_limit: None,
-            clipboard_monitor: true,
+            clipboard_monitor: false,
             notifications: true,
             theme: ThemeConfig::default(),
             window: WindowConfig::default(),
             proxy: None,
             default_create_subfolder: true,
-            default_auto_extract: true,
-            extract_to_subfolder: true,
+            default_auto_extract: false,
             delete_archive_after_extract: false,
             close_to_tray: true,
-            scroll_long_names: false,
             torrent: TorrentConfig::default(),
         }
     }
@@ -118,45 +100,99 @@ impl Default for AppConfig {
 
 impl AppConfig {
     pub fn load() -> Result<Self> {
-        let path = Self::config_path();
-        Self::load_from_path(&path)
+        Self::load_from_path(&Self::config_path())
     }
 
     fn load_from_path(path: &Path) -> Result<Self> {
-        let content = std::fs::read_to_string(path)?;
-        let config: Self = toml::from_str(&content)
-            .map_err(|e| ShioError::Config(format!("parse {}: {}", path.display(), e)))?;
-        config.validate()
+        let mut content = String::new();
+        std::fs::File::open(path)?
+            .take(MAX_CONFIG_BYTES + 1)
+            .read_to_string(&mut content)?;
+        if content.len() as u64 > MAX_CONFIG_BYTES {
+            return Err(ShioError::Config(format!(
+                "{} exceeds the 1 MiB config limit",
+                path.display()
+            )));
+        }
+        // toml's errors quote the offending source (possibly the proxy password); report only the line.
+        let config: Self = toml::from_str(&content).map_err(|error| {
+            let line = error.span().map_or(1, |span| {
+                content[..span.start.min(content.len())]
+                    .matches('\n')
+                    .count()
+                    + 1
+            });
+            ShioError::Config(format!("{} line {line} is invalid", path.display()))
+        })?;
+        config.validate()?;
+        Ok(config)
     }
 
-    fn validate(self) -> Result<Self> {
+    pub(crate) fn validate(&self) -> Result<()> {
         validate_theme_id(&self.theme.id)?;
-        self.torrent
-            .seed_policy
-            .validate()
-            .map_err(|e| ShioError::Config(format!("invalid torrent seed policy: {e}")))?;
-        Ok(self)
+        if self.download_dir.as_os_str().is_empty() {
+            return Err(ShioError::Config("download_dir cannot be empty".into()));
+        }
+        if !(1..=MAX_CONCURRENT).contains(&self.max_concurrent) {
+            return Err(ShioError::Config(format!(
+                "max_concurrent must be between 1 and {MAX_CONCURRENT}"
+            )));
+        }
+        if !(1..=MAX_SEGMENTS).contains(&self.default_segments) {
+            return Err(ShioError::Config(format!(
+                "default_segments must be between 1 and {MAX_SEGMENTS}"
+            )));
+        }
+        if self.max_retries > MAX_RETRIES {
+            return Err(ShioError::Config(format!(
+                "max_retries must be between 0 and {MAX_RETRIES}"
+            )));
+        }
+        if self
+            .speed_limit
+            .is_some_and(|limit| limit < MIN_SPEED_LIMIT)
+        {
+            return Err(ShioError::Config(format!(
+                "speed_limit must be at least {MIN_SPEED_LIMIT} bytes/s"
+            )));
+        }
+        if self.torrent.listen_port == 0 {
+            return Err(ShioError::Config(
+                "torrent.listen_port must be between 1 and 65535".into(),
+            ));
+        }
+        if let Some(proxy) = self.proxy.as_ref() {
+            if proxy.host.trim().is_empty() || proxy.port == 0 {
+                return Err(ShioError::Config(
+                    "proxy host must be non-empty and proxy port must be between 1 and 65535"
+                        .into(),
+                ));
+            }
+            if proxy.username.is_some() != proxy.password.is_some() {
+                return Err(ShioError::Config(
+                    "proxy username and password must either both be set or both be absent".into(),
+                ));
+            }
+        }
+        self.torrent.seed_policy.validate()
     }
 
     pub fn save(&self) -> Result<()> {
-        let path = Self::config_path();
-        self.save_to_path(&path)
+        self.save_to_path(&Self::config_path())
     }
 
     fn save_to_path(&self, path: &Path) -> Result<()> {
         let parent = path
             .parent()
             .ok_or_else(|| ShioError::Config("config path has no parent".into()))?;
-        std::fs::create_dir_all(parent).map_err(ShioError::Io)?;
+        std::fs::create_dir_all(parent)?;
         let content = toml::to_string_pretty(self).map_err(|e| ShioError::Config(e.to_string()))?;
-        let tmp = path.with_extension("toml.tmp");
-        {
-            let mut file = std::fs::File::create(&tmp).map_err(ShioError::Io)?;
-            file.write_all(content.as_bytes()).map_err(ShioError::Io)?;
-            file.sync_all().map_err(ShioError::Io)?;
-        }
-        std::fs::rename(&tmp, path).map_err(ShioError::Io)?;
-        tracing::debug!("Config saved to {}", path.display());
+        let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+        temporary.write_all(content.as_bytes())?;
+        temporary.as_file().sync_all()?;
+        temporary.persist(path).map_err(|error| error.error)?;
+        #[cfg(unix)]
+        std::fs::File::open(parent)?.sync_all()?;
         Ok(())
     }
 
@@ -165,17 +201,13 @@ impl AppConfig {
     }
 
     pub fn config_path() -> PathBuf {
-        if let Some(proj_dirs) = directories::ProjectDirs::from("", "", "shio") {
-            proj_dirs.config_dir().join("config.toml")
-        } else {
-            PathBuf::from("shio_config.toml")
-        }
+        Self::config_dir().join("config.toml")
     }
 
     pub fn config_dir() -> PathBuf {
         directories::ProjectDirs::from("", "", "shio").map_or_else(
             || PathBuf::from("."),
-            |proj_dirs| proj_dirs.config_dir().to_path_buf(),
+            |dirs| dirs.config_dir().to_path_buf(),
         )
     }
 
@@ -184,39 +216,33 @@ impl AppConfig {
     }
 
     pub fn data_dir() -> PathBuf {
-        if let Some(proj_dirs) = directories::ProjectDirs::from("", "", "shio") {
-            proj_dirs.data_dir().to_path_buf()
-        } else {
-            PathBuf::from(".")
-        }
+        directories::ProjectDirs::from("", "", "shio")
+            .map_or_else(|| PathBuf::from("."), |dirs| dirs.data_dir().to_path_buf())
     }
 }
 
 pub fn validate_theme_id(id: &str) -> Result<()> {
-    if id.is_empty() {
-        return Err(ShioError::Config("theme id cannot be empty".to_string()));
+    let valid = !id.is_empty()
+        && !id.starts_with('-')
+        && !id.ends_with('-')
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+    if valid {
+        Ok(())
+    } else {
+        Err(ShioError::Config(format!("invalid theme id: {id}")))
     }
-    if id.starts_with('-') || id.ends_with('-') {
-        return Err(ShioError::Config(format!("invalid theme id: {id}")));
-    }
-    if !id
-        .bytes()
-        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
-    {
-        return Err(ShioError::Config(format!("invalid theme id: {id}")));
-    }
-    Ok(())
 }
 
-fn dirs_download_dir() -> PathBuf {
-    directories::UserDirs::new()
-        .and_then(|dirs| dirs.download_dir().map(std::path::Path::to_path_buf))
-        .unwrap_or_else(|| {
-            directories::UserDirs::new().map_or_else(
-                || PathBuf::from("downloads"),
-                |dirs| dirs.home_dir().join("Downloads"),
-            )
-        })
+fn default_download_dir() -> PathBuf {
+    directories::UserDirs::new().map_or_else(
+        || PathBuf::from("Downloads"),
+        |dirs| {
+            dirs.download_dir()
+                .map_or_else(|| dirs.home_dir().join("Downloads"), Path::to_path_buf)
+        },
+    )
 }
 
 #[cfg(test)]
@@ -224,88 +250,42 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_config_toml_roundtrips() {
-        let original = AppConfig::default();
-        let serialized = toml::to_string(&original).expect("serialize default");
-        let parsed: AppConfig = toml::from_str(&serialized).expect("parse own output");
-        assert_eq!(parsed, original);
+    fn validation_rejects_hostile_values() {
+        let mut theme = AppConfig::default();
+        theme.theme.id = "GitHub Dark".to_string();
+        let mut seed = AppConfig::default();
+        seed.torrent.seed_policy = crate::torrent::SeedPolicy::StopAtRatio { ratio: f32::NAN };
+
+        for config in [theme, seed] {
+            assert!(config.validate().is_err());
+        }
     }
 
     #[test]
-    fn default_has_sane_values() {
-        let cfg = AppConfig::default();
-        assert!(cfg.max_concurrent >= 1);
-        assert!(cfg.default_segments >= 1);
-        assert!(!cfg.download_dir.as_os_str().is_empty());
-        assert_eq!(cfg.theme, ThemeConfig::default());
-        assert!(!cfg.scroll_long_names);
+    fn parse_errors_never_echo_config_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        for line in ["password = 12345678", "password = \"hunter\\q2\""] {
+            std::fs::write(&path, format!("[proxy]\nhost = \"h\"\n{line}\n")).unwrap();
+
+            let error = AppConfig::load_from_path(&path).unwrap_err().to_string();
+
+            assert!(error.contains("line 3"), "{error}");
+            assert!(
+                !error.contains("12345678") && !error.contains("hunter"),
+                "{error}"
+            );
+        }
     }
 
     #[test]
-    fn default_theme_config_uses_typed_defaults() {
-        let cfg = AppConfig::default();
-
-        assert_eq!(cfg.theme.id, "dark");
-        assert_eq!(cfg.window.material, WindowMaterialPreference::Acrylic);
-    }
-
-    #[test]
-    fn old_theme_string_config_is_rejected() {
-        let mut value = toml::Value::try_from(AppConfig::default()).expect("serialize default");
-        let table = value.as_table_mut().expect("default config is a table");
-        table.insert("theme".to_string(), toml::Value::String("dark".to_string()));
-
-        assert!(value.try_into::<AppConfig>().is_err());
-    }
-
-    #[test]
-    fn invalid_theme_ids_are_rejected() {
-        let mut config = AppConfig::default();
-        config.theme.id = "GitHub Dark".to_string();
-
-        assert!(config.validate().is_err());
-    }
-
-    #[test]
-    fn malformed_toml_returns_error() {
-        let bad = "this is not = [valid toml";
-        assert!(toml::from_str::<AppConfig>(bad).is_err());
-    }
-
-    #[test]
-    fn missing_required_field_returns_error() {
-        let bad = "max_concurrent = 3";
-        assert!(toml::from_str::<AppConfig>(bad).is_err());
-    }
-
-    #[test]
-    fn torrent_config_default_is_standard() {
-        let c = TorrentConfig::default();
-        assert_eq!(c.listen_port, 6881);
-        assert!(c.dht);
-        assert!(c.upnp);
-    }
-
-    #[test]
-    fn config_validation_rejects_invalid_seed_policy() {
-        let mut config = AppConfig::default();
-        config.torrent.seed_policy = crate::torrent::SeedPolicy::StopAtRatio { ratio: f32::NAN };
-
-        assert!(config.validate().is_err());
-    }
-
-    #[test]
-    fn save_writes_valid_config_through_temp_file() {
-        let dir = tempfile::tempdir().expect("temp dir");
+    fn save_then_load_roundtrips() {
+        let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         let config = AppConfig::default();
 
-        config.save_to_path(&path).expect("save config");
+        config.save_to_path(&path).unwrap();
 
-        assert_eq!(
-            AppConfig::load_from_path(&path).expect("load saved config"),
-            config
-        );
-        assert!(!path.with_extension("toml.tmp").exists());
+        assert_eq!(AppConfig::load_from_path(&path).unwrap(), config);
     }
 }

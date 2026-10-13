@@ -3,22 +3,20 @@ members = ["crates/shio-core", "crates/shio-app"]
 resolver = "3"
 
 [workspace.package]
-version = "0.1.2"
+version = "0.2.0"
 edition = "2024"
 license = "MIT"
 rust-version = "1.96"
 repository = "https://github.com/offs/shio"
-homepage = "https://github.com/offs/shio"
 authors = ["offs"]
 
 [workspace.dependencies]
-librqbit = "8.1.1"
+librqbit = { version = "9.0.1", default-features = false, features = ["rust-tls"] }
 iced = { version = "0.14.0", default-features = false }
-iced_aw = { version = "0.14.1", default-features = false }
-iced_drop = { version = "0.2.29", default-features = false, features = ["helpers"] }
 iced_fonts = { version = "0.3.0", features = ["bootstrap"] }
+iced_renderer = { version = "0.14.0", default-features = false }
 
-tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "fs", "io-util", "net", "sync", "time", "signal"] }
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "fs", "io-util", "sync", "time"] }
 tokio-util = { version = "0.7.18", default-features = false, features = ["rt"] }
 futures = "0.3.32"
 
@@ -46,32 +44,31 @@ chrono = { version = "0.4.44", features = ["serde"] }
 url = { version = "2.5.8", features = ["serde"] }
 bytesize = "2.3.1"
 nucleo-matcher = "0.3.1"
-regex = "1.12.3"
 directories = "6.0.0"
-async-trait = "0.1.89"
+tempfile = "3.27.0"
 open = "5.3.5"
 
-zip = { version = "8.6.0", default-features = false, features = ["deflate", "deflate64", "lzma", "zstd"] }
-sevenz-rust2 = { version = "0.21.0", features = ["compress"] }
+zip = { version = "9.0.2", default-features = false, features = ["aes-crypto", "bzip2", "deflate-flate2-zlib-rs", "deflate64", "lzma", "xz", "zstd"] }
+sevenz-rust2 = "0.24.0"
 tar = "0.4.46"
 flate2 = "1.1.9"
-zstd = "0.13.3"
-unrar = "0.5.8"
+zstd = "0.14.2"
+rars = { version = "0.10.0", default-features = false, features = ["encryption"] }
 
-notify-rust = "4.17.0"
+notify-rust = "4.18.2"
 rfd = "0.17.2"
-arboard = "3.6.1"
 image = { version = "0.25.10", default-features = false, features = ["png"] }
-tray-icon = "0.24.0"
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_System_Registry"] }
+tray-icon = { version = "0.26.1", default-features = false }
+zbus = { version = "5.16.0", default-features = false, features = ["async-io", "blocking-api"] }
+wayland-client = { version = "0.31.14", features = ["system"] }
+wayland-protocols = { version = "0.32.12", features = ["client", "staging"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Registry", "Win32_System_Threading", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
 winresource = "0.1.31"
 
 [profile.release]
-opt-level = 3
 lto = "fat"
 codegen-units = 1
-strip = true
-panic = "abort"
+strip = "debuginfo"
 
 [profile.dev]
 opt-level = 1
@@ -92,7 +89,6 @@ rust_2018_idioms = { level = "warn", priority = -1 }
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }
 nursery = { level = "warn", priority = -1 }
-module_name_repetitions = "allow"
 missing_errors_doc = "allow"
 missing_panics_doc = "allow"
 must_use_candidate = "allow"
@@ -102,9 +98,23 @@ too_many_lines = "allow"
 cast_precision_loss = "allow"
 cast_possible_truncation = "allow"
 cast_sign_loss = "allow"
-cast_possible_wrap = "allow"
 struct_excessive_bools = "allow"
 option_if_let_else = "allow"
 significant_drop_tightening = "allow"
 redundant_pub_crate = "allow"
 float_cmp = "allow"
+
+# Unreleased upstream fixes after 9.0.1: bencode depth limit (eb96f1c), Windows DHT receive
+# errors (2b12307), Windows sparse files (ced4266). Drop once a release contains them.
+[patch.crates-io]
+librqbit = { git = "https://github.com/ikatson/rqbit", rev = "57e95d1" }
+librqbit-bencode = { git = "https://github.com/ikatson/rqbit", rev = "57e95d1" }
+librqbit-buffers = { git = "https://github.com/ikatson/rqbit", rev = "57e95d1" }
+librqbit-clone-to-owned = { git = "https://github.com/ikatson/rqbit", rev = "57e95d1" }
+librqbit-core = { git = "https://github.com/ikatson/rqbit", rev = "57e95d1" }
+librqbit-dht = { git = "https://github.com/ikatson/rqbit", rev = "57e95d1" }
+librqbit-lsd = { git = "https://github.com/ikatson/rqbit", rev = "57e95d1" }
+librqbit-peer-protocol = { git = "https://github.com/ikatson/rqbit", rev = "57e95d1" }
+librqbit-sha1-wrapper = { git = "https://github.com/ikatson/rqbit", rev = "57e95d1" }
+librqbit-tracker-comms = { git = "https://github.com/ikatson/rqbit", rev = "57e95d1" }
+librqbit-upnp = { git = "https://github.com/ikatson/rqbit", rev = "57e95d1" }

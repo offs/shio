@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Shio
+GenericName=Download Manager
+Comment=Download manager for links, torrents, and archives
+Exec=shio %U
+Icon=com.shio.DownloadManager
+Terminal=false
+MimeType=application/x-bittorrent;x-scheme-handler/magnet;
+Categories=Network;FileTransfer;
+Keywords=download;torrent;magnet;archive;
+StartupWMClass=com.shio.DownloadManager
