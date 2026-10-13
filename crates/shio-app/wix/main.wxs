@@ -50,9 +50,12 @@
                       DiskId="1"
                       Source="wix\License.rtf"
                       KeyPath="yes" />
+            </Component>
+            <Component Directory="APPLICATIONFOLDER">
                 <File Id="ThirdPartyLicensesFile"
                       DiskId="1"
-                      Source="..\..\packaging\THIRD_PARTY_LICENSES.md" />
+                      Source="..\..\packaging\THIRD_PARTY_LICENSES.md"
+                      KeyPath="yes" />
             </Component>
             <Component Directory="ApplicationProgramsFolder">
                 <RemoveFolder Id="ApplicationProgramsFolder"
