@@ -1,958 +1,727 @@
-use super::state::{
-    AddHttpPreview, AddHttpPreviewState, AddMagnetPreview, AddMagnetPreviewState, AddSourceId,
-    AddTorrentFile, AddTorrentSource,
+use super::{MAX_NAME_TEXT_BYTES, MAX_PATH_TEXT_BYTES, truncate_text_bytes};
+use crate::link::{is_link, is_magnet};
+use iced::widget::text_editor;
+use shio_core::{
+    AppConfig, HttpArchivePartRequest, HttpArchiveSetRequest, HttpDownloadRequest,
+    HttpPreviewResult, HttpPreviewState, MagnetPreviewResult, TorrentDownloadRequest, TorrentFile,
+    TorrentSource,
 };
-use shio_core::TorrentFile;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
-pub(crate) const ADD_URL_PREVIEW_LIMIT: usize = 20;
-pub(crate) const HTTP_PREVIEW_BATCH_LIMIT: usize = 8;
+const MAX_LINKS: usize = 32;
+const MAX_TORRENTS: usize = 32;
+const HTTP_PREVIEW_LIMIT: usize = 8;
+pub(super) const MAX_URL_TEXT_BYTES: usize = 64 * 1024;
 
-pub(crate) fn is_magnet(url: &str) -> bool {
-    url.trim_start().to_ascii_lowercase().starts_with("magnet:")
+pub(crate) struct AddDialog {
+    pub(crate) urls: text_editor::Content,
+    pub(crate) links: Vec<Link>,
+    pub(crate) torrents: Vec<TorrentPick>,
+    pub(crate) selected_torrent: Option<u64>,
+    pub(crate) torrent_search: String,
+    pub(crate) filename: String,
+    pub(crate) save_path: String,
+    pub(crate) create_subfolder: bool,
+    pub(crate) subfolder: String,
+    pub(crate) auto_extract: bool,
+    pub(crate) submitting: bool,
+    pub(crate) failures: Vec<(String, String)>,
+    pub(crate) validation: AddValidation,
+    subfolder_edited: bool,
+    too_many: bool,
+    segments: u8,
+    plan: Vec<Item>,
+    submitted: Vec<(String, Source)>,
 }
 
-fn is_http_url(url: &str) -> bool {
-    url::Url::parse(url)
-        .is_ok_and(|parsed| matches!(parsed.scheme(), "http" | "https") && parsed.has_host())
+pub(crate) struct Link {
+    pub(crate) url: String,
+    pub(crate) name: String,
+    pub(crate) state: LinkState,
+    request: Option<u64>,
 }
 
-#[derive(Debug, Default, PartialEq, Eq)]
-pub(crate) struct ParsedAddUrls {
-    pub(crate) entries: Vec<String>,
-    pub(crate) entry_previews: Vec<String>,
-    pub(crate) http_urls: Vec<String>,
-    pub(crate) magnets: Vec<String>,
-    pub(crate) preview: Vec<String>,
-    pub(crate) http_count: usize,
-    pub(crate) magnet_count: usize,
-    pub(crate) single_url_name: Option<String>,
-    pub(crate) has_archive_url: bool,
-    pub(crate) suggested_subfolder: Option<String>,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LinkState {
+    Unchecked,
+    Resolving,
+    Ready { size: Option<u64> },
+    Blocked(String),
+    Failed(String),
 }
 
-pub(crate) fn parse_add_urls(text: &str) -> ParsedAddUrls {
-    let mut parsed = ParsedAddUrls::default();
-    let mut filenames = Vec::new();
-
-    for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
-        if is_magnet(line) {
-            parsed.entries.push(line.to_string());
-            parsed.magnet_count += 1;
-            parsed.magnets.push(line.to_string());
-            parsed.entry_previews.push("magnet".to_string());
-            if parsed.preview.len() < ADD_URL_PREVIEW_LIMIT {
-                parsed.preview.push("magnet".to_string());
-            }
-            continue;
-        }
-
-        if is_http_url(line) {
-            parsed.entries.push(line.to_string());
-            parsed.http_count += 1;
-            parsed.http_urls.push(line.to_string());
-            let filename = shio_core::extract_filename(line, None);
-            parsed.has_archive_url |= shio_core::is_archive_filename(&filename);
-            parsed.entry_previews.push(filename.clone());
-            if parsed.preview.len() < ADD_URL_PREVIEW_LIMIT {
-                parsed.preview.push(filename.clone());
-            }
-            filenames.push(filename);
-        }
-    }
-
-    if parsed.entries.len() == 1 && parsed.http_count == 1 && parsed.magnet_count == 0 {
-        parsed.single_url_name = filenames.first().cloned();
-    }
-
-    let filename_refs: Vec<&str> = filenames.iter().map(String::as_str).collect();
-    parsed.suggested_subfolder = shio_core::suggest_folder_name(&filename_refs);
-
-    parsed
-}
-
-pub(crate) fn path_label(path: &Path) -> String {
-    path.file_name().map_or_else(
-        || path.display().to_string(),
-        |name| name.to_string_lossy().into_owned(),
-    )
-}
-
-fn selected_torrent_files(torrent: &AddTorrentFile) -> Vec<&TorrentFile> {
-    torrent.files.iter().filter(|file| file.selected).collect()
-}
-
-fn torrent_file_matches(file: &TorrentFile, query: &str) -> bool {
-    let query = query.trim();
-    if query.is_empty() {
-        return true;
-    }
-
-    let query = query.to_ascii_lowercase();
-    file.path
-        .to_string_lossy()
-        .to_ascii_lowercase()
-        .contains(&query)
-}
-
-pub(crate) fn filtered_torrent_file_indices(torrent: &AddTorrentFile, query: &str) -> Vec<usize> {
-    torrent
-        .files
-        .iter()
-        .enumerate()
-        .filter_map(|(index, file)| torrent_file_matches(file, query).then_some(index))
-        .collect()
-}
-
-pub(crate) fn set_matching_torrent_files(
-    torrent: &mut AddTorrentFile,
-    query: &str,
-    selected: bool,
-) {
-    for file_index in filtered_torrent_file_indices(torrent, query) {
-        if let Some(file) = torrent.files.get_mut(file_index) {
-            file.selected = selected;
-        }
-    }
-}
-
-pub(crate) fn default_add_source_selection(
-    urls: &[String],
-    torrent_files: &[AddTorrentFile],
-) -> Option<AddSourceId> {
-    torrent_files
-        .iter()
-        .find(|torrent| torrent.selected_count() == 0)
-        .or_else(|| torrent_files.first())
-        .map(|torrent| match &torrent.source {
-            AddTorrentSource::File { path } => AddSourceId::TorrentFile(path.clone()),
-            AddTorrentSource::Magnet { request_id, .. } => AddSourceId::MagnetPreview(*request_id),
-        })
-        .or_else(|| (!urls.is_empty()).then_some(AddSourceId::Url(0)))
-}
-
-pub(crate) fn add_source_exists(
-    source: &AddSourceId,
-    urls: &[String],
-    torrent_files: &[AddTorrentFile],
-) -> bool {
-    match source {
-        AddSourceId::Url(index) => *index < urls.len(),
-        AddSourceId::TorrentFile(path) => torrent_files.iter().any(|torrent| {
-            matches!(&torrent.source, AddTorrentSource::File { path: source_path } if source_path == path)
-        }),
-        AddSourceId::MagnetPreview(request_id) => torrent_files.iter().any(|torrent| {
-            matches!(
-                &torrent.source,
-                AddTorrentSource::Magnet {
-                    request_id: source_request_id,
-                    ..
-                } if source_request_id == request_id
-            )
-        }),
-    }
-}
-
-pub(crate) fn repair_add_source_selection(
-    selected_source: &mut Option<AddSourceId>,
-    urls: &[String],
-    torrent_files: &[AddTorrentFile],
-) {
-    if selected_source
-        .as_ref()
-        .is_some_and(|source| add_source_exists(source, urls, torrent_files))
-    {
-        return;
-    }
-
-    *selected_source = default_add_source_selection(urls, torrent_files);
-}
-
-pub(crate) fn can_confirm_add_sources(urls: &[String], torrent_files: &[AddTorrentFile]) -> bool {
-    (!urls.is_empty() || !torrent_files.is_empty())
-        && torrent_files.iter().all(AddTorrentFile::has_selection)
-}
-
-pub(crate) const fn should_request_http_previews(http_urls: &[String]) -> bool {
-    !http_urls.is_empty() && http_urls.len() <= HTTP_PREVIEW_BATCH_LIMIT
-}
-
-fn http_preview_for_url<'a>(
-    url: &str,
-    http_previews: &'a [AddHttpPreview],
-) -> Option<&'a AddHttpPreviewState> {
-    http_previews
-        .iter()
-        .find(|preview| preview.url == url)
-        .map(|preview| &preview.state)
-}
-
-pub(crate) fn http_preview_name(url: &str, http_previews: &[AddHttpPreview]) -> Option<String> {
-    match http_preview_for_url(url, http_previews) {
-        Some(AddHttpPreviewState::Ready(preview)) if !preview.filename.is_empty() => {
-            Some(preview.filename.clone())
-        },
-        _ => None,
-    }
-}
-
-pub(crate) fn add_single_http_name(
-    parsed: &ParsedAddUrls,
-    http_previews: &[AddHttpPreview],
-) -> Option<String> {
-    if parsed.entries.len() != 1 || parsed.http_count != 1 || parsed.magnet_count != 0 {
-        return None;
-    }
-    let url = parsed.http_urls.first()?;
-    http_preview_name(url, http_previews).or_else(|| parsed.single_url_name.clone())
-}
-
-pub(crate) fn addable_url_entries(
-    urls: &[String],
-    http_previews: &[AddHttpPreview],
-) -> Vec<String> {
-    urls.iter()
-        .filter(|url| {
-            is_magnet(url)
-                || (is_http_url(url)
-                    && !matches!(
-                        http_preview_for_url(url, http_previews),
-                        Some(AddHttpPreviewState::Blocked { .. })
-                    ))
-        })
-        .cloned()
-        .collect()
-}
-
-pub(crate) fn addable_has_archive_url(urls: &[String], http_previews: &[AddHttpPreview]) -> bool {
-    addable_url_entries(urls, http_previews)
-        .iter()
-        .filter(|url| !is_magnet(url))
-        .map(|url| {
-            http_preview_name(url, http_previews)
-                .unwrap_or_else(|| shio_core::extract_filename(url, None))
-        })
-        .any(|filename| shio_core::is_archive_filename(&filename))
-}
-
-pub(crate) fn url_without_fragment(url: &str) -> String {
-    match url::Url::parse(url) {
-        Ok(mut parsed) => {
-            parsed.set_fragment(None);
-            parsed.to_string()
-        },
-        Err(_) => url.to_string(),
-    }
-}
-
-pub(crate) fn archive_set_validation_error(
-    urls: &[String],
-    http_previews: &[AddHttpPreview],
-) -> Option<String> {
-    let mut groups: std::collections::BTreeMap<String, Vec<u32>> =
-        std::collections::BTreeMap::new();
-    let mut filenames_by_network_url = std::collections::BTreeMap::<String, String>::new();
-    for url in urls.iter().filter(|url| !is_magnet(url)) {
-        let filename = http_preview_name(url, http_previews)
-            .unwrap_or_else(|| shio_core::extract_filename(url, None));
-        let network_url = url_without_fragment(url);
-        if let Some(existing) = filenames_by_network_url.insert(network_url, filename.clone())
-            && existing != filename
-        {
-            return Some("multiple filenames point to the same URL".to_string());
-        }
-        if let Some(part) = shio_core::parse_archive_part(&filename) {
-            groups
-                .entry(part.base_name)
-                .or_default()
-                .push(part.part_number);
-        }
-    }
-    for mut parts in groups.into_values().filter(|parts| parts.len() >= 2) {
-        parts.sort_unstable();
-        for (index, part) in parts.into_iter().enumerate() {
-            let expected = u32::try_from(index + 1).ok()?;
-            if part != expected {
-                return Some(format!("missing part{expected:02}.rar"));
-            }
-        }
-    }
-    None
-}
-
-pub(crate) fn removed_http_preview_request_ids(
-    http_previews: &[AddHttpPreview],
-    parsed_http_urls: &[String],
-) -> Vec<u64> {
-    http_previews
-        .iter()
-        .filter(|preview| !parsed_http_urls.contains(&preview.url))
-        .map(|preview| preview.request_id)
-        .collect()
-}
-
-pub(crate) fn drain_http_preview_request_ids(http_previews: &mut Vec<AddHttpPreview>) -> Vec<u64> {
-    http_previews
-        .drain(..)
-        .map(|preview| preview.request_id)
-        .collect()
-}
-
-pub(crate) fn apply_http_preview_result(
-    result: shio_core::HttpPreviewResult,
-    parsed: &ParsedAddUrls,
-    http_previews: &mut [AddHttpPreview],
-) {
-    let Some(position) = http_previews
-        .iter()
-        .position(|preview| preview.request_id == result.request_id)
-    else {
-        return;
-    };
-
-    if !parsed
-        .http_urls
-        .iter()
-        .any(|url| url == &http_previews[position].url)
-    {
-        return;
-    }
-
-    http_previews[position].state = match result.state {
-        shio_core::HttpPreviewState::Ready(preview) => AddHttpPreviewState::Ready(preview),
-        shio_core::HttpPreviewState::Blocked { reason } => AddHttpPreviewState::Blocked { reason },
-        shio_core::HttpPreviewState::Error { message } => AddHttpPreviewState::Failed { message },
-    };
-}
-
-pub(crate) fn apply_magnet_preview_result(
-    result: shio_core::MagnetPreviewResult,
-    parsed: &ParsedAddUrls,
-    url_entries: &mut Vec<String>,
-    magnet_previews: &mut Vec<AddMagnetPreview>,
-    torrent_files: &mut Vec<AddTorrentFile>,
-) {
-    if !parsed.magnets.iter().any(|magnet| magnet == &result.magnet) {
-        return;
-    }
-
-    let Some(position) = magnet_previews.iter().position(|preview| {
-        preview.magnet == result.magnet && preview.request_id == result.request_id
-    }) else {
-        return;
-    };
-
-    match result.result {
-        Ok(manifest) => {
-            magnet_previews.remove(position);
-            url_entries.retain(|entry| entry != &result.magnet);
-            torrent_files.push(AddTorrentFile {
-                source: AddTorrentSource::Magnet {
-                    magnet: result.magnet,
-                    request_id: result.request_id,
-                },
-                display_name: manifest.name,
-                is_private: manifest.is_private,
-                files: manifest.files,
-                trackers: manifest.trackers,
-                metadata_bytes: Some(manifest.metadata_bytes),
-            });
-        },
-        Err(message) => {
-            magnet_previews[position].state = AddMagnetPreviewState::Failed { message };
-        },
-    }
-}
-
-pub(crate) fn torrent_display_name(torrent: &AddTorrentFile) -> String {
-    let selected = selected_torrent_files(torrent);
-    if selected.len() == 1 {
-        return selected[0]
-            .path
-            .file_name()
-            .and_then(std::ffi::OsStr::to_str)
-            .map_or_else(
-                || torrent.display_name.clone(),
-                shio_core::sanitize_filename,
-            );
-    }
-    torrent.display_name.clone()
-}
-
-pub(crate) fn torrent_subfolder_name(torrent: &AddTorrentFile) -> Option<String> {
-    let selected = selected_torrent_files(torrent);
-    if selected.is_empty() {
-        return None;
-    }
-    if selected.len() == 1 {
-        return selected[0]
-            .path
-            .file_stem()
-            .and_then(std::ffi::OsStr::to_str)
-            .map(shio_core::sanitize_filename)
-            .filter(|name| !name.is_empty());
-    }
-
-    let mut components = selected
-        .iter()
-        .map(|file| file.path.components().collect::<Vec<_>>());
-    let first = components.next()?;
-    let shared = components.fold(first, |shared, parts| {
-        shared
-            .into_iter()
-            .zip(parts)
-            .take_while(|(left, right)| left == right)
-            .map(|(component, _)| component)
-            .collect()
-    });
-    if !shared.is_empty() {
-        let mut out = PathBuf::new();
-        for component in shared {
-            out.push(component.as_os_str());
-        }
-        if let Some(name) = out.file_name().and_then(std::ffi::OsStr::to_str) {
-            let sanitized = shio_core::sanitize_filename(name);
-            if !sanitized.is_empty() {
-                return Some(sanitized);
-            }
-        }
-    }
-    Some(torrent.display_name.clone()).filter(|name| !name.is_empty())
-}
-
-pub(crate) fn torrent_file_preview(
-    path: PathBuf,
+#[derive(Clone)]
+pub(crate) struct TorrentPick {
+    pub(crate) id: u64,
+    pub(crate) name: String,
+    pub(crate) files: Vec<TorrentFile>,
+    source: PickSource,
     bytes: Vec<u8>,
-) -> Result<AddTorrentFile, String> {
-    let manifest = shio_core::parse_torrent_manifest(&bytes)
-        .map_err(|error| format!("invalid torrent file {}: {error}", path_label(&path)))?;
-    Ok(AddTorrentFile {
-        source: AddTorrentSource::File { path },
-        display_name: manifest.name,
-        is_private: manifest.is_private,
-        files: manifest.files,
-        trackers: manifest.trackers,
-        metadata_bytes: Some(bytes),
-    })
+}
+
+#[derive(Clone)]
+enum PickSource {
+    File(PathBuf),
+    Magnet(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AddValidation {
+    Empty,
+    Invalid(String),
+    Ready(String),
+}
+
+enum Item {
+    Http {
+        url: String,
+        name: String,
+    },
+    ArchiveSet {
+        name: String,
+        request: HttpArchiveSetRequest,
+        urls: Vec<String>,
+    },
+    Magnet(String),
+    Torrent(u64),
+}
+
+enum Source {
+    Urls(Vec<String>),
+    Torrent(u64),
+}
+
+pub(super) enum AddRequest {
+    Http(HttpDownloadRequest),
+    ArchiveSet(HttpArchiveSetRequest),
+    Torrent(TorrentDownloadRequest),
+}
+
+#[derive(Default)]
+pub(super) struct Previews {
+    pub(super) http: Vec<(u64, String)>,
+    pub(super) magnets: Vec<(u64, String)>,
+    pub(super) cancel: Vec<u64>,
+}
+
+impl TorrentPick {
+    pub(super) fn from_file(path: PathBuf, bytes: Vec<u8>) -> Result<Self, String> {
+        let manifest = shio_core::parse_torrent_manifest(&bytes)
+            .map_err(|error| format!("{}: {}", file_label(&path), error.short_label()))?;
+        Ok(Self {
+            id: 0,
+            name: manifest.name,
+            files: manifest.files,
+            source: PickSource::File(path),
+            bytes,
+        })
+    }
+
+    pub(crate) fn selected_count(&self) -> usize {
+        self.files.iter().filter(|file| file.selected).count()
+    }
+
+    pub(crate) fn selected_size(&self) -> u64 {
+        self.files
+            .iter()
+            .filter(|file| file.selected)
+            .fold(0, |total, file| total.saturating_add(file.size))
+    }
+
+    fn magnet(&self) -> Option<&str> {
+        match &self.source {
+            PickSource::Magnet(magnet) => Some(magnet),
+            PickSource::File(_) => None,
+        }
+    }
+
+    fn request(&self, save_path: PathBuf, auto_extract: bool) -> TorrentDownloadRequest {
+        let request = match &self.source {
+            PickSource::File(_) => {
+                TorrentDownloadRequest::new(TorrentSource::File(self.bytes.clone()), save_path)
+            },
+            PickSource::Magnet(magnet) => {
+                TorrentDownloadRequest::new(TorrentSource::Magnet(magnet.clone()), save_path)
+                    .with_metadata_bytes(self.bytes.clone())
+            },
+        }
+        .with_files(self.files.clone())
+        .with_auto_extract(auto_extract);
+        let mut selected = self.files.iter().filter(|file| file.selected);
+        match (selected.next(), selected.next()) {
+            (Some(only), None) => match only.path.file_name().and_then(|name| name.to_str()) {
+                Some(name) => request.with_filename(shio_core::sanitize_filename(name)),
+                None => request,
+            },
+            _ => request,
+        }
+    }
+}
+
+impl AddDialog {
+    pub(super) fn new(config: &AppConfig) -> Self {
+        Self {
+            urls: text_editor::Content::new(),
+            links: Vec::new(),
+            torrents: Vec::new(),
+            selected_torrent: None,
+            torrent_search: String::new(),
+            filename: String::new(),
+            save_path: truncate_text_bytes(
+                config.download_dir.to_string_lossy().into_owned(),
+                MAX_PATH_TEXT_BYTES,
+            ),
+            create_subfolder: config.default_create_subfolder,
+            subfolder: String::new(),
+            auto_extract: config.default_auto_extract,
+            submitting: false,
+            failures: Vec::new(),
+            validation: AddValidation::Empty,
+            subfolder_edited: false,
+            too_many: false,
+            segments: config.default_segments,
+            plan: Vec::new(),
+            submitted: Vec::new(),
+        }
+    }
+
+    pub(crate) fn single_http(&self) -> bool {
+        self.torrents.is_empty() && matches!(self.links.as_slice(), [link] if !is_magnet(&link.url))
+    }
+
+    pub(super) fn resolving(&self) -> impl Iterator<Item = u64> + '_ {
+        self.links
+            .iter()
+            .filter(|link| link.state == LinkState::Resolving)
+            .filter_map(|link| link.request)
+    }
+
+    pub(super) fn append_text(&mut self, text: &str) {
+        let mut urls = self.urls.text();
+        if !urls.trim().is_empty() {
+            urls.push('\n');
+        }
+        urls.push_str(text);
+        self.urls = text_editor::Content::with_text(&truncate_text_bytes(urls, MAX_URL_TEXT_BYTES));
+    }
+
+    pub(super) fn set_subfolder(&mut self, name: String) {
+        self.subfolder = truncate_text_bytes(name, MAX_NAME_TEXT_BYTES);
+        self.subfolder_edited = true;
+        self.revalidate();
+    }
+
+    pub(super) fn sync_links(&mut self, next_request: &mut u64) -> Previews {
+        let mut text = self.urls.text();
+        let too_long = text.len() > MAX_URL_TEXT_BYTES;
+        if too_long {
+            text = truncate_text_bytes(text, MAX_URL_TEXT_BYTES);
+            self.urls = text_editor::Content::with_text(&text);
+        }
+        let mut seen = HashSet::new();
+        let lines: Vec<&str> = text
+            .lines()
+            .map(str::trim)
+            .filter(|line| is_link(line) && seen.insert(*line))
+            .collect();
+        self.torrents.retain(|torrent| {
+            torrent
+                .magnet()
+                .is_none_or(|magnet| lines.contains(&magnet))
+        });
+        let preview_http =
+            lines.iter().filter(|line| !is_magnet(line)).count() <= HTTP_PREVIEW_LIMIT;
+
+        let mut previews = Previews::default();
+        let mut previous = std::mem::take(&mut self.links);
+        for &line in lines.iter().take(MAX_LINKS) {
+            if self
+                .torrents
+                .iter()
+                .any(|torrent| torrent.magnet() == Some(line))
+            {
+                continue;
+            }
+            let magnet = is_magnet(line);
+            if let Some(index) = previous.iter().position(|link| link.url == line) {
+                let mut link = previous.swap_remove(index);
+                if !magnet && !preview_http && link.state == LinkState::Resolving {
+                    previews.cancel.extend(link.request.take());
+                    link.state = LinkState::Unchecked;
+                }
+                self.links.push(link);
+                continue;
+            }
+            let request = (magnet || preview_http).then(|| {
+                *next_request += 1;
+                *next_request
+            });
+            if let Some(id) = request {
+                let queue = if magnet {
+                    &mut previews.magnets
+                } else {
+                    &mut previews.http
+                };
+                queue.push((id, line.to_owned()));
+            }
+            self.links.push(Link {
+                url: line.to_owned(),
+                name: if magnet {
+                    "magnet".to_owned()
+                } else {
+                    shio_core::extract_filename(line)
+                },
+                state: if request.is_some() {
+                    LinkState::Resolving
+                } else {
+                    LinkState::Unchecked
+                },
+                request,
+            });
+        }
+        previews.cancel.extend(
+            previous
+                .into_iter()
+                .filter(|link| link.state == LinkState::Resolving)
+                .filter_map(|link| link.request),
+        );
+        self.too_many = too_long || lines.len() > MAX_LINKS;
+        self.revalidate();
+        previews
+    }
+
+    pub(super) fn apply_http_preview(&mut self, result: HttpPreviewResult) {
+        let Some(link) = self.links.iter_mut().find(|link| {
+            link.request == Some(result.request_id) && link.state == LinkState::Resolving
+        }) else {
+            return;
+        };
+        link.state = match result.state {
+            HttpPreviewState::Ready(preview) => {
+                if !preview.filename.is_empty() {
+                    link.name = preview.filename;
+                }
+                LinkState::Ready {
+                    size: preview.total_size,
+                }
+            },
+            HttpPreviewState::Blocked { reason } => LinkState::Blocked(reason),
+            HttpPreviewState::Error { message } => LinkState::Failed(message),
+        };
+        self.revalidate();
+    }
+
+    pub(super) fn apply_magnet_preview(&mut self, result: MagnetPreviewResult) {
+        let Some(index) = self.links.iter().position(|link| {
+            link.request == Some(result.request_id)
+                && link.url == result.magnet
+                && link.state == LinkState::Resolving
+        }) else {
+            return;
+        };
+        match result.result {
+            Ok(manifest) => {
+                self.links.remove(index);
+                self.torrents.push(TorrentPick {
+                    id: result.request_id,
+                    name: manifest.name,
+                    files: manifest.files,
+                    source: PickSource::Magnet(result.magnet),
+                    bytes: manifest.metadata_bytes,
+                });
+                self.selected_torrent.get_or_insert(result.request_id);
+            },
+            Err(message) => self.links[index].state = LinkState::Failed(message),
+        }
+        self.revalidate();
+    }
+
+    pub(super) fn add_torrents(
+        &mut self,
+        picks: Vec<Result<TorrentPick, String>>,
+        next_request: &mut u64,
+    ) -> Vec<String> {
+        let mut problems = Vec::new();
+        for pick in picks {
+            match pick {
+                Ok(_) if self.torrents.len() == MAX_TORRENTS => {
+                    problems.push(format!("up to {MAX_TORRENTS} torrents at once"));
+                    break;
+                },
+                Ok(mut pick) => {
+                    let duplicate =
+                        self.torrents
+                            .iter()
+                            .any(|torrent| match (&torrent.source, &pick.source) {
+                                (PickSource::File(a), PickSource::File(b)) => a == b,
+                                _ => false,
+                            });
+                    if duplicate {
+                        continue;
+                    }
+                    *next_request += 1;
+                    pick.id = *next_request;
+                    self.selected_torrent.get_or_insert(pick.id);
+                    self.torrents.push(pick);
+                },
+                Err(problem) => problems.push(problem),
+            }
+        }
+        self.revalidate();
+        problems
+    }
+
+    pub(super) fn set_torrent_files(&mut self, torrent: u64, file: Option<usize>, selected: bool) {
+        let search = self.torrent_search.trim().to_lowercase();
+        let Some(pick) = self.torrents.iter_mut().find(|pick| pick.id == torrent) else {
+            return;
+        };
+        for (index, entry) in pick.files.iter_mut().enumerate() {
+            let target = match file {
+                Some(file) => index == file,
+                None => {
+                    search.is_empty()
+                        || entry
+                            .path
+                            .to_string_lossy()
+                            .to_lowercase()
+                            .contains(&search)
+                },
+            };
+            if target {
+                entry.selected = selected;
+            }
+        }
+        self.revalidate();
+    }
+
+    pub(super) fn revalidate(&mut self) {
+        if !self
+            .selected_torrent
+            .is_some_and(|id| self.torrents.iter().any(|pick| pick.id == id))
+        {
+            self.selected_torrent = self.torrents.first().map(|pick| pick.id);
+        }
+        if !self.subfolder_edited {
+            let names: Vec<&str> = self
+                .links
+                .iter()
+                .filter(|link| {
+                    !is_magnet(&link.url) && !matches!(link.state, LinkState::Blocked(_))
+                })
+                .map(|link| link.name.as_str())
+                .chain(self.torrents.iter().map(|pick| pick.name.as_str()))
+                .collect();
+            let suggestion = shio_core::suggest_folder_name(&names)
+                .or_else(|| names.first().map(|name| shio_core::sanitize_filename(name)))
+                .unwrap_or_default();
+            self.subfolder = truncate_text_bytes(suggestion, MAX_NAME_TEXT_BYTES);
+        }
+        let plan = if self.links.is_empty() && self.torrents.is_empty() {
+            Err(AddValidation::Empty)
+        } else if self.too_many {
+            Err(AddValidation::Invalid(format!(
+                "up to {MAX_LINKS} links at once"
+            )))
+        } else {
+            self.build_plan().map_err(AddValidation::Invalid)
+        };
+        (self.plan, self.validation) = match plan {
+            Ok(plan) if plan.is_empty() => (plan, AddValidation::Empty),
+            Ok(plan) => {
+                let summary = summary(&plan);
+                (plan, AddValidation::Ready(summary))
+            },
+            Err(validation) => (Vec::new(), validation),
+        };
+    }
+
+    fn build_plan(&self) -> Result<Vec<Item>, String> {
+        let save_path = Path::new(self.save_path.trim());
+        if !save_path.is_absolute() {
+            return Err("choose a download folder".to_owned());
+        }
+        let mut items = Vec::new();
+        let mut sets: BTreeMap<String, Vec<(&Link, u32)>> = BTreeMap::new();
+        let addable = self
+            .links
+            .iter()
+            .filter(|link| !matches!(link.state, LinkState::Blocked(_)));
+        for link in addable {
+            if is_magnet(&link.url) {
+                items.push(Item::Magnet(link.url.clone()));
+            } else if let Some(part) = shio_core::parse_archive_part(&link.name) {
+                sets.entry(part.base_name)
+                    .or_default()
+                    .push((link, part.part_number));
+            } else {
+                items.push(Item::Http {
+                    url: link.url.clone(),
+                    name: link.name.clone(),
+                });
+            }
+        }
+        for (base_name, parts) in sets {
+            if let [(link, _)] = parts.as_slice() {
+                items.push(Item::Http {
+                    url: link.url.clone(),
+                    name: link.name.clone(),
+                });
+                continue;
+            }
+            let name = shio_core::subfolder_value(self.create_subfolder, &self.subfolder)
+                .unwrap_or_else(|| base_name.clone());
+            let request = parts
+                .iter()
+                .map(|(link, number)| {
+                    HttpArchivePartRequest::new(
+                        link.url.clone(),
+                        link.name.clone(),
+                        *number,
+                        self.segments,
+                    )
+                })
+                .collect::<shio_core::Result<Vec<_>>>()
+                .and_then(|parts| {
+                    HttpArchiveSetRequest::new(
+                        name.clone(),
+                        save_path.to_path_buf(),
+                        parts,
+                        self.auto_extract,
+                    )
+                })
+                .map_err(|error| format!("{base_name}: {}", error.short_label()))?;
+            items.push(Item::ArchiveSet {
+                name,
+                request,
+                urls: parts.iter().map(|(link, _)| link.url.clone()).collect(),
+            });
+        }
+        for pick in &self.torrents {
+            if pick.selected_count() == 0 {
+                return Err(format!("select at least one file in {}", pick.name));
+            }
+            items.push(Item::Torrent(pick.id));
+        }
+        Ok(items)
+    }
+
+    pub(super) fn submit(&mut self) -> Vec<AddRequest> {
+        let save_path = PathBuf::from(self.save_path.trim());
+        let subfolder = shio_core::subfolder_value(self.create_subfolder, &self.subfolder);
+        let torrent_path = subfolder
+            .as_ref()
+            .map_or_else(|| save_path.clone(), |subfolder| save_path.join(subfolder));
+        let rename = self.filename.trim();
+        let rename = (self.single_http() && !rename.is_empty()).then_some(rename);
+        self.submitting = true;
+        self.failures.clear();
+        self.submitted.clear();
+        let mut requests = Vec::with_capacity(self.plan.len());
+        for item in &self.plan {
+            let (label, source, request) = match item {
+                Item::Http { url, name } => {
+                    let mut request = HttpDownloadRequest::new(url.clone(), save_path.clone())
+                        .with_segments(self.segments)
+                        .with_auto_extract(self.auto_extract);
+                    if let Some(subfolder) = &subfolder {
+                        request = request.with_subfolder(subfolder.clone());
+                    }
+                    if let Some(rename) = rename {
+                        request = request.with_filename(rename.to_owned());
+                    }
+                    (
+                        name.clone(),
+                        Source::Urls(vec![url.clone()]),
+                        AddRequest::Http(request),
+                    )
+                },
+                Item::ArchiveSet {
+                    name,
+                    request,
+                    urls,
+                } => (
+                    name.clone(),
+                    Source::Urls(urls.clone()),
+                    AddRequest::ArchiveSet(request.clone()),
+                ),
+                Item::Magnet(magnet) => (
+                    "magnet link".to_owned(),
+                    Source::Urls(vec![magnet.clone()]),
+                    AddRequest::Torrent(
+                        TorrentDownloadRequest::new(
+                            TorrentSource::Magnet(magnet.clone()),
+                            torrent_path.clone(),
+                        )
+                        .with_auto_extract(self.auto_extract),
+                    ),
+                ),
+                Item::Torrent(id) => {
+                    let Some(pick) = self.torrents.iter().find(|pick| pick.id == *id) else {
+                        continue;
+                    };
+                    (
+                        pick.name.clone(),
+                        Source::Torrent(*id),
+                        AddRequest::Torrent(pick.request(torrent_path.clone(), self.auto_extract)),
+                    )
+                },
+            };
+            self.submitted.push((label, source));
+            requests.push(request);
+        }
+        requests
+    }
+
+    pub(super) fn finish_submit(
+        &mut self,
+        results: Vec<Result<(), String>>,
+        next_request: &mut u64,
+    ) -> (usize, Previews) {
+        self.submitting = false;
+        let mut added = 0;
+        let mut added_urls = HashSet::new();
+        for ((label, source), result) in self.submitted.drain(..).zip(results) {
+            if let Err(reason) = result {
+                self.failures.push((label, reason));
+                continue;
+            }
+            added += 1;
+            match source {
+                Source::Urls(urls) => added_urls.extend(urls),
+                Source::Torrent(id) => {
+                    if let Some(index) = self.torrents.iter().position(|pick| pick.id == id)
+                        && let PickSource::Magnet(magnet) = self.torrents.remove(index).source
+                    {
+                        added_urls.insert(magnet);
+                    }
+                },
+            }
+        }
+        let text = self.urls.text();
+        let remaining: Vec<&str> = text
+            .lines()
+            .filter(|line| !added_urls.contains(line.trim()))
+            .collect();
+        self.urls = text_editor::Content::with_text(&remaining.join("\n"));
+        (added, self.sync_links(next_request))
+    }
+}
+
+fn summary(plan: &[Item]) -> String {
+    let (mut links, mut sets, mut torrents) = (0, 0, 0);
+    for item in plan {
+        match item {
+            Item::Http { .. } | Item::Magnet(_) => links += 1,
+            Item::ArchiveSet { .. } => sets += 1,
+            Item::Torrent(_) => torrents += 1,
+        }
+    }
+    [
+        (links, "link", "links"),
+        (sets, "archive set", "archive sets"),
+        (torrents, "torrent", "torrents"),
+    ]
+    .into_iter()
+    .filter(|(count, ..)| *count > 0)
+    .map(|(count, one, many)| format!("{count} {}", if count == 1 { one } else { many }))
+    .collect::<Vec<_>>()
+    .join(" · ")
+}
+
+pub(super) fn file_label(path: &Path) -> String {
+    path.file_name()
+        .unwrap_or(path.as_os_str())
+        .to_string_lossy()
+        .into_owned()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::{
-        AddHttpPreview, AddHttpPreviewState, AddMagnetPreview, AddMagnetPreviewState,
-        AddTorrentPreview, AddTorrentSource,
-    };
-    use shio_core::{
-        HttpPreview, HttpPreviewResult, HttpPreviewState, MagnetPreviewManifest,
-        MagnetPreviewResult,
-    };
 
-    const MAGNET: &str = "magnet:?xt=urn:btih:cab507494d02ebb1178b38f2e9d7be299c86b862&dn=ubuntu";
-    const HTTP_URL: &str = "https://example.com/download?id=1";
-    const OTHER_HTTP_URL: &str = "https://example.com/file.bin";
+    const MAGNET: &str = "magnet:?xt=urn:btih:cab507494d02ebb1178b38f2e9d7be299c86b862";
 
-    fn torrent_with_selection(selected: bool) -> AddTorrentPreview {
-        AddTorrentPreview {
-            source: AddTorrentSource::File {
-                path: PathBuf::from("batch.torrent"),
-            },
-            display_name: "batch".to_string(),
-            is_private: false,
-            files: vec![TorrentFile {
-                path: PathBuf::from("file.bin"),
-                size: 1,
-                downloaded: 0,
-                selected,
-            }],
-            trackers: Vec::new(),
-            metadata_bytes: None,
+    fn dialog(text: &str) -> (AddDialog, Previews) {
+        let mut dialog = AddDialog::new(&AppConfig::default());
+        dialog.save_path = std::env::temp_dir().to_string_lossy().into_owned();
+        dialog.urls = text_editor::Content::with_text(text);
+        let previews = dialog.sync_links(&mut 0);
+        (dialog, previews)
+    }
+
+    #[test]
+    fn links_group_into_archive_sets_and_validate_before_submit() {
+        let many: Vec<String> = (0..=MAX_LINKS)
+            .map(|n| format!("https://e.com/{n}.bin"))
+            .collect();
+        let many = many.join("\n");
+        let mixed = format!(
+            "https://e.com/a.part01.rar\nhttps://e.com/a.part02.rar\nhttps://e.com/x.iso\n{MAGNET}\nhttps://e.com/x.iso"
+        );
+        let cases = [
+            ("", AddValidation::Empty),
+            ("not a link\nftp://e.com/x", AddValidation::Empty),
+            (
+                mixed.as_str(),
+                AddValidation::Ready("2 links · 1 archive set".to_owned()),
+            ),
+            (
+                "https://e.com/b.part01.rar\nhttps://e.com/b.part03.rar",
+                AddValidation::Invalid(String::new()),
+            ),
+            (many.as_str(), AddValidation::Invalid(String::new())),
+        ];
+        for (text, expected) in cases {
+            let (dialog, _) = dialog(text);
+            match (&dialog.validation, &expected) {
+                (AddValidation::Invalid(_), AddValidation::Invalid(_)) => {},
+                (actual, expected) => assert_eq!(actual, expected, "{text}"),
+            }
         }
+
+        let (mut relative, _) = dialog("https://e.com/x.iso");
+        relative.save_path = "downloads".to_owned();
+        relative.revalidate();
+        assert!(matches!(relative.validation, AddValidation::Invalid(_)));
     }
 
-    fn parsed_with_magnet() -> ParsedAddUrls {
-        parse_add_urls(&format!("https://example.com/file.bin\n{MAGNET}"))
-    }
-
-    fn parsed_with_http_urls() -> ParsedAddUrls {
-        parse_add_urls(&format!("{HTTP_URL}\n{OTHER_HTTP_URL}"))
-    }
-
-    fn preview_result(request_id: u64) -> MagnetPreviewResult {
-        MagnetPreviewResult {
+    #[test]
+    fn blocked_links_are_left_out_and_stale_previews_ignored() {
+        let (mut dialog, previews) = dialog("https://e.com/a.bin\nhttps://e.com/b.bin");
+        assert_eq!(previews.http.len(), 2);
+        let blocked = |request_id| HttpPreviewResult {
             request_id,
-            magnet: MAGNET.to_string(),
-            result: Ok(MagnetPreviewManifest {
-                name: "ubuntu".to_string(),
-                total_size: 42,
-                is_private: false,
-                files: vec![TorrentFile {
-                    path: PathBuf::from("ubuntu.iso"),
-                    size: 42,
-                    downloaded: 0,
-                    selected: true,
-                }],
-                trackers: vec!["udp://tracker.example:1337/announce".to_string()],
-                metadata_bytes: b"metadata".to_vec(),
-            }),
-        }
-    }
-
-    fn http_ready_result(request_id: u64) -> HttpPreviewResult {
-        HttpPreviewResult {
-            request_id,
-            state: HttpPreviewState::Ready(HttpPreview {
-                filename: "server-name.iso".to_string(),
-                total_size: Some(42),
-                content_type: Some("application/octet-stream".to_string()),
-                accept_ranges: true,
-            }),
-        }
-    }
-
-    fn sample_torrent_bytes() -> Vec<u8> {
-        let pieces = b"abcdefghijklmnopqrst";
-        let mut bytes = b"d8:announce35:udp://tracker.example:1337/announce4:infod5:filesld6:lengthi123e4:pathl7:foo.txteed6:lengthi456e4:pathl3:bar7:baz.mkveee4:name7:release12:piece lengthi16384e6:pieces20:".to_vec();
-        bytes.extend_from_slice(pieces);
-        bytes.extend_from_slice(b"ee");
-        bytes
-    }
-
-    #[test]
-    fn parse_add_urls_uses_fragment_filenames() {
-        let input = [
-            "https://example.com/a#archive.part01.rar",
-            "https://example.com/b#archive.part02.rar",
-            "magnet:?xt=urn:btih:123",
-        ]
-        .join("\n");
-
-        let parsed = parse_add_urls(&input);
-
-        assert_eq!(parsed.entries.len(), 3);
-        assert_eq!(parsed.http_count, 2);
-        assert_eq!(parsed.magnet_count, 1);
-        assert_eq!(parsed.preview[0], "archive.part01.rar");
-        assert_eq!(parsed.preview[1], "archive.part02.rar");
-        assert_eq!(parsed.preview[2], "magnet");
-        assert!(parsed.has_archive_url);
-        assert_eq!(parsed.suggested_subfolder.as_deref(), Some("archive"));
-    }
-
-    #[test]
-    fn parse_add_urls_caps_preview() {
-        let input = (1..=32)
-            .map(|n| format!("https://example.com/{n}#batch.part{n:02}.rar"))
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        let parsed = parse_add_urls(&input);
-
-        assert_eq!(parsed.entries.len(), 32);
-        assert_eq!(parsed.preview.len(), ADD_URL_PREVIEW_LIMIT);
-        assert_eq!(parsed.http_count, 32);
-        assert_eq!(parsed.magnet_count, 0);
-    }
-
-    #[test]
-    fn parse_add_urls_ignores_invalid_intermediate_http_text() {
-        let input = [
-            HTTP_URL,
-            "https://",
-            "not a url",
-            "ftp://example.com/file.bin",
-            MAGNET,
-        ]
-        .join("\n");
-
-        let parsed = parse_add_urls(&input);
-
-        assert_eq!(
-            parsed.entries,
-            vec![HTTP_URL.to_string(), MAGNET.to_string()]
-        );
-        assert_eq!(parsed.http_urls, vec![HTTP_URL.to_string()]);
-        assert_eq!(parsed.http_count, 1);
-        assert_eq!(parsed.magnet_count, 1);
-        assert_eq!(
-            parsed.preview,
-            vec!["download".to_string(), "magnet".to_string()]
-        );
-    }
-
-    #[test]
-    fn can_confirm_add_sources_rejects_empty_sources() {
-        assert!(!can_confirm_add_sources(&[], &[]));
-    }
-
-    #[test]
-    fn can_confirm_add_sources_rejects_torrent_without_selection() {
-        let torrents = [torrent_with_selection(false)];
-
-        assert!(!can_confirm_add_sources(
-            &["https://example.com/file.bin".to_string()],
-            &torrents
-        ));
-    }
-
-    #[test]
-    fn can_confirm_add_sources_accepts_urls_and_selected_torrents() {
-        let torrents = [torrent_with_selection(true)];
-
-        assert!(can_confirm_add_sources(
-            &["https://example.com/file.bin".to_string()],
-            &torrents
-        ));
-    }
-
-    #[test]
-    fn default_source_selection_uses_url_row_index() {
-        assert_eq!(
-            default_add_source_selection(&[HTTP_URL.to_string(), HTTP_URL.to_string()], &[]),
-            Some(AddSourceId::Url(0))
-        );
-    }
-
-    #[test]
-    fn url_source_identity_allows_duplicate_urls_by_index() {
-        let urls = vec![HTTP_URL.to_string(), HTTP_URL.to_string()];
-
-        assert!(add_source_exists(&AddSourceId::Url(0), &urls, &[]));
-        assert!(add_source_exists(&AddSourceId::Url(1), &urls, &[]));
-        assert!(!add_source_exists(&AddSourceId::Url(2), &urls, &[]));
-    }
-
-    #[test]
-    fn torrent_file_filter_matches_path_and_preserves_original_indices() {
-        let torrent = AddTorrentPreview {
-            source: AddTorrentSource::File {
-                path: PathBuf::from("release.torrent"),
+            state: HttpPreviewState::Blocked {
+                reason: "a web page".to_owned(),
             },
-            display_name: "release".to_string(),
-            is_private: false,
-            files: vec![
-                TorrentFile {
-                    path: PathBuf::from("show/s01e01.mkv"),
-                    size: 10,
-                    downloaded: 0,
-                    selected: true,
-                },
-                TorrentFile {
-                    path: PathBuf::from("subs/episode-one.srt"),
-                    size: 1,
-                    downloaded: 0,
-                    selected: true,
-                },
-                TorrentFile {
-                    path: PathBuf::from("extras/Poster.JPG"),
-                    size: 2,
-                    downloaded: 0,
-                    selected: true,
-                },
-            ],
-            trackers: Vec::new(),
-            metadata_bytes: None,
         };
 
-        assert_eq!(filtered_torrent_file_indices(&torrent, "subs"), vec![1]);
+        dialog.apply_http_preview(blocked(previews.http[0].0));
+        dialog.apply_http_preview(blocked(99));
+        assert_eq!(dialog.validation, AddValidation::Ready("1 link".to_owned()));
+
+        dialog.apply_http_preview(blocked(previews.http[1].0));
+        assert_eq!(dialog.validation, AddValidation::Empty);
+    }
+
+    #[test]
+    fn failed_items_stay_in_the_form_with_their_reason() {
+        let (mut dialog, _) = dialog("https://e.com/a.bin\nhttps://e.com/b.bin");
+        assert_eq!(dialog.submit().len(), 2);
+        assert!(dialog.submitting);
+
+        let (added, _) =
+            dialog.finish_submit(vec![Ok(()), Err("not found (404)".to_owned())], &mut 2);
+
+        assert_eq!(added, 1);
+        assert!(!dialog.submitting);
         assert_eq!(
-            filtered_torrent_file_indices(&torrent, "poster.jpg"),
-            vec![2]
+            dialog.failures,
+            [("b.bin".to_owned(), "not found (404)".to_owned())]
         );
-    }
-
-    #[test]
-    fn torrent_matching_selection_changes_all_matching_original_indices() {
-        let mut torrent = AddTorrentPreview {
-            source: AddTorrentSource::File {
-                path: PathBuf::from("release.torrent"),
-            },
-            display_name: "release".to_string(),
-            is_private: false,
-            files: vec![
-                TorrentFile {
-                    path: PathBuf::from("keep/a.txt"),
-                    size: 1,
-                    downloaded: 0,
-                    selected: true,
-                },
-                TorrentFile {
-                    path: PathBuf::from("drop/b.txt"),
-                    size: 1,
-                    downloaded: 0,
-                    selected: true,
-                },
-                TorrentFile {
-                    path: PathBuf::from("keep/c.txt"),
-                    size: 1,
-                    downloaded: 0,
-                    selected: true,
-                },
-            ],
-            trackers: Vec::new(),
-            metadata_bytes: None,
-        };
-
-        set_matching_torrent_files(&mut torrent, "keep", false);
-
-        assert_eq!(
-            torrent
-                .files
-                .iter()
-                .map(|file| file.selected)
-                .collect::<Vec<_>>(),
-            vec![false, true, false]
-        );
-    }
-
-    #[test]
-    fn resolved_magnet_moves_into_torrent_previews() {
-        let mut url_entries = parsed_with_magnet().entries;
-        let mut magnets = vec![AddMagnetPreview {
-            magnet: MAGNET.to_string(),
-            request_id: 7,
-            state: AddMagnetPreviewState::Resolving,
-        }];
-        let mut torrents = Vec::new();
-
-        apply_magnet_preview_result(
-            preview_result(7),
-            &parsed_with_magnet(),
-            &mut url_entries,
-            &mut magnets,
-            &mut torrents,
-        );
-
-        assert_eq!(url_entries, vec!["https://example.com/file.bin"]);
-        assert!(magnets.is_empty());
-        assert_eq!(torrents.len(), 1);
-        assert_eq!(torrents[0].display_name, "ubuntu");
-        assert_eq!(torrents[0].selected_count(), 1);
-        assert_eq!(
-            torrents[0].metadata_bytes.as_deref(),
-            Some(&b"metadata"[..])
-        );
-    }
-
-    #[test]
-    fn stale_magnet_preview_result_is_ignored() {
-        let mut url_entries = parsed_with_magnet().entries;
-        let mut magnets = vec![AddMagnetPreview {
-            magnet: MAGNET.to_string(),
-            request_id: 8,
-            state: AddMagnetPreviewState::Resolving,
-        }];
-        let mut torrents = Vec::new();
-
-        apply_magnet_preview_result(
-            preview_result(7),
-            &parsed_with_magnet(),
-            &mut url_entries,
-            &mut magnets,
-            &mut torrents,
-        );
-
-        assert_eq!(url_entries.len(), 2);
-        assert_eq!(magnets.len(), 1);
-        assert!(torrents.is_empty());
-    }
-
-    #[test]
-    fn failed_magnet_preview_remains_addable() {
-        let mut url_entries = parsed_with_magnet().entries;
-        let mut magnets = vec![AddMagnetPreview {
-            magnet: MAGNET.to_string(),
-            request_id: 7,
-            state: AddMagnetPreviewState::Resolving,
-        }];
-        let mut torrents = Vec::new();
-
-        apply_magnet_preview_result(
-            MagnetPreviewResult {
-                request_id: 7,
-                magnet: MAGNET.to_string(),
-                result: Err("metadata unavailable".to_string()),
-            },
-            &parsed_with_magnet(),
-            &mut url_entries,
-            &mut magnets,
-            &mut torrents,
-        );
-
-        assert!(url_entries.iter().any(|entry| entry == MAGNET));
-        assert!(matches!(
-            magnets[0].state,
-            AddMagnetPreviewState::Failed { .. }
-        ));
-        assert!(torrents.is_empty());
-    }
-
-    #[test]
-    fn stale_http_preview_result_is_ignored() {
-        let mut previews = vec![AddHttpPreview {
-            url: HTTP_URL.to_string(),
-            request_id: 8,
-            state: AddHttpPreviewState::Resolving,
-        }];
-
-        apply_http_preview_result(
-            http_ready_result(7),
-            &parsed_with_http_urls(),
-            &mut previews,
-        );
-
-        assert_eq!(
-            previews,
-            vec![AddHttpPreview {
-                url: HTTP_URL.to_string(),
-                request_id: 8,
-                state: AddHttpPreviewState::Resolving,
-            }]
-        );
-    }
-
-    #[test]
-    fn ready_http_preview_updates_name_without_removing_original_url() {
-        let parsed = parsed_with_http_urls();
-        let url_entries = parsed.entries.clone();
-        let mut previews = vec![AddHttpPreview {
-            url: HTTP_URL.to_string(),
-            request_id: 7,
-            state: AddHttpPreviewState::Resolving,
-        }];
-
-        apply_http_preview_result(http_ready_result(7), &parsed, &mut previews);
-
-        assert_eq!(url_entries[0], HTTP_URL);
-        assert!(matches!(
-            previews[0].state,
-            AddHttpPreviewState::Ready(HttpPreview { ref filename, .. }) if filename == "server-name.iso"
-        ));
-    }
-
-    #[test]
-    fn blocked_http_preview_is_not_addable() {
-        let parsed = parsed_with_http_urls();
-        let mut previews = vec![
-            AddHttpPreview {
-                url: HTTP_URL.to_string(),
-                request_id: 7,
-                state: AddHttpPreviewState::Resolving,
-            },
-            AddHttpPreview {
-                url: OTHER_HTTP_URL.to_string(),
-                request_id: 8,
-                state: AddHttpPreviewState::Resolving,
-            },
-        ];
-
-        apply_http_preview_result(http_ready_result(7), &parsed, &mut previews);
-        apply_http_preview_result(
-            HttpPreviewResult {
-                request_id: 8,
-                state: HttpPreviewState::Blocked {
-                    reason: "unsupported host".to_string(),
-                },
-            },
-            &parsed,
-            &mut previews,
-        );
-
-        let addable_urls = addable_url_entries(&parsed.entries, &previews);
-
-        assert_eq!(addable_urls, vec![HTTP_URL.to_string()]);
-        assert!(can_confirm_add_sources(&addable_urls, &[]));
-        assert_eq!(previews.len(), 2);
-        assert!(matches!(
-            previews[1].state,
-            AddHttpPreviewState::Blocked { ref reason } if reason == "unsupported host"
-        ));
-    }
-
-    #[test]
-    fn torrent_file_preview_retains_source_bytes() {
-        let bytes = sample_torrent_bytes();
-        let path = PathBuf::from("sample.torrent");
-
-        let preview = torrent_file_preview(path, bytes.clone()).expect("valid torrent");
-
-        assert_eq!(preview.metadata_bytes.as_deref(), Some(bytes.as_slice()));
-    }
-
-    #[test]
-    fn failed_http_preview_does_not_block_other_valid_urls() {
-        let parsed = parsed_with_http_urls();
-        let mut previews = vec![
-            AddHttpPreview {
-                url: HTTP_URL.to_string(),
-                request_id: 7,
-                state: AddHttpPreviewState::Resolving,
-            },
-            AddHttpPreview {
-                url: OTHER_HTTP_URL.to_string(),
-                request_id: 8,
-                state: AddHttpPreviewState::Resolving,
-            },
-        ];
-
-        apply_http_preview_result(http_ready_result(7), &parsed, &mut previews);
-        apply_http_preview_result(
-            HttpPreviewResult {
-                request_id: 8,
-                state: HttpPreviewState::Error {
-                    message: "preview timed out".to_string(),
-                },
-            },
-            &parsed,
-            &mut previews,
-        );
-
-        let addable_urls = addable_url_entries(&parsed.entries, &previews);
-
-        assert_eq!(
-            addable_urls,
-            vec![HTTP_URL.to_string(), OTHER_HTTP_URL.to_string()]
-        );
-        assert!(can_confirm_add_sources(&addable_urls, &[]));
-        assert_eq!(previews.len(), 2);
-        assert!(matches!(
-            previews[1].state,
-            AddHttpPreviewState::Failed { ref message } if message == "preview timed out"
-        ));
-    }
-
-    #[test]
-    fn draining_http_preview_request_ids_clears_pending_previews() {
-        let mut previews = vec![
-            AddHttpPreview {
-                url: HTTP_URL.to_string(),
-                request_id: 7,
-                state: AddHttpPreviewState::Resolving,
-            },
-            AddHttpPreview {
-                url: OTHER_HTTP_URL.to_string(),
-                request_id: 8,
-                state: AddHttpPreviewState::Ready(HttpPreview {
-                    filename: "server-name.iso".to_string(),
-                    total_size: Some(42),
-                    content_type: Some("application/octet-stream".to_string()),
-                    accept_ranges: true,
-                }),
-            },
-        ];
-
-        let request_ids = drain_http_preview_request_ids(&mut previews);
-
-        assert_eq!(request_ids, vec![7, 8]);
-        assert!(previews.is_empty());
-    }
-
-    #[test]
-    fn large_http_batches_skip_network_previews() {
-        let urls = (1..=46)
-            .map(|n| format!("https://example.com/file.part{n:02}.rar"))
-            .collect::<Vec<_>>();
-
-        assert!(!should_request_http_previews(&urls));
+        assert_eq!(dialog.urls.text().trim(), "https://e.com/b.bin");
+        assert_eq!(dialog.links.len(), 1);
     }
 }

@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -5,8 +6,11 @@ pub enum ShioError {
     #[error("network: {0}")]
     Network(#[from] reqwest::Error),
 
-    #[error("HTTP {code}: {message}")]
-    Http { code: u16, message: String },
+    #[error("HTTP {code}")]
+    Http {
+        code: u16,
+        retry_after: Option<std::time::Duration>,
+    },
 
     #[error("i/o: {0}")]
     Io(#[from] std::io::Error),
@@ -31,17 +35,17 @@ pub enum ShioError {
     #[error("database value in {field}: {value}")]
     DatabaseValue { field: &'static str, value: String },
 
-    #[error("unsupported database schema version {found}; expected {expected}")]
-    UnsupportedDatabaseVersion { found: i64, expected: i64 },
+    #[error("the database was not created by this version of Shio")]
+    UnrecognizedDatabase,
 
     #[error("config: {0}")]
     Config(String),
 
-    #[error("invalid url: {0}")]
-    InvalidUrl(String),
+    #[error("remote file changed while resuming")]
+    ResourceChanged,
 
-    #[error("server does not support resuming")]
-    NotResumable,
+    #[error("destination already exists: {0}")]
+    DestinationExists(PathBuf),
 
     #[error("URL is not a direct file link (server returned {content_type})")]
     NotADirectFile { content_type: String },
@@ -64,7 +68,17 @@ pub enum ShioError {
 
 pub type Result<T> = std::result::Result<T, ShioError>;
 
+const MAX_LABEL_CHARS: usize = 48;
+
 impl ShioError {
+    // reqwest's Display includes the request URL, which may carry tokens.
+    pub(crate) fn safe_diagnostic(&self) -> String {
+        match self {
+            Self::Network(_) => self.short_label(),
+            _ => self.to_string(),
+        }
+    }
+
     pub fn short_label(&self) -> String {
         match self {
             Self::Network(e) => {
@@ -82,7 +96,7 @@ impl ShioError {
                 404 => "not found (404)".into(),
                 429 => "rate limited (429)".into(),
                 500..=599 => format!("server error ({code})"),
-                _ => format!("http {code}"),
+                _ => format!("HTTP {code}"),
             },
             Self::Io(e) => match e.kind() {
                 std::io::ErrorKind::PermissionDenied => "permission denied".into(),
@@ -90,40 +104,35 @@ impl ShioError {
                 std::io::ErrorKind::StorageFull => "disk full".into(),
                 _ => format!("disk error: {e}"),
             },
-            Self::NotResumable => "server does not support resume".into(),
+            Self::ResourceChanged => "remote file changed; restart required".into(),
+            Self::DestinationExists(_) => "destination already exists".into(),
             Self::NotADirectFile { .. } => "not a direct file link".into(),
             Self::SizeMismatch { .. } => "incomplete download".into(),
             Self::Cancelled => "cancelled".into(),
             Self::PasswordRequired => "password required".into(),
-            Self::Extract(msg) => friendly_extract(msg),
-            Self::InvalidUrl(_) => "invalid url".into(),
             Self::DatabaseJson { .. }
             | Self::DatabaseTimestamp { .. }
             | Self::DatabaseValue { .. }
-            | Self::UnsupportedDatabaseVersion { .. } => "corrupt database row".into(),
-            Self::Database(_) | Self::Config(_) | Self::Other(_) => {
-                let s = self.to_string();
-                if s.len() > 48 {
-                    format!("{}…", &s[..47])
-                } else {
-                    s
+            | Self::UnrecognizedDatabase => "corrupt database row".into(),
+            Self::Database(_) | Self::Config(_) | Self::Extract(_) | Self::Other(_) => {
+                let label = self.to_string();
+                match label.char_indices().nth(MAX_LABEL_CHARS - 1) {
+                    Some((end, _)) => format!("{}…", &label[..end]),
+                    None => label,
                 }
             },
         }
     }
 }
 
-fn friendly_extract(msg: &str) -> String {
-    let lower = msg.to_ascii_lowercase();
-    if lower.contains("password") || lower.contains("encrypt") {
-        "archive is password-protected".into()
-    } else if lower.contains("crc") || lower.contains("checksum") || lower.contains("corrupt") {
-        "archive is corrupt".into()
-    } else if lower.contains("unsupported") || lower.contains("unknown format") {
-        "unsupported archive format".into()
-    } else if lower.contains("space") || lower.contains("disk full") {
-        "disk full".into()
-    } else {
-        "extract failed".into()
+#[cfg(test)]
+mod tests {
+    use super::ShioError;
+
+    #[test]
+    fn short_label_truncates_unicode_at_a_character_boundary() {
+        let label = ShioError::Config("界".repeat(60)).short_label();
+        assert!(label.ends_with('…'));
+        assert_eq!(label.chars().count(), super::MAX_LABEL_CHARS);
     }
 }

@@ -1,118 +1,113 @@
 mod associations;
+#[cfg(target_os = "linux")]
+pub(crate) mod noctalia;
+#[cfg(windows)]
+mod registry;
 
-use iced::window::icon;
+use std::fs::{File, OpenOptions};
+use std::io;
+use std::path::Path;
 
 pub(crate) use associations::{
-    AssociationLaunch, association_launch_from_args, complete_download_association_setup,
-    successful_association_message,
+    ASSOCIATION_SETUP_SUPPORTED, ASSOCIATION_SUCCESS_MESSAGE, AssociationLaunch, UNREGISTER_FLAG,
+    association_launch_from_args, register_associations, unregister_associations,
 };
 
+pub(crate) const APP_ID: &str = "com.shio.DownloadManager";
 const ICON_BYTES: &[u8] = include_bytes!("../../../assets/icons/icon-256.png");
-const APP_USER_MODEL_ID: &str = "com.shio.DownloadManager";
-
-#[cfg(windows)]
-const DISPLAY_NAME: &str = "shio";
 
 pub(crate) fn window_icon() -> Option<iced::window::Icon> {
-    let img = image::load_from_memory(ICON_BYTES).ok()?.to_rgba8();
-    let (w, h) = img.dimensions();
-    icon::from_rgba(img.into_raw(), w, h).ok()
+    let image = image::load_from_memory(ICON_BYTES).ok()?.to_rgba8();
+    let (width, height) = image.dimensions();
+    iced::window::icon::from_rgba(image.into_raw(), width, height).ok()
 }
 
-#[allow(clippy::missing_const_for_fn)]
-pub(crate) fn register_app_id() {
-    #[cfg(windows)]
+pub(crate) fn create_private_dir(path: &Path) -> io::Result<()> {
+    std::fs::create_dir_all(path)?;
+    #[cfg(unix)]
     {
-        windows::set_app_user_model_id();
-        windows::register_aumid_in_registry();
+        use std::os::unix::fs::PermissionsExt;
+        let metadata = std::fs::symlink_metadata(path)?;
+        if !metadata.is_dir() {
+            return Err(io::Error::other(format!(
+                "{} is not a directory",
+                path.display()
+            )));
+        }
+        if metadata.permissions().mode() & 0o777 != 0o700 {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn open_private(path: &Path, options: &OpenOptions) -> io::Result<File> {
+    reject_non_file(path)?;
+    #[cfg(unix)]
+    let options = &{
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let mut options = options.clone();
+        options.mode(0o600);
+        options
+    };
+    options.open(path)
+}
+
+fn reject_non_file(path: &Path) -> io::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if !metadata.is_file() => Err(io::Error::other(format!(
+            "{} is not a regular file",
+            path.display()
+        ))),
+        Err(error) if error.kind() != io::ErrorKind::NotFound => Err(error),
+        _ => Ok(()),
     }
 }
 
-pub(crate) const fn app_id() -> &'static str {
-    APP_USER_MODEL_ID
+pub(crate) fn remove_if_exists(path: &Path) -> io::Result<()> {
+    match std::fs::remove_file(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        result => result,
+    }
 }
 
 #[cfg(windows)]
-mod windows {
-    use super::{APP_USER_MODEL_ID, DISPLAY_NAME, ICON_BYTES};
-    use std::io::Write;
-    use std::path::PathBuf;
-    use windows_sys::Win32::Foundation::ERROR_SUCCESS;
-    use windows_sys::Win32::System::Registry::{
-        HKEY, HKEY_CURRENT_USER, KEY_WRITE, REG_OPTION_NON_VOLATILE, REG_SZ, RegCloseKey,
-        RegCreateKeyExW, RegSetValueExW,
+pub(crate) fn register_app_id() {
+    #![allow(unsafe_code)]
+    let id = registry::wide(APP_ID);
+    // SAFETY: `id` is NUL-terminated and outlives the call.
+    let hr = unsafe {
+        windows_sys::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID(id.as_ptr())
     };
-    use windows_sys::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID;
-
-    pub(super) fn set_app_user_model_id() {
-        let wide = wide_z(APP_USER_MODEL_ID);
-        #[allow(unsafe_code)]
-        unsafe {
-            let hr = SetCurrentProcessExplicitAppUserModelID(wide.as_ptr());
-            if hr < 0 {
-                tracing::warn!("SetCurrentProcessExplicitAppUserModelID failed: 0x{hr:08x}");
-            }
-        }
+    if hr < 0 {
+        tracing::warn!("SetCurrentProcessExplicitAppUserModelID failed: 0x{hr:08x}");
     }
-
-    pub(super) fn register_aumid_in_registry() {
-        let subkey = format!("Software\\Classes\\AppUserModelId\\{APP_USER_MODEL_ID}");
-        let icon_path = ensure_icon_on_disk();
-        #[allow(unsafe_code)]
-        unsafe {
-            let mut hkey: HKEY = std::ptr::null_mut();
-            let path = wide_z(&subkey);
-            let status = RegCreateKeyExW(
-                HKEY_CURRENT_USER,
-                path.as_ptr(),
-                0,
-                std::ptr::null(),
-                REG_OPTION_NON_VOLATILE,
-                KEY_WRITE,
-                std::ptr::null(),
-                &raw mut hkey,
-                std::ptr::null_mut(),
-            );
-            if status != ERROR_SUCCESS {
-                tracing::warn!("RegCreateKeyExW failed: {status}");
-                return;
-            }
-            set_string(hkey, "DisplayName", DISPLAY_NAME);
-            if let Some(path) = icon_path.and_then(|p| p.to_str().map(str::to_owned)) {
-                set_string(hkey, "IconUri", &path);
-            }
-            RegCloseKey(hkey);
-        }
+    let mut values = vec![("DisplayName", "shio")];
+    let icon = icon_file();
+    if let Some(icon) = icon.as_deref().and_then(Path::to_str) {
+        values.push(("IconUri", icon));
     }
-
-    #[allow(unsafe_code)]
-    /// # Safety
-    /// `hkey` must be a valid open registry key handle with write access.
-    unsafe fn set_string(hkey: HKEY, name: &str, value: &str) {
-        let name_w = wide_z(name);
-        let value_w: Vec<u16> = value.encode_utf16().chain(std::iter::once(0)).collect();
-        let byte_len = u32::try_from(value_w.len() * 2).unwrap_or(u32::MAX);
-        let bytes = value_w.as_ptr().cast::<u8>();
-        let status = unsafe { RegSetValueExW(hkey, name_w.as_ptr(), 0, REG_SZ, bytes, byte_len) };
-        if status != ERROR_SUCCESS {
-            tracing::warn!("RegSetValueExW({name}) failed: {status}");
-        }
+    if let Err(error) = registry::write_key(&app_id_key(), &values) {
+        tracing::warn!("{error}");
     }
+}
 
-    fn ensure_icon_on_disk() -> Option<PathBuf> {
-        let base = std::env::var_os("LOCALAPPDATA").map(PathBuf::from)?;
-        let dir = base.join("shio");
-        std::fs::create_dir_all(&dir).ok()?;
-        let path = dir.join("icon.png");
-        let needs_write = std::fs::read(&path).map_or(true, |existing| existing != ICON_BYTES);
-        if needs_write {
-            let mut f = std::fs::File::create(&path).ok()?;
-            f.write_all(ICON_BYTES).ok()?;
-        }
-        Some(path)
-    }
+#[cfg(windows)]
+fn app_id_key() -> String {
+    format!("Software\\Classes\\AppUserModelId\\{APP_ID}")
+}
 
-    fn wide_z(s: &str) -> Vec<u16> {
-        s.encode_utf16().chain(std::iter::once(0)).collect()
+#[cfg(windows)]
+fn icon_path() -> Option<std::path::PathBuf> {
+    Some(std::path::PathBuf::from(std::env::var_os("LOCALAPPDATA")?).join("shio/icon.png"))
+}
+
+#[cfg(windows)]
+fn icon_file() -> Option<std::path::PathBuf> {
+    let path = icon_path()?;
+    if std::fs::read(&path).ok().as_deref() != Some(ICON_BYTES) {
+        std::fs::create_dir_all(path.parent()?).ok()?;
+        std::fs::write(&path, ICON_BYTES).ok()?;
     }
+    Some(path)
 }

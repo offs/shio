@@ -1,443 +1,230 @@
 use shio_core::{
     AppConfig, DownloadEngine, EngineCommand, HttpPreview, HttpPreviewResult, HttpPreviewState,
 };
-use std::io::Write as _;
-use std::net::SocketAddr;
 use std::time::Duration;
 use tempfile::TempDir;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{mpsc, oneshot};
 
-const PREVIEW_TOKEN: &str = "secret-preview-token";
+const FILE_RESPONSE: &str = "HTTP/1.1 206 Partial Content\r\nContent-Length: 2\r\nContent-Range: bytes 0-1/1234\r\nContent-Type: application/octet-stream\r\n";
 
 async fn read_request(stream: &mut TcpStream) -> std::io::Result<()> {
-    let (reader, _) = stream.split();
-    let mut reader = BufReader::new(reader);
-
-    let mut request_line = String::new();
-    reader.read_line(&mut request_line).await?;
-
+    let mut reader = BufReader::new(stream);
     loop {
         let mut line = String::new();
         reader.read_line(&mut line).await?;
-        let trimmed = line.trim_end_matches(['\r', '\n']);
-        if trimmed.is_empty() {
-            break;
+        if line.trim_end().is_empty() {
+            return Ok(());
         }
     }
-
-    Ok(())
 }
 
-async fn bind_ephemeral() -> (SocketAddr, TcpListener) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    (addr, listener)
-}
-
-async fn write_response(stream: &mut TcpStream, response: &[u8]) -> std::io::Result<()> {
-    stream.write_all(response).await?;
+async fn answer(listener: &TcpListener, head: &str) -> std::io::Result<()> {
+    let (mut stream, _) = listener.accept().await?;
+    read_request(&mut stream).await?;
+    stream.write_all(format!("{head}\r\nab").as_bytes()).await?;
     stream.shutdown().await
 }
 
-async fn serve_probe_file(listener: TcpListener) -> std::io::Result<()> {
-    let (mut stream, _) = listener.accept().await?;
-    read_request(&mut stream).await?;
-    let mut response = Vec::new();
-    write!(
-        response,
-        "HTTP/1.1 206 Partial Content\r\nContent-Length: 2\r\nAccept-Ranges: bytes\r\nContent-Range: bytes 0-1/1234\r\nContent-Type: application/octet-stream\r\nContent-Disposition: attachment; filename=\"preview-file.bin\"\r\n\r\nab"
-    )?;
-    write_response(&mut stream, &response).await
+async fn listen() -> (TcpListener, String) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    (listener, format!("http://{address}"))
 }
 
-async fn serve_probe_file_without_disposition(listener: TcpListener) -> std::io::Result<()> {
-    let (mut stream, _) = listener.accept().await?;
-    read_request(&mut stream).await?;
-    let mut response = Vec::new();
-    write!(
-        response,
-        "HTTP/1.1 206 Partial Content\r\nContent-Length: 2\r\nAccept-Ranges: bytes\r\nContent-Range: bytes 0-1/1234\r\nContent-Type: application/octet-stream\r\n\r\nab"
-    )?;
-    write_response(&mut stream, &response).await
-}
-
-async fn serve_html_landing_page(listener: TcpListener) -> std::io::Result<()> {
-    let (mut stream, _) = listener.accept().await?;
-    read_request(&mut stream).await?;
-    let body = b"<html><a href=\"/real-file.bin\">download</a></html>";
-    let mut response = Vec::new();
-    write!(
-        response,
-        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/html\r\n\r\n",
-        body.len()
-    )?;
-    response.extend_from_slice(body);
-    write_response(&mut stream, &response).await
-}
-
-async fn serve_redirect_to_tokenized_file(
-    listener: TcpListener,
-    addr: SocketAddr,
-    token: &'static str,
-) -> std::io::Result<()> {
-    let (mut stream, _) = listener.accept().await?;
-    read_request(&mut stream).await?;
-    let mut response = Vec::new();
-    write!(
-        response,
-        "HTTP/1.1 302 Found\r\nLocation: http://{addr}/cdn/file.bin?token={token}\r\nContent-Length: 0\r\n\r\n"
-    )?;
-    write_response(&mut stream, &response).await?;
-
-    let (mut stream, _) = listener.accept().await?;
-    read_request(&mut stream).await?;
-    let mut response = Vec::new();
-    write!(
-        response,
-        "HTTP/1.1 206 Partial Content\r\nContent-Length: 2\r\nAccept-Ranges: bytes\r\nContent-Range: bytes 0-1/1234\r\nContent-Type: application/octet-stream\r\nContent-Disposition: attachment; filename=\"preview-file.bin\"\r\n\r\nab"
-    )?;
-    write_response(&mut stream, &response).await
-}
-
-async fn serve_slow_probe_file(
-    listener: TcpListener,
-    accepted_tx: tokio::sync::oneshot::Sender<()>,
-    release_rx: tokio::sync::oneshot::Receiver<()>,
-) -> std::io::Result<()> {
-    let (mut stream, _) = listener.accept().await?;
-    read_request(&mut stream).await?;
-    accepted_tx.send(()).expect("signal accepted slow request");
-    release_rx.await.map_err(|_| {
-        std::io::Error::new(
-            std::io::ErrorKind::BrokenPipe,
-            "slow server release dropped",
-        )
-    })?;
-
-    let mut response = Vec::new();
-    write!(
-        response,
-        "HTTP/1.1 206 Partial Content\r\nContent-Length: 2\r\nAccept-Ranges: bytes\r\nContent-Range: bytes 0-1/1234\r\nContent-Type: application/octet-stream\r\nContent-Disposition: attachment; filename=\"late-file.bin\"\r\n\r\nab"
-    )?;
-    write_response(&mut stream, &response).await
-}
-
-async fn signal_if_request_arrives(
-    listener: TcpListener,
-    accepted_tx: tokio::sync::oneshot::Sender<()>,
-) -> std::io::Result<()> {
-    let (_stream, _) = listener.accept().await?;
-    accepted_tx.send(()).expect("signal unexpected request");
-    Ok(())
-}
-
-async fn await_server(handle: tokio::task::JoinHandle<std::io::Result<()>>) -> std::io::Result<()> {
-    tokio::time::timeout(Duration::from_secs(2), handle)
-        .await
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "server timed out"))?
-        .map_err(|error| std::io::Error::other(format!("server task panicked: {error}")))?
-}
-
-async fn shutdown_engine(
-    tx: &tokio::sync::mpsc::Sender<EngineCommand>,
+struct Engine {
+    _dir: TempDir,
+    commands: mpsc::Sender<EngineCommand>,
     handle: tokio::task::JoinHandle<()>,
-) {
-    let (cmd, ack) = EngineCommand::shutdown();
-    let notified = ack.notified();
-    tx.send(cmd).await.unwrap();
-    tokio::time::timeout(Duration::from_secs(2), notified)
-        .await
-        .unwrap();
-    tokio::time::timeout(Duration::from_secs(2), handle)
-        .await
-        .unwrap()
-        .unwrap();
 }
 
-#[tokio::test]
-async fn http_preview_uses_fragment_filename_for_direct_multifile_url() {
-    let dir = TempDir::new().unwrap();
-    let db_path = dir.path().join("shio.db");
-
-    let (addr, listener) = bind_ephemeral().await;
-    let server = tokio::spawn(serve_probe_file_without_disposition(listener));
-
-    let url = format!("http://{addr}/opaque-id#release.part01.rar");
-    let (engine, _progress) = DownloadEngine::new(AppConfig::default(), &db_path).unwrap();
-    let tx = engine.command_sender();
-    let handle = tokio::spawn(engine.run());
-    let (reply, mut preview_rx) = tokio::sync::mpsc::channel::<HttpPreviewResult>(1);
-
-    tx.send(EngineCommand::ResolveHttpPreview {
-        request_id: 41,
-        url,
-        reply,
-    })
-    .await
-    .unwrap();
-
-    let result = tokio::time::timeout(Duration::from_secs(2), preview_rx.recv())
-        .await
-        .unwrap()
-        .unwrap();
-    shutdown_engine(&tx, handle).await;
-    await_server(server).await.unwrap();
-
-    assert_eq!(
-        result.state,
-        HttpPreviewState::Ready(HttpPreview {
-            filename: "release.part01.rar".to_string(),
-            total_size: Some(1234),
-            content_type: Some("application/octet-stream".to_string()),
-            accept_ranges: true,
-        })
-    );
-}
-
-#[tokio::test]
-async fn http_preview_probes_direct_file_and_preserves_request_context() {
-    let dir = TempDir::new().unwrap();
-    let db_path = dir.path().join("shio.db");
-
-    let (addr, listener) = bind_ephemeral().await;
-    let server = tokio::spawn(serve_probe_file(listener));
-
-    let url = format!("http://{addr}/downloads/ignored-name.dat");
-    let (engine, _progress) = DownloadEngine::new(AppConfig::default(), &db_path).unwrap();
-    let tx = engine.command_sender();
-    let handle = tokio::spawn(engine.run());
-    let (reply, mut preview_rx) = tokio::sync::mpsc::channel::<HttpPreviewResult>(1);
-
-    tx.send(EngineCommand::ResolveHttpPreview {
-        request_id: 42,
-        url: url.clone(),
-        reply,
-    })
-    .await
-    .unwrap();
-
-    let result = tokio::time::timeout(Duration::from_secs(2), preview_rx.recv())
-        .await
-        .unwrap()
-        .unwrap();
-    shutdown_engine(&tx, handle).await;
-    await_server(server).await.unwrap();
-
-    assert_eq!(result.request_id, 42);
-    assert_eq!(
-        result.state,
-        HttpPreviewState::Ready(HttpPreview {
-            filename: "preview-file.bin".to_string(),
-            total_size: Some(1234),
-            content_type: Some("application/octet-stream".to_string()),
-            accept_ranges: true,
-        })
-    );
-}
-
-#[tokio::test]
-async fn http_preview_blocks_html_landing_pages_without_resolving() {
-    let dir = TempDir::new().unwrap();
-    let db_path = dir.path().join("shio.db");
-
-    let (addr, listener) = bind_ephemeral().await;
-    let server = tokio::spawn(serve_html_landing_page(listener));
-
-    let url = format!("http://{addr}/landing");
-    let (engine, _progress) = DownloadEngine::new(AppConfig::default(), &db_path).unwrap();
-    let tx = engine.command_sender();
-    let handle = tokio::spawn(engine.run());
-    let (reply, mut preview_rx) = tokio::sync::mpsc::channel::<HttpPreviewResult>(1);
-
-    tx.send(EngineCommand::ResolveHttpPreview {
-        request_id: 47,
-        url,
-        reply,
-    })
-    .await
-    .unwrap();
-
-    let result = tokio::time::timeout(Duration::from_secs(2), preview_rx.recv())
-        .await
-        .unwrap()
-        .unwrap();
-    shutdown_engine(&tx, handle).await;
-    await_server(server).await.unwrap();
-
-    assert_eq!(
-        result,
-        HttpPreviewResult {
-            request_id: 47,
-            state: HttpPreviewState::Blocked {
-                reason: "not a direct file link".to_string(),
-            },
+impl Engine {
+    fn start() -> Self {
+        let dir = TempDir::new().unwrap();
+        let (engine, commands, _progress) =
+            DownloadEngine::new(AppConfig::default(), dir.path()).unwrap();
+        Self {
+            _dir: dir,
+            commands,
+            handle: tokio::spawn(engine.run()),
         }
+    }
+
+    async fn preview(&self, request_id: u64, url: String) -> mpsc::Receiver<HttpPreviewResult> {
+        let (reply, results) = mpsc::channel(1);
+        self.commands
+            .send(EngineCommand::ResolveHttpPreview {
+                request_id,
+                url,
+                reply,
+            })
+            .await
+            .unwrap();
+        results
+    }
+
+    async fn cancel(&self, request_id: u64) {
+        self.commands
+            .send(EngineCommand::CancelPreview { request_id })
+            .await
+            .unwrap();
+    }
+
+    async fn shutdown(self) {
+        let (reply, ack) = oneshot::channel();
+        self.commands
+            .send(EngineCommand::Shutdown { reply })
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), ack)
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), self.handle)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+}
+
+async fn resolve(head: String, path: &str) -> HttpPreviewState {
+    let (listener, base) = listen().await;
+    let server = tokio::spawn(async move { answer(&listener, &head).await });
+    let engine = Engine::start();
+    let mut results = engine.preview(7, format!("{base}{path}")).await;
+
+    let result = tokio::time::timeout(Duration::from_secs(2), results.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    engine.shutdown().await;
+    server.await.unwrap().unwrap();
+    assert_eq!(result.request_id, 7);
+    result.state
+}
+
+fn ready(filename: &str) -> HttpPreviewState {
+    HttpPreviewState::Ready(HttpPreview {
+        filename: filename.into(),
+        total_size: Some(1234),
+        content_type: Some("application/octet-stream".into()),
+        accept_ranges: true,
+    })
+}
+
+#[tokio::test]
+async fn preview_names_files_from_fragments_then_content_disposition() {
+    let with_disposition =
+        format!("{FILE_RESPONSE}Content-Disposition: attachment; filename=\"server.bin\"\r\n");
+
+    assert_eq!(
+        resolve(FILE_RESPONSE.into(), "/opaque-id#release.part01.rar").await,
+        ready("release.part01.rar")
+    );
+    assert_eq!(
+        resolve(with_disposition, "/downloads/ignored.dat").await,
+        ready("server.bin")
     );
 }
 
 #[tokio::test]
-async fn http_preview_debug_output_omits_tokenized_urls() {
-    let dir = TempDir::new().unwrap();
-    let db_path = dir.path().join("shio.db");
+async fn preview_blocks_html_landing_pages() {
+    let state = resolve(
+        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Type: text/html\r\n".into(),
+        "/landing",
+    )
+    .await;
 
-    let (addr, listener) = bind_ephemeral().await;
-    let server = tokio::spawn(serve_redirect_to_tokenized_file(
-        listener,
-        addr,
-        PREVIEW_TOKEN,
-    ));
-
-    let url = format!("http://{addr}/download");
-    let (engine, _progress) = DownloadEngine::new(AppConfig::default(), &db_path).unwrap();
-    let tx = engine.command_sender();
-    let handle = tokio::spawn(engine.run());
-    let (reply, mut preview_rx) = tokio::sync::mpsc::channel::<HttpPreviewResult>(1);
-
-    tx.send(EngineCommand::ResolveHttpPreview {
-        request_id: 43,
-        url,
-        reply,
-    })
-    .await
-    .unwrap();
-
-    let result = tokio::time::timeout(Duration::from_secs(2), preview_rx.recv())
-        .await
-        .unwrap()
-        .unwrap();
-    shutdown_engine(&tx, handle).await;
-    await_server(server).await.unwrap();
-
-    assert_eq!(result.request_id, 43);
-    assert!(!format!("{result:?}").contains(PREVIEW_TOKEN));
+    assert!(
+        matches!(state, HttpPreviewState::Blocked { .. }),
+        "{state:?}"
+    );
 }
 
 #[tokio::test]
-async fn shutdown_cancels_in_flight_http_preview_without_stale_result() {
-    let dir = TempDir::new().unwrap();
-    let db_path = dir.path().join("shio.db");
+async fn preview_results_never_expose_redirect_tokens() {
+    let (listener, base) = listen().await;
+    let redirect = format!(
+        "HTTP/1.1 302 Found\r\nLocation: {base}/cdn/file.bin?token=secret-preview-token\r\nContent-Length: 2\r\n"
+    );
+    let server = tokio::spawn(async move {
+        answer(&listener, &redirect).await?;
+        answer(&listener, FILE_RESPONSE).await
+    });
+    let engine = Engine::start();
+    let mut results = engine.preview(43, format!("{base}/download")).await;
 
-    let (addr, listener) = bind_ephemeral().await;
-    let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
-    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
-    let server = tokio::spawn(serve_slow_probe_file(listener, accepted_tx, release_rx));
-
-    let url = format!("http://{addr}/slow-file.bin");
-    let (engine, _progress) = DownloadEngine::new(AppConfig::default(), &db_path).unwrap();
-    let tx = engine.command_sender();
-    let handle = tokio::spawn(engine.run());
-    let (reply, mut preview_rx) = tokio::sync::mpsc::channel::<HttpPreviewResult>(1);
-
-    tx.send(EngineCommand::ResolveHttpPreview {
-        request_id: 44,
-        url,
-        reply,
-    })
-    .await
-    .unwrap();
-
-    tokio::time::timeout(Duration::from_secs(2), accepted_rx)
+    let result = tokio::time::timeout(Duration::from_secs(2), results.recv())
         .await
         .unwrap()
         .unwrap();
-    shutdown_engine(&tx, handle).await;
+    engine.shutdown().await;
+    server.await.unwrap().unwrap();
 
-    let stale = tokio::time::timeout(Duration::from_millis(500), preview_rx.recv()).await;
-    if let Ok(Some(result)) = stale {
-        panic!("preview result arrived after shutdown: {result:?}");
-    }
-    release_tx.send(()).expect("release slow server");
-    match await_server(server).await {
-        Ok(()) => {},
-        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => {},
-        Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {},
-        Err(error) => panic!("slow server failed: {error}"),
+    assert!(!format!("{result:?}").contains("secret-preview-token"));
+}
+
+#[tokio::test]
+async fn cancel_and_shutdown_stop_in_flight_previews_without_results() {
+    for shutdown in [false, true] {
+        let (listener, base) = listen().await;
+        let (accepted_tx, accepted) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_request(&mut stream).await.unwrap();
+            accepted_tx.send(()).unwrap();
+            std::future::pending::<()>().await;
+        });
+        let engine = Engine::start();
+        let mut results = engine.preview(45, format!("{base}/slow.bin")).await;
+        tokio::time::timeout(Duration::from_secs(2), accepted)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let engine = if shutdown {
+            engine.shutdown().await;
+            None
+        } else {
+            engine.cancel(45).await;
+            Some(engine)
+        };
+
+        let closed = tokio::time::timeout(Duration::from_secs(2), results.recv())
+            .await
+            .unwrap();
+        assert_eq!(closed, None, "shutdown: {shutdown}");
+        server.abort();
+        if let Some(engine) = engine {
+            engine.shutdown().await;
+        }
     }
 }
 
 #[tokio::test]
-async fn cancel_http_preview_stops_in_flight_request_without_stale_result() {
-    let dir = TempDir::new().unwrap();
-    let db_path = dir.path().join("shio.db");
+async fn cancel_before_resolve_prevents_the_request() {
+    let (listener, base) = listen().await;
+    let (accepted_tx, accepted) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        let _ = listener.accept().await;
+        let _ = accepted_tx.send(());
+    });
+    let engine = Engine::start();
 
-    let (addr, listener) = bind_ephemeral().await;
-    let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
-    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
-    let server = tokio::spawn(serve_slow_probe_file(listener, accepted_tx, release_rx));
+    engine.cancel(46).await;
+    let mut results = engine.preview(46, format!("{base}/cancelled.bin")).await;
 
-    let url = format!("http://{addr}/slow-file.bin");
-    let (engine, _progress) = DownloadEngine::new(AppConfig::default(), &db_path).unwrap();
-    let tx = engine.command_sender();
-    let handle = tokio::spawn(engine.run());
-    let (reply, mut preview_rx) = tokio::sync::mpsc::channel::<HttpPreviewResult>(1);
-
-    tx.send(EngineCommand::ResolveHttpPreview {
-        request_id: 45,
-        url,
-        reply,
-    })
-    .await
-    .unwrap();
-
-    tokio::time::timeout(Duration::from_secs(2), accepted_rx)
-        .await
-        .unwrap()
-        .unwrap();
-    tx.send(EngineCommand::CancelHttpPreview { request_id: 45 })
-        .await
-        .unwrap();
-
-    let closed = tokio::time::timeout(Duration::from_secs(2), preview_rx.recv())
+    let closed = tokio::time::timeout(Duration::from_secs(2), results.recv())
         .await
         .unwrap();
     assert_eq!(closed, None);
-
-    release_tx.send(()).expect("release slow server");
-    match await_server(server).await {
-        Ok(()) => {},
-        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => {},
-        Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {},
-        Err(error) => panic!("slow server failed: {error}"),
-    }
-    shutdown_engine(&tx, handle).await;
-}
-
-#[tokio::test]
-async fn cancel_before_http_preview_resolve_prevents_network_request() {
-    let dir = TempDir::new().unwrap();
-    let db_path = dir.path().join("shio.db");
-
-    let (addr, listener) = bind_ephemeral().await;
-    let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
-    let server = tokio::spawn(signal_if_request_arrives(listener, accepted_tx));
-
-    let url = format!("http://{addr}/cancelled-before-start.bin");
-    let (engine, _progress) = DownloadEngine::new(AppConfig::default(), &db_path).unwrap();
-    let tx = engine.command_sender();
-    let handle = tokio::spawn(engine.run());
-    let (reply, mut preview_rx) = tokio::sync::mpsc::channel::<HttpPreviewResult>(1);
-
-    tx.send(EngineCommand::CancelHttpPreview { request_id: 46 })
-        .await
-        .unwrap();
-    tx.send(EngineCommand::ResolveHttpPreview {
-        request_id: 46,
-        url,
-        reply,
-    })
-    .await
-    .unwrap();
-
-    let closed = tokio::time::timeout(Duration::from_secs(2), preview_rx.recv())
-        .await
-        .unwrap();
-    assert_eq!(closed, None);
-
-    let accepted = tokio::time::timeout(Duration::from_millis(300), accepted_rx).await;
-    assert!(accepted.is_err(), "cancelled preview still reached server");
-
-    shutdown_engine(&tx, handle).await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), accepted)
+            .await
+            .is_err(),
+        "cancelled preview still reached the server"
+    );
+    engine.shutdown().await;
     server.abort();
-    assert!(server.await.unwrap_err().is_cancelled());
 }

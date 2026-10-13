@@ -1,5 +1,6 @@
 use shio_core::{
-    AppConfig, DownloadEngine, DownloadStatus, EngineCommand, TorrentDownloadRequest, TorrentSource,
+    AppConfig, DownloadEngine, DownloadStatus, EngineCommand, ProgressEvent,
+    TorrentDownloadRequest, TorrentSource,
 };
 use std::time::Duration;
 
@@ -7,50 +8,49 @@ use std::time::Duration;
 #[ignore = "network-dependent, slow; run with --ignored"]
 async fn downloads_small_torrent_end_to_end() {
     let tmp = tempfile::TempDir::new().unwrap();
-    let db_path = tmp.path().join("shio.db");
-    let cfg = AppConfig::default();
-    let (engine, mut progress) = DownloadEngine::new(cfg, &db_path).unwrap();
-    let tx = engine.command_sender();
+    let config = AppConfig {
+        download_dir: tmp.path().join("downloads"),
+        ..AppConfig::default()
+    };
+    let (engine, tx, mut progress) = DownloadEngine::new(config, &tmp.path().join("data")).unwrap();
     let engine_handle = tokio::spawn(engine.run());
 
-    let magnet =
-        "magnet:?xt=urn:btih:cab507494d02ebb1178b38f2e9d7be299c86b862&dn=ubuntu".to_string();
-    let (reply, _ack) = tokio::sync::oneshot::channel();
+    let magnet = "magnet:?xt=urn:btih:cab507494d02ebb1178b38f2e9d7be299c86b862&dn=ubuntu";
+    let (reply, ack) = tokio::sync::oneshot::channel();
     tx.send(EngineCommand::AddTorrentPrepared {
         request: TorrentDownloadRequest::new(
-            TorrentSource::Magnet(magnet),
-            tmp.path().to_path_buf(),
+            TorrentSource::Magnet(magnet.into()),
+            tmp.path().join("downloads"),
         ),
         reply,
     })
     .await
     .unwrap();
+    ack.await.unwrap().unwrap();
 
     let deadline = tokio::time::Instant::now() + Duration::from_mins(10);
-    let mut saw_fetching = false;
-    let mut saw_downloading = false;
+    let mut saw_metadata = false;
     loop {
         tokio::select! {
             () = tokio::time::sleep_until(deadline) => {
-                panic!("timeout without first bytes (fetching={saw_fetching}, downloading={saw_downloading})");
+                panic!("timeout without first bytes (metadata={saw_metadata})");
             }
-            maybe = progress.recv() => {
-                let Some(p) = maybe else { panic!("progress channel closed"); };
-                match p.status {
-                    DownloadStatus::FetchingMetadata => saw_fetching = true,
-                    DownloadStatus::Downloading => saw_downloading = true,
-                    _ => {}
-                }
-                if p.downloaded > 0 && saw_downloading {
+            event = progress.recv() => {
+                let Some(event) = event else { panic!("engine stopped") };
+                let ProgressEvent::Update(p) = event else { continue; };
+                saw_metadata |= p.status == DownloadStatus::FetchingMetadata;
+                if p.status == DownloadStatus::Downloading && p.downloaded > 0 {
                     break;
                 }
             }
         }
     }
 
-    let (cmd, ack) = EngineCommand::shutdown();
-    let notified = ack.notified();
-    let _ = tx.send(cmd).await;
-    let _ = tokio::time::timeout(Duration::from_secs(5), notified).await;
-    let _ = engine_handle.await;
+    let (reply, done) = tokio::sync::oneshot::channel();
+    tx.send(EngineCommand::Shutdown { reply }).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), done)
+        .await
+        .unwrap()
+        .unwrap();
+    engine_handle.await.unwrap();
 }

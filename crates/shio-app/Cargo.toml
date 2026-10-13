@@ -6,18 +6,28 @@ license.workspace = true
 rust-version.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "download app"
+description = "Minimal desktop download manager for links, torrents, and archives"
+publish = false
 
 [[bin]]
 name = "shio"
 path = "src/main.rs"
 
 [dependencies]
-shio-core = { path = "../shio-core", version = "0.1.2" }
-iced = { workspace = true, features = ["tokio", "advanced", "lazy"] }
-iced_aw = { workspace = true, features = ["context_menu"] }
-iced_drop = { workspace = true }
+shio-core = { path = "../shio-core", version = "0.2.0" }
+iced = { workspace = true, features = [
+    "wgpu",
+    "tiny-skia",
+    "crisp",
+    "web-colors",
+    "x11",
+    "wayland",
+    "tokio",
+    "advanced",
+    "lazy",
+] }
 iced_fonts = { workspace = true }
+iced_renderer = { workspace = true }
 tokio = { workspace = true }
 parking_lot = { workspace = true }
 serde = { workspace = true }
@@ -27,24 +37,27 @@ tracing-subscriber = { workspace = true }
 nucleo-matcher = { workspace = true }
 bytesize = { workspace = true }
 url = { workspace = true }
-arboard = { workspace = true }
+uuid = { workspace = true }
 rfd = { workspace = true }
 open = { workspace = true }
 notify-rust = { workspace = true }
 image = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
-window-vibrancy = "0.7.1"
 windows-sys = { workspace = true }
 tray-icon = { workspace = true }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+tray-icon = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+tray-icon = { workspace = true, features = ["ksni"] }
+zbus = { workspace = true }
+wayland-client = { workspace = true }
+wayland-protocols = { workspace = true }
+
 [build-dependencies]
 winresource = { workspace = true }
-
-[features]
-default = ["wgpu"]
-wgpu = ["iced/wgpu"]
-software = ["iced/tiny-skia"]
 
 [lints]
 workspace = true

@@ -1,19 +1,31 @@
-use std::fmt;
+use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
+use nucleo_matcher::{Matcher, Utf32Str};
+use shio_core::TorrentFile;
 
 const KB: u64 = 1_000;
 const MB: u64 = 1_000_000;
 const GB: u64 = 1_000_000_000;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SizeFilter {
+#[derive(Default)]
+pub(crate) struct Query {
+    pattern: Option<Pattern>,
+    kind: TypeFilter,
+    size: SizeFilter,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum SizeFilter {
+    #[default]
     Any,
     LessThan(u64),
     Between(u64, u64),
     GreaterThan(u64),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum TypeFilter {
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum TypeFilter {
+    #[default]
+    Any,
     Archives,
     Audio,
     Documents,
@@ -23,9 +35,82 @@ pub(crate) enum TypeFilter {
     Videos,
 }
 
-impl TypeFilter {
-    const fn extensions(self) -> &'static [&'static str] {
+impl Query {
+    pub(crate) fn parse(input: &str) -> Self {
+        let mut text = Vec::new();
+        let mut query = Self::default();
+        for token in input.split_whitespace() {
+            let lower = token.to_lowercase();
+            if let Some(value) = lower.strip_prefix("type:")
+                && let Some(kind) = parse_type(value)
+            {
+                query.kind = kind;
+            } else if let Some(value) = lower.strip_prefix("size:")
+                && let Some(size) = parse_size(value)
+            {
+                query.size = size;
+            } else if lower != "type:" && lower != "size:" {
+                text.push(token);
+            }
+        }
+        if !text.is_empty() {
+            query.pattern = Some(Pattern::parse(
+                &text.join(" "),
+                CaseMatching::Ignore,
+                Normalization::Smart,
+            ));
+        }
+        query
+    }
+
+    pub(crate) fn matches(
+        &self,
+        matcher: &mut Matcher,
+        name: &str,
+        url: Option<&str>,
+        size: Option<u64>,
+        files: &[TorrentFile],
+    ) -> bool {
+        let kind = self.kind;
+        let kind_matches = kind.matches(name)
+            || files.iter().any(|file| {
+                file.selected
+                    && file
+                        .path
+                        .file_name()
+                        .and_then(std::ffi::OsStr::to_str)
+                        .is_some_and(|name| kind.matches(name))
+            });
+        if !kind_matches || !self.size.matches(size) {
+            return false;
+        }
+        let Some(pattern) = &self.pattern else {
+            return true;
+        };
+        let mut buffer = Vec::new();
+        [Some(name), url].into_iter().flatten().any(|haystack| {
+            pattern
+                .score(Utf32Str::new(haystack, &mut buffer), matcher)
+                .is_some()
+        })
+    }
+}
+
+impl SizeFilter {
+    fn matches(self, size: Option<u64>) -> bool {
         match self {
+            Self::Any => true,
+            Self::LessThan(max) => size.is_some_and(|s| s < max),
+            Self::Between(min, max) => size.is_some_and(|s| s >= min && s < max),
+            Self::GreaterThan(min) => size.is_some_and(|s| s > min),
+        }
+    }
+}
+
+impl TypeFilter {
+    fn matches(self, filename: &str) -> bool {
+        let extensions: &[&str] = match self {
+            Self::Any => return true,
             Self::Archives => &["zip", "rar", "7z", "tar", "gz", "bz2", "xz", "zst", "lz4"],
             Self::Audio => &["mp3", "flac", "wav", "aac", "ogg", "wma", "m4a", "opus"],
             Self::Documents => &[
@@ -39,293 +124,131 @@ impl TypeFilter {
             Self::Videos => &[
                 "mp4", "mkv", "avi", "mov", "wmv", "flv", "webm", "m4v", "ts",
             ],
-        }
-    }
-
-    pub(crate) fn matches_download(self, download: &shio_core::Download) -> bool {
-        filename_matches_type(&download.filename, self)
-            || download.torrent().is_some_and(|torrent| {
-                torrent.files.iter().any(|file| {
-                    file.selected
-                        && file
-                            .path
-                            .file_name()
-                            .and_then(std::ffi::OsStr::to_str)
-                            .is_some_and(|name| filename_matches_type(name, self))
-                })
-            })
+        };
+        filename.rsplit_once('.').is_some_and(|(_, extension)| {
+            extensions
+                .iter()
+                .any(|known| extension.eq_ignore_ascii_case(known))
+        })
     }
 }
 
-fn filename_matches_type(filename: &str, filter: TypeFilter) -> bool {
-    filename
-        .rsplit('.')
-        .next()
-        .map(str::to_ascii_lowercase)
-        .is_some_and(|ext| filter.extensions().contains(&ext.as_str()))
-}
-
-impl SizeFilter {
-    pub(crate) fn matches(self, size: Option<u64>) -> bool {
-        match self {
-            Self::Any => true,
-            Self::LessThan(max) => size.is_some_and(|s| s < max),
-            Self::Between(min, max) => size.is_some_and(|s| s >= min && s < max),
-            Self::GreaterThan(min) => size.is_some_and(|s| s > min),
-        }
-    }
-}
-
-impl fmt::Display for SizeFilter {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match *self {
-            Self::Any => write!(f, "any"),
-            Self::LessThan(n) if n == 10 * MB => write!(f, "< 10 MB"),
-            Self::LessThan(n) if n == 100 * MB => write!(f, "< 100 MB"),
-            Self::LessThan(n) if n == GB => write!(f, "< 1 GB"),
-            Self::LessThan(n) => write!(f, "< {}", format_bytes(n)),
-            Self::Between(a, b) if a == 10 * MB && b == 100 * MB => write!(f, "10 – 100 MB"),
-            Self::Between(a, b) if a == 100 * MB && b == GB => write!(f, "100 MB – 1 GB"),
-            Self::Between(a, b) => write!(f, "{} – {}", format_bytes(a), format_bytes(b)),
-            Self::GreaterThan(n) if n == 10 * MB => write!(f, "> 10 MB"),
-            Self::GreaterThan(n) if n == 100 * MB => write!(f, "> 100 MB"),
-            Self::GreaterThan(n) if n == GB => write!(f, "> 1 GB"),
-            Self::GreaterThan(n) => write!(f, "> {}", format_bytes(n)),
-        }
-    }
-}
-
-fn format_bytes(n: u64) -> String {
-    if n >= GB {
-        format!("{} GB", n / GB)
-    } else if n >= MB {
-        format!("{} MB", n / MB)
-    } else if n >= KB {
-        format!("{} KB", n / KB)
-    } else {
-        format!("{n} B")
-    }
-}
-
-use nucleo_matcher::{
-    Config, Matcher,
-    pattern::{CaseMatching, Normalization, Pattern},
-};
-
-#[derive(Debug, Clone)]
-pub(crate) struct MatchResult {
-    pub(crate) filename_indices: Vec<u32>,
-}
-
-pub(crate) fn make_matcher() -> Matcher {
-    Matcher::new(Config::DEFAULT)
-}
-
-pub(crate) fn match_download(
-    matcher: &mut Matcher,
-    dl: &shio_core::Download,
-    pattern_str: &str,
-) -> Option<MatchResult> {
-    if pattern_str.is_empty() {
-        return Some(MatchResult {
-            filename_indices: Vec::new(),
-        });
-    }
-
-    let pattern = Pattern::parse(pattern_str, CaseMatching::Ignore, Normalization::Smart);
-
-    let mut fn_buf = Vec::new();
-    let fn_hay = nucleo_matcher::Utf32Str::new(&dl.filename, &mut fn_buf);
-    let mut fn_indices = Vec::new();
-    let fn_score = pattern.indices(fn_hay, matcher, &mut fn_indices);
-
-    if fn_score.is_some() {
-        return Some(MatchResult {
-            filename_indices: fn_indices,
-        });
-    }
-
-    let mut url_buf = Vec::new();
-    let url_str = dl.url().unwrap_or("");
-    let url_hay = nucleo_matcher::Utf32Str::new(url_str, &mut url_buf);
-    let url_score = pattern.score(url_hay, matcher);
-
-    url_score.map(|_| MatchResult {
-        filename_indices: Vec::new(),
+fn parse_type(value: &str) -> Option<TypeFilter> {
+    Some(match value {
+        "any" | "all" => TypeFilter::Any,
+        "archive" | "archives" => TypeFilter::Archives,
+        "audio" | "music" => TypeFilter::Audio,
+        "document" | "documents" | "docs" => TypeFilter::Documents,
+        "image" | "images" => TypeFilter::Images,
+        "software" | "program" | "programs" | "app" | "apps" => TypeFilter::Software,
+        "torrent" | "torrents" => TypeFilter::Torrents,
+        "video" | "videos" => TypeFilter::Videos,
+        _ => return None,
     })
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct SearchQuery {
-    pub(crate) text: String,
-    pub(crate) type_filter: Option<TypeFilter>,
-    pub(crate) size_filter: SizeFilter,
-}
-
-impl SearchQuery {
-    pub(crate) fn parse(input: &str) -> Self {
-        let mut text_tokens: Vec<&str> = Vec::new();
-        let mut type_filter = None;
-        let mut size_filter = SizeFilter::Any;
-
-        for token in input.split_whitespace() {
-            let lower = token.to_lowercase();
-            if let Some(rest) = lower.strip_prefix("type:") {
-                if let Some(parsed) = parse_type_value(rest) {
-                    type_filter = parsed;
-                    continue;
-                }
-            } else if let Some(rest) = lower.strip_prefix("size:")
-                && let Some(sf) = parse_size_value(rest)
-            {
-                size_filter = sf;
-                continue;
-            }
-            text_tokens.push(token);
-        }
-
-        Self {
-            text: text_tokens.join(" "),
-            type_filter,
-            size_filter,
-        }
-    }
-}
-
-#[expect(
-    clippy::option_option,
-    reason = "nested option distinguishes an explicit any type filter from an unrecognized token"
-)]
-fn parse_type_value(value: &str) -> Option<Option<TypeFilter>> {
-    match value {
-        "any" | "all" => Some(None),
-        "archive" | "archives" => Some(Some(TypeFilter::Archives)),
-        "audio" | "music" => Some(Some(TypeFilter::Audio)),
-        "document" | "documents" | "docs" => Some(Some(TypeFilter::Documents)),
-        "image" | "images" => Some(Some(TypeFilter::Images)),
-        "software" | "program" | "programs" | "app" | "apps" => Some(Some(TypeFilter::Software)),
-        "torrent" | "torrents" => Some(Some(TypeFilter::Torrents)),
-        "video" | "videos" => Some(Some(TypeFilter::Videos)),
-        _ => None,
-    }
-}
-
-fn parse_size_value(value: &str) -> Option<SizeFilter> {
+fn parse_size(value: &str) -> Option<SizeFilter> {
     if value == "any" {
         return Some(SizeFilter::Any);
     }
     if let Some(rest) = value.strip_prefix('<') {
-        return parse_size_amount(rest).map(SizeFilter::LessThan);
+        return parse_amount(rest).map(SizeFilter::LessThan);
     }
     if let Some(rest) = value.strip_prefix('>') {
-        return parse_size_amount(rest).map(SizeFilter::GreaterThan);
+        return parse_amount(rest).map(SizeFilter::GreaterThan);
     }
-    if let Some((lo, hi)) = value.split_once('-')
-        && let (Some(a), Some(b)) = (parse_size_amount(lo), parse_size_amount(hi))
-    {
-        return Some(SizeFilter::Between(a, b));
-    }
-    None
+    let (low, high) = value.split_once('-')?;
+    Some(SizeFilter::Between(parse_amount(low)?, parse_amount(high)?))
 }
 
-fn parse_size_amount(s: &str) -> Option<u64> {
-    let s = s.trim();
-    let (num_str, unit) = if let Some(n) = s.strip_suffix("gb") {
-        (n, GB)
-    } else if let Some(n) = s.strip_suffix("mb") {
-        (n, MB)
-    } else if let Some(n) = s.strip_suffix("kb") {
-        (n, KB)
-    } else if let Some(n) = s.strip_suffix('b') {
-        (n, 1)
-    } else {
-        return None;
-    };
-    num_str.parse::<u64>().ok().map(|n| n * unit)
+fn parse_amount(text: &str) -> Option<u64> {
+    let (number, unit) = [("gb", GB), ("mb", MB), ("kb", KB), ("b", 1)]
+        .into_iter()
+        .find_map(|(suffix, unit)| text.strip_suffix(suffix).map(|number| (number, unit)))?;
+    number.parse::<u64>().ok()?.checked_mul(unit)
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Suggestion {
     pub(crate) label: &'static str,
     pub(crate) value: &'static str,
+    pub(crate) hint: &'static str,
 }
 
-const TYPE_OPTIONS: &[(&str, &str)] = &[
-    ("archives", "type:archives"),
-    ("audio", "type:audio"),
-    ("documents", "type:documents"),
-    ("images", "type:images"),
-    ("software", "type:software"),
-    ("torrents", "type:torrents"),
-    ("videos", "type:videos"),
-    ("any", "type:any"),
+const KEYS: [Suggestion; 2] = [
+    Suggestion {
+        label: "type:",
+        value: "type:",
+        hint: "archives, videos…",
+    },
+    Suggestion {
+        label: "size:",
+        value: "size:",
+        hint: ">1gb, <100mb…",
+    },
 ];
 
-const SIZE_OPTIONS: &[(&str, &str)] = &[
-    ("<10mb", "size:<10mb"),
-    ("<100mb", "size:<100mb"),
-    ("10mb-100mb", "size:10mb-100mb"),
-    ("100mb-1gb", "size:100mb-1gb"),
-    (">100mb", "size:>100mb"),
-    (">1gb", "size:>1gb"),
-    ("any", "size:any"),
+const TYPES: [&str; 8] = [
+    "type:archives",
+    "type:audio",
+    "type:documents",
+    "type:images",
+    "type:software",
+    "type:torrents",
+    "type:videos",
+    "type:any",
+];
+
+const SIZES: [&str; 7] = [
+    "size:<10mb",
+    "size:<100mb",
+    "size:10mb-100mb",
+    "size:100mb-1gb",
+    "size:>100mb",
+    "size:>1gb",
+    "size:any",
 ];
 
 pub(crate) fn completions(input: &str) -> Vec<Suggestion> {
-    let last_token = match input.split_whitespace().last() {
-        Some(t) => t.to_lowercase(),
-        None => return Vec::new(),
+    if input.trim().is_empty() {
+        return KEYS.to_vec();
+    }
+    let Some(token) = input
+        .split_whitespace()
+        .last()
+        .filter(|_| !input.ends_with(char::is_whitespace))
+    else {
+        return Vec::new();
     };
-
-    if !last_token.contains(':') {
-        let mut out = Vec::new();
-        if "type:".starts_with(&last_token) {
-            out.push(Suggestion {
-                label: "type:",
-                value: "type:",
-            });
-        }
-        if "size:".starts_with(&last_token) {
-            out.push(Suggestion {
-                label: "size:",
-                value: "size:",
-            });
-        }
-        return out;
-    }
-
-    if let Some(partial) = last_token.strip_prefix("type:") {
-        if parse_type_value(partial).is_some() {
-            return Vec::new();
-        }
-        return TYPE_OPTIONS
+    let token = token.to_lowercase();
+    let values = |options: &[&'static str], partial: &str| {
+        options
             .iter()
-            .filter(|(label, _)| partial.is_empty() || label.starts_with(partial))
-            .map(|(label, value)| Suggestion { label, value })
-            .collect();
+            .filter_map(|&value| {
+                let (_, label) = value.split_once(':')?;
+                label.starts_with(partial).then_some(Suggestion {
+                    label,
+                    value,
+                    hint: "",
+                })
+            })
+            .collect()
+    };
+    match token.split_once(':') {
+        None => KEYS
+            .into_iter()
+            .filter(|key| key.value.starts_with(&token))
+            .collect(),
+        Some(("type", partial)) if parse_type(partial).is_none() => values(&TYPES, partial),
+        Some(("size", partial)) if parse_size(partial).is_none() => values(&SIZES, partial),
+        Some(_) => Vec::new(),
     }
-
-    if let Some(partial) = last_token.strip_prefix("size:") {
-        if parse_size_value(partial).is_some() {
-            return Vec::new();
-        }
-        return SIZE_OPTIONS
-            .iter()
-            .filter(|(label, _)| partial.is_empty() || label.starts_with(partial))
-            .map(|(label, value)| Suggestion { label, value })
-            .collect();
-    }
-
-    Vec::new()
 }
 
-pub(crate) fn apply_suggestion(input: &str, suggestion_value: &str) -> String {
-    let trimmed = input.trim_end();
-    let prefix = match trimmed.rfind(char::is_whitespace) {
-        Some(pos) => &trimmed[..=pos],
-        None => "",
-    };
-    format!("{prefix}{suggestion_value} ")
+pub(crate) fn apply(input: &str, value: &str) -> String {
+    let kept = input.trim_end_matches(|c: char| !c.is_whitespace());
+    let space = if value.ends_with(':') { "" } else { " " };
+    format!("{kept}{value}{space}")
 }
 
 #[cfg(test)]
@@ -333,14 +256,69 @@ mod tests {
     use super::*;
 
     #[test]
-    fn size_filter_matches_expected_boundaries() {
+    fn query_syntax_parses_filters_and_keeps_other_tokens_as_text() {
+        let cases = [
+            ("", TypeFilter::Any, SizeFilter::Any, false),
+            ("ubuntu iso", TypeFilter::Any, SizeFilter::Any, true),
+            ("Size:", TypeFilter::Any, SizeFilter::Any, false),
+            (
+                "TYPE:Archives",
+                TypeFilter::Archives,
+                SizeFilter::Any,
+                false,
+            ),
+            (
+                "type:videos type:any",
+                TypeFilter::Any,
+                SizeFilter::Any,
+                false,
+            ),
+            (
+                "size:<10mb",
+                TypeFilter::Any,
+                SizeFilter::LessThan(10 * MB),
+                false,
+            ),
+            (
+                "size:>1gb",
+                TypeFilter::Any,
+                SizeFilter::GreaterThan(GB),
+                false,
+            ),
+            (
+                "size:10mb-100mb",
+                TypeFilter::Any,
+                SizeFilter::Between(10 * MB, 100 * MB),
+                false,
+            ),
+            ("type:banana", TypeFilter::Any, SizeFilter::Any, true),
+            (
+                "size:>99999999999gb",
+                TypeFilter::Any,
+                SizeFilter::Any,
+                true,
+            ),
+            (
+                "size:18446744073709551616b",
+                TypeFilter::Any,
+                SizeFilter::Any,
+                true,
+            ),
+        ];
+        for (input, kind, size, has_text) in cases {
+            let query = Query::parse(input);
+            assert_eq!(query.kind, kind, "{input}");
+            assert_eq!(query.size, size, "{input}");
+            assert_eq!(query.pattern.is_some(), has_text, "{input}");
+        }
+    }
+
+    #[test]
+    fn size_filter_bounds_are_half_open_and_unknown_sizes_only_match_any() {
         let cases = [
             (SizeFilter::Any, None, true),
-            (SizeFilter::Any, Some(10 * GB), true),
             (SizeFilter::LessThan(10 * MB), None, false),
-            (SizeFilter::LessThan(10 * MB), Some(5 * MB), true),
             (SizeFilter::LessThan(10 * MB), Some(10 * MB), false),
-            (SizeFilter::Between(10 * MB, 100 * MB), Some(9 * MB), false),
             (SizeFilter::Between(10 * MB, 100 * MB), Some(10 * MB), true),
             (
                 SizeFilter::Between(10 * MB, 100 * MB),
@@ -350,90 +328,59 @@ mod tests {
             (SizeFilter::GreaterThan(GB), Some(GB), false),
             (SizeFilter::GreaterThan(GB), Some(GB + 1), true),
         ];
-
-        for (filter, value, expected) in cases {
-            assert_eq!(filter.matches(value), expected, "{filter:?} {value:?}");
+        for (filter, size, expected) in cases {
+            assert_eq!(filter.matches(size), expected, "{filter:?} {size:?}");
         }
     }
 
     #[test]
-    fn search_query_parse_handles_text_type_size_and_unknown_tokens() {
-        let cases = [
-            ("", "", None, SizeFilter::Any),
-            ("ubuntu iso", "ubuntu iso", None, SizeFilter::Any),
-            (
-                "type:archives",
-                "",
-                Some(TypeFilter::Archives),
-                SizeFilter::Any,
-            ),
-            ("size:<10mb", "", None, SizeFilter::LessThan(10 * MB)),
-            ("size:>1gb", "", None, SizeFilter::GreaterThan(GB)),
-            (
-                "size:10mb-100mb",
-                "",
-                None,
-                SizeFilter::Between(10 * MB, 100 * MB),
-            ),
-            (
-                "type:banana extra",
-                "type:banana extra",
-                None,
-                SizeFilter::Any,
-            ),
-        ];
+    fn query_matches_name_url_and_selected_torrent_files() {
+        let mut matcher = Matcher::default();
+        let files = [TorrentFile {
+            path: "release/movie.mkv".into(),
+            size: 1,
+            selected: true,
+        }];
 
-        for (input, text, type_filter, size_filter) in cases {
-            let q = SearchQuery::parse(input);
-            assert_eq!(q.text, text, "{input}");
-            assert_eq!(q.type_filter, type_filter, "{input}");
-            assert_eq!(q.size_filter, size_filter, "{input}");
-        }
+        assert!(Query::parse("ubu").matches(&mut matcher, "ubuntu.iso", None, None, &[]));
+        assert!(Query::parse("mirror").matches(
+            &mut matcher,
+            "file.bin",
+            Some("https://mirror.example/file.bin"),
+            None,
+            &[]
+        ));
+        assert!(!Query::parse("xyzzy").matches(&mut matcher, "movie.mp4", None, None, &[]));
+        assert!(Query::parse("type:video").matches(&mut matcher, "release", None, None, &files));
+        assert!(!Query::parse("type:video").matches(&mut matcher, "notes.txt", None, None, &[]));
     }
 
     #[test]
-    fn fuzzy_match_subsequence_scores_and_indices() {
-        use nucleo_matcher::{
-            Matcher,
-            pattern::{CaseMatching, Normalization, Pattern},
+    fn completions_follow_the_last_token_and_only_offer_filters_the_parser_accepts() {
+        let values = |input: &str| -> Vec<&str> {
+            completions(input)
+                .into_iter()
+                .map(|suggestion| suggestion.value)
+                .collect()
         };
-
-        let mut matcher = Matcher::new(nucleo_matcher::Config::DEFAULT);
-        let pattern = Pattern::parse("ubu", CaseMatching::Ignore, Normalization::Smart);
-        let mut buf = Vec::new();
-        let haystack = nucleo_matcher::Utf32Str::new("ubuntu-24.04.iso", &mut buf);
-        let mut indices = Vec::new();
-        let score = pattern.indices(haystack, &mut matcher, &mut indices);
-        assert!(score.is_some(), "should match");
-        assert!(!indices.is_empty(), "should have indices");
-        assert_eq!(&indices[..3], &[0, 1, 2], "should match leading 'ubu'");
-    }
-
-    #[test]
-    fn query_matches_filename_returns_indices() {
-        use shio_core::Download;
-        use std::path::PathBuf;
-
-        let mut dl = Download::new("https://example.com/x".to_string(), PathBuf::from("/tmp"));
-        dl.filename = "ubuntu-24.04.iso".to_string();
-
-        let mut matcher = make_matcher();
-        let result = match_download(&mut matcher, &dl, "ubu");
-        assert!(result.is_some(), "should match");
-        let res = result.unwrap();
-        assert_eq!(&res.filename_indices[..3], &[0, 1, 2]);
-    }
-
-    #[test]
-    fn query_no_match_returns_none() {
-        use shio_core::Download;
-        use std::path::PathBuf;
-
-        let mut dl = Download::new("https://example.com/x".to_string(), PathBuf::from("/tmp"));
-        dl.filename = "movie.mp4".to_string();
-
-        let mut matcher = make_matcher();
-        let result = match_download(&mut matcher, &dl, "xyzzy");
-        assert!(result.is_none());
+        assert_eq!(values(""), ["type:", "size:"]);
+        assert_eq!(values("ubuntu s"), ["size:"]);
+        assert_eq!(
+            values("type:a"),
+            ["type:archives", "type:audio", "type:any"]
+        );
+        assert_eq!(values("SIZE:<1"), ["size:<10mb", "size:<100mb"]);
+        for done in ["ubuntu", "ubuntu ", "type:videos", "size:>1gb", "name:x"] {
+            assert!(values(done).is_empty(), "{done}");
+        }
+        for value in values("type:").into_iter().chain(values("size:")) {
+            let query = Query::parse(value);
+            assert!(query.pattern.is_none(), "{value} is not a filter");
+        }
+        assert_eq!(apply("ubuntu ty", "type:"), "ubuntu type:");
+        assert_eq!(
+            apply("ubuntu type:vi", "type:videos"),
+            "ubuntu type:videos "
+        );
     }
 }

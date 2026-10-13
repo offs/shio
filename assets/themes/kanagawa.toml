@@ -1,0 +1,14 @@
+id = "kanagawa"
+name = "kanagawa"
+appearance = "dark"
+
+[colors]
+background = "#181820"
+text_primary = "#DCD7BA"
+text_secondary = "#C8C093"
+text_tertiary = "#9CABCA"
+accent = "#7E9CD8"
+success = "#98BB6C"
+warning = "#FF9E3B"
+error = "#FF5D62"
+border = "#DCD7BA"

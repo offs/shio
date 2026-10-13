@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>com.shio.DownloadManager</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <name>Shio</name>
+  <developer id="io.github.offs">
+    <name>offs</name>
+  </developer>
+  <summary>Download manager for links, torrents, and archives</summary>
+  <description>
+    <p>Shio is a small desktop download manager for direct links, magnet links, and torrent files.</p>
+    <p>Downloads are split into segments, survive restarts, and can be speed limited. Finished archives, including multi-part zip, 7z, tar, and rar sets, are unpacked automatically.</p>
+    <p>It also offers seeding rules, a tray icon, notifications, opt-in clipboard link detection, and custom themes.</p>
+  </description>
+  <launchable type="desktop-id">com.shio.DownloadManager.desktop</launchable>
+  <url type="homepage">https://github.com/offs/shio</url>
+  <url type="bugtracker">https://github.com/offs/shio/issues</url>
+  <screenshots>
+    <screenshot type="default">
+      <caption>Downloads in progress</caption>
+      <image type="source" width="1190" height="850">https://raw.githubusercontent.com/offs/shio/main/docs/screenshots/shio.png</image>
+    </screenshot>
+  </screenshots>
+  <branding>
+    <color type="primary" scheme_preference="light">#c7c9f7</color>
+    <color type="primary" scheme_preference="dark">#2a2c7a</color>
+  </branding>
+  <supports>
+    <control>pointing</control>
+    <control>keyboard</control>
+  </supports>
+  <provides>
+    <binary>shio</binary>
+    <mediatype>application/x-bittorrent</mediatype>
+    <mediatype>x-scheme-handler/magnet</mediatype>
+  </provides>
+  <releases>
+    <release version="0.2.0" date="2026-10-13">
+      <description>
+        <p>First public release.</p>
+      </description>
+    </release>
+  </releases>
+  <content_rating type="oars-1.1" />
+</component>

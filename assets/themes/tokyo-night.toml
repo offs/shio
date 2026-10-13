@@ -1,0 +1,14 @@
+id = "tokyo-night"
+name = "tokyo night"
+appearance = "dark"
+
+[colors]
+background = "#16161E"
+text_primary = "#C0CAF5"
+text_secondary = "#A9B1D6"
+text_tertiary = "#A9B1D6"
+accent = "#7AA2F7"
+success = "#9ECE6A"
+warning = "#E0AF68"
+error = "#F7768E"
+border = "#C0CAF5"

@@ -1,808 +1,398 @@
-use super::download_status::{self, DownloadStatusPresentation, RowTone};
-use crate::message::{DownloadColumnWidths, Message};
-use crate::style::{self, Palette};
+use super::{hint_on, icon_button, pill};
+use crate::message::Message;
+use crate::style::{self, ICON_BUTTON, Palette, SPACE_M, SPACE_S, SPACE_XS};
+use bytesize::ByteSize;
 use iced::widget::text::Wrapping;
 use iced::widget::{
-    Space, button, column, container, progress_bar, rich_text, row, span, stack, text,
+    Space, column, container, hover, lazy, mouse_area, progress_bar, row, text, tooltip,
 };
-use iced::{Border, Element, Length, Theme};
-use iced_aw::ContextMenu;
-use shio_core::{Download, DownloadId, DownloadStatus, TorrentSource};
+use iced::{Alignment, Color, Element, Length, Padding, Point};
+use iced_fonts::bootstrap;
+use shio_core::{DownloadId, DownloadStatus, TorrentStats};
+use std::borrow::Cow;
+use std::hash::{Hash, Hasher};
 
-const MAX_FILENAME_CHARS: usize = 34;
-const FILENAME_TAIL_CHARS: usize = 10;
-const ROW_HEIGHT: f32 = 48.0;
-const ROW_VERTICAL_PADDING: u16 = 8;
-const ROW_HORIZONTAL_PADDING: u16 = 16;
-const ACTION_BUTTON_SIZE: f32 = 32.0;
-const ACTION_BUTTON_GAP: f32 = 4.0;
-pub(crate) const ACTION_COLUMN_WIDTH: f32 = ACTION_BUTTON_SIZE * 2.0 + ACTION_BUTTON_GAP;
-const COLUMN_GAP_WIDTH: f32 = 8.0;
-const ROW_SPACING: f32 = 4.0;
-const APPROX_FILENAME_CHAR_WIDTH: f32 = 7.2;
+const PADDING: [f32; 2] = [7.0, SPACE_M];
+const ACTIONS_WIDTH: f32 = 3.0 * ICON_BUTTON + 2.0 * SPACE_XS;
+const DOT: f32 = 6.0;
+const NAME_INSET: f32 = DOT + SPACE_S;
+const NAME_CHAR_WIDTH: f32 = 7.2;
+const ROW_CHROME: f32 = 2.0 * (SPACE_XS + SPACE_M) + NAME_INSET + SPACE_S + ACTIONS_WIDTH;
 
-#[derive(Clone, Copy)]
-pub(crate) struct NameDisplayOptions {
-    pub(crate) carousel: bool,
-    pub(crate) carousel_offset: usize,
-    pub(crate) name_width: f32,
+/// The `lazy` key: every field `build` reads must be hashed.
+pub(crate) struct RowView<'a> {
+    pub(crate) id: DownloadId,
+    pub(crate) name: &'a str,
+    pub(crate) error: Option<&'a str>,
+    pub(crate) status: DownloadStatus,
+    pub(crate) downloaded: u64,
+    pub(crate) total: Option<u64>,
+    pub(crate) speed: u64,
+    pub(crate) torrent: Option<TorrentStats>,
+    pub(crate) pinned: bool,
+    pub(crate) selected: bool,
+    pub(crate) name_budget: usize,
+    pub(crate) palette: &'a Palette,
 }
 
-pub(crate) fn view<'a>(
-    download: &'a Download,
-    selected: bool,
-    match_indices: Option<&[u32]>,
-    drop_side: Option<crate::app::DropSide>,
-    name_options: NameDisplayOptions,
-    widths: DownloadColumnWidths,
-    p: &'a Palette,
-) -> Element<'a, Message> {
-    let id = download.id;
-    let presentation = download_status::present(download);
-    let progress_pct = download.progress_percent() / 100.0;
-
-    let content = row![
-        status_dot(&presentation, p),
-        name_cell(download, match_indices, name_options, p),
-        column_gap(),
-        size_cell(download, widths.size, p),
-        column_gap(),
-        progress_cell(&presentation, progress_pct, widths.progress, p),
-        column_gap(),
-        speed_cell(&presentation, widths.speed, p),
-        column_gap(),
-        eta_cell(&presentation, widths.eta, p),
-        column_gap(),
-        action_cell(download, p),
-    ]
-    .spacing(ROW_SPACING)
-    .align_y(iced::Alignment::Center)
-    .width(Length::Fill)
-    .padding([ROW_VERTICAL_PADDING, ROW_HORIZONTAL_PADDING])
-    .height(ROW_HEIGHT);
-
-    let wrapped: Element<'_, Message> = if let Some(side) = drop_side {
-        stack![
-            if selected {
-                container(content)
-                    .width(Length::Fill)
-                    .style(style::row_selected(p))
-            } else {
-                container(content)
-                    .width(Length::Fill)
-                    .style(style::download_row_container)
-            },
-            drop_indicator(side, p),
-        ]
-        .width(Length::Fill)
-        .into()
-    } else if selected {
-        container(content)
-            .width(Length::Fill)
-            .style(style::row_selected(p))
-            .into()
-    } else {
-        container(content)
-            .width(Length::Fill)
-            .style(style::download_row_container)
-            .into()
-    };
-
-    let status = download.status;
-    let pinned = download.pinned;
-    let is_torrent = download.kind.is_torrent();
-    let can_copy_url = copyable_source(download).is_some();
-    let menu_text_primary = p.text_primary;
-    let menu_text_tertiary = p.text_tertiary;
-    let menu_bg_elevated = p.bg_elevated;
-    let menu_border = p.border_default;
-    let menu_bg_hover = p.bg_hover;
-    let menu_text_secondary = p.text_secondary;
-    ContextMenu::new(wrapped, move || {
-        context_menu_items(
-            id,
-            status,
-            pinned,
-            is_torrent,
-            can_copy_url,
-            MenuColors {
-                text_primary: menu_text_primary,
-                text_secondary: menu_text_secondary,
-                text_tertiary: menu_text_tertiary,
-                bg_elevated: menu_bg_elevated,
-                border: menu_border,
-                bg_hover: menu_bg_hover,
-            },
-        )
-    })
-    .into()
-}
-
-fn column_gap<'a>() -> Element<'a, Message> {
-    Space::new().width(COLUMN_GAP_WIDTH).into()
-}
-
-fn status_dot<'a>(presentation: &DownloadStatusPresentation, p: &Palette) -> Element<'a, Message> {
-    let status_color = presentation.dot_tone.color(p);
-    container(
-        container(Space::new().width(0).height(0))
-            .width(8)
-            .height(8)
-            .style(move |_: &Theme| container::Style {
-                background: Some(status_color.into()),
-                border: Border {
-                    radius: 100.0.into(),
-                    ..Border::default()
-                },
-                ..container::Style::default()
-            }),
-    )
-    .width(28)
-    .center_y(Length::Shrink)
-    .into()
-}
-
-fn name_cell<'a>(
-    download: &'a Download,
-    match_indices: Option<&[u32]>,
-    options: NameDisplayOptions,
-    p: &'a Palette,
-) -> Element<'a, Message> {
-    let display_filename = display_filename(&download.filename, options);
-    let filename_el: Element<'_, Message> = match match_indices {
-        Some(indices) if !indices.is_empty() && display_filename == download.filename => {
-            highlighted_filename(&download.filename, indices, p)
-        },
-        _ => text(display_filename)
-            .size(13)
-            .color(p.text_primary)
-            .width(Length::Fill)
-            .wrapping(Wrapping::None)
-            .into(),
-    };
-
-    let mut name_row = row![]
-        .spacing(6)
-        .align_y(iced::Alignment::Center)
-        .width(Length::Fill)
-        .clip(true);
-    if download.pinned {
-        name_row = name_row.push(
-            iced_fonts::bootstrap::pin_angle_fill()
-                .size(11)
-                .color(p.text_tertiary),
-        );
-    }
-    name_row = name_row.push(filename_el);
-
-    container(name_row)
-        .width(Length::Fixed(options.name_width))
-        .clip(true)
-        .into()
-}
-
-fn size_cell<'a>(download: &'a Download, width: f32, p: &Palette) -> Element<'a, Message> {
-    let size_str = match download.total_size {
-        Some(total) => format_size_pair(download.downloaded, total),
-        None => format_size_compact(download.downloaded),
-    };
-    text(size_str)
-        .size(12)
-        .color(p.text_secondary)
-        .wrapping(Wrapping::None)
-        .width(Length::Fixed(width))
-        .into()
-}
-
-fn truncated_filename(filename: &str, max_chars: usize) -> String {
-    if filename.chars().count() <= max_chars {
-        return filename.to_string();
-    }
-
-    let head_len = max_chars.saturating_sub(FILENAME_TAIL_CHARS + 3).max(1);
-    let head: String = filename.chars().take(head_len).collect();
-    let mut tail: Vec<char> = filename.chars().rev().take(FILENAME_TAIL_CHARS).collect();
-    tail.reverse();
-    format!("{head}...{}", tail.into_iter().collect::<String>())
-}
-
-fn display_filename(filename: &str, options: NameDisplayOptions) -> String {
-    let max_chars = max_filename_chars(options.name_width);
-    if options.carousel {
-        return carousel_filename(filename, options.carousel_offset, max_chars);
-    }
-    truncated_filename(filename, max_chars)
-}
-
-fn carousel_filename(filename: &str, offset: usize, max_chars: usize) -> String {
-    let chars: Vec<char> = filename.chars().collect();
-    if chars.len() <= max_chars {
-        return filename.to_string();
-    }
-
-    let head_len = max_chars.saturating_sub(FILENAME_TAIL_CHARS + 3).max(1);
-    let scrollable_len = chars.len() - FILENAME_TAIL_CHARS;
-    let start = offset % scrollable_len;
-    let visible: String = (0..head_len)
-        .map(|i| chars[(start + i) % scrollable_len])
-        .collect();
-    let visible = visible.trim_end_matches('.');
-    let tail: String = chars[chars.len() - FILENAME_TAIL_CHARS..].iter().collect();
-    format!("{visible}...{tail}")
-}
-
-fn max_filename_chars(width: f32) -> usize {
-    ((width / APPROX_FILENAME_CHAR_WIDTH).floor() as usize).max(MAX_FILENAME_CHARS)
-}
-
-fn format_size_compact(bytes: u64) -> String {
-    bytesize::ByteSize(bytes).to_string()
-}
-
-fn split_size_unit(value: &str) -> Option<(&str, &str)> {
-    value
-        .rsplit_once(' ')
-        .filter(|(amount, unit)| !amount.is_empty() && !unit.is_empty())
-}
-
-fn format_size_pair(downloaded: u64, total: u64) -> String {
-    let downloaded = format_size_compact(downloaded);
-    let total = format_size_compact(total);
-    match (split_size_unit(&downloaded), split_size_unit(&total)) {
-        (Some((downloaded_amount, downloaded_unit)), Some((_, total_unit)))
-            if downloaded_unit == total_unit =>
-        {
-            format!("{downloaded_amount} / {total}")
-        },
-        _ => format!("{downloaded} / {total}"),
-    }
-}
-
-fn progress_cell<'a>(
-    presentation: &DownloadStatusPresentation,
-    pct: f32,
-    width: f32,
-    p: &Palette,
-) -> Element<'a, Message> {
-    let pct = pct.clamp(0.0, 1.0);
-    let bar_color = presentation.bar_tone.color(p);
-    let bg = p.progress_bg;
-    container(progress_bar(0.0..=1.0, pct).style(move |_: &Theme| {
-        iced::widget::progress_bar::Style {
-            background: bg.into(),
-            bar: bar_color.into(),
-            border: Border {
-                radius: 2.0.into(),
-                ..Border::default()
-            },
+impl Hash for RowView<'_> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.id.hash(state);
+        self.name.hash(state);
+        self.error.hash(state);
+        std::mem::discriminant(&self.status).hash(state);
+        self.downloaded.hash(state);
+        self.total.hash(state);
+        self.speed.hash(state);
+        if let Some(t) = self.torrent {
+            (
+                t.peers,
+                t.upload_speed,
+                t.ratio.to_bits(),
+                t.metadata_wait_secs,
+            )
+                .hash(state);
         }
-    }))
-    .width(Length::Fixed(width))
-    .height(4)
-    .into()
-}
-
-fn speed_cell<'a>(
-    presentation: &DownloadStatusPresentation,
-    width: f32,
-    p: &Palette,
-) -> Element<'a, Message> {
-    text(presentation.detail.clone())
-        .size(12)
-        .color(detail_color(presentation, p))
-        .wrapping(Wrapping::None)
-        .width(Length::Fixed(width))
-        .into()
-}
-
-const fn detail_color(presentation: &DownloadStatusPresentation, p: &Palette) -> iced::Color {
-    match presentation.dot_tone {
-        RowTone::Warning => p.warning,
-        RowTone::Error => p.error,
-        RowTone::Active | RowTone::Uploading | RowTone::Complete | RowTone::Muted => {
-            p.text_secondary
-        },
+        self.pinned.hash(state);
+        self.selected.hash(state);
+        self.name_budget.hash(state);
+        self.palette.hash(state);
     }
 }
 
-fn eta_cell<'a>(
-    presentation: &DownloadStatusPresentation,
-    width: f32,
-    p: &Palette,
-) -> Element<'a, Message> {
-    text(presentation.status.clone())
-        .size(12)
-        .color(p.text_tertiary)
-        .width(Length::Fixed(width))
+pub(crate) fn name_budget(width: f32) -> usize {
+    ((width - ROW_CHROME).max(0.0) / NAME_CHAR_WIDTH) as usize
+}
+
+pub(crate) fn view(row: RowView<'_>) -> Element<'_, Message> {
+    lazy(row, build).into()
+}
+
+fn build(r: &RowView<'_>) -> Element<'static, Message> {
+    let p = *r.palette;
+    let id = r.id;
+    let tone = tone(r.status, &p);
+
+    let label = |name: String| {
+        text(name)
+            .size(style::TEXT_BODY)
+            .color(p.text_primary)
+            .wrapping(Wrapping::None)
+    };
+    let name: Element<'static, Message> = match middle_ellipsis(r.name, r.name_budget) {
+        Cow::Borrowed(name) => label(name.to_owned()).into(),
+        Cow::Owned(short) => hint_on(label(short), r.name.to_owned(), tooltip::Position::Top, &p),
+    };
+    let title = row![pill(tone, DOT, DOT)]
+        .push(
+            r.pinned
+                .then(|| bootstrap::pin_angle_fill().size(10).color(p.text_tertiary)),
+        )
+        .push(container(name).width(Length::Fill).clip(true))
+        .spacing(SPACE_S)
+        .align_y(Alignment::Center);
+
+    let detail = text(detail(r))
+        .size(style::TEXT_SMALL)
+        .color(if r.selected {
+            p.text_secondary
+        } else {
+            p.text_tertiary
+        })
+        .wrapping(Wrapping::None);
+    let detail: Element<'static, Message> = match r.error {
+        Some(error) if r.status.is_failed() => {
+            hint_on(detail, error.to_owned(), tooltip::Position::Bottom, &p)
+        },
+        _ => detail.into(),
+    };
+    let bar: Element<'static, Message> = match progress(r) {
+        Some(fraction) => progress_bar(0.0..=1.0, fraction)
+            .girth(2.0)
+            .style(style::progress(p, tone))
+            .into(),
+        None => Space::new().height(2).into(),
+    };
+    let lower = column![container(detail).width(Length::Fill).clip(true), bar].spacing(SPACE_XS);
+
+    let text_column = column![
+        title,
+        container(lower).padding(Padding::ZERO.left(NAME_INSET))
+    ]
+    .spacing(2)
+    .width(Length::Fill);
+    let trailing = if r.selected {
+        actions(r, &p)
+    } else {
+        Space::new().width(ACTIONS_WIDTH).into()
+    };
+    let base = container(
+        row![text_column, trailing]
+            .spacing(SPACE_S)
+            .align_y(Alignment::Center),
+    )
+    .width(Length::Fill)
+    .padding(PADDING)
+    .style(style::row(p, r.selected));
+
+    let overlay = container((!r.selected).then(|| actions(r, &p)))
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .padding(PADDING)
+        .align_x(Alignment::End)
+        .align_y(Alignment::Center);
+
+    mouse_area(hover(base, overlay))
+        .on_press(Message::RowPressed(id))
+        .on_double_click(Message::RowDoubleClicked(id))
+        .on_right_press(Message::OpenRowMenu(id, Point::ORIGIN))
         .into()
 }
 
-fn action_cell<'a>(download: &'a Download, p: &'a Palette) -> Element<'a, Message> {
+fn actions(r: &RowView<'_>, p: &Palette) -> Element<'static, Message> {
+    let id = r.id;
+    let primary = match r.status {
+        DownloadStatus::Pending
+        | DownloadStatus::Queued
+        | DownloadStatus::Starting
+        | DownloadStatus::Downloading
+        | DownloadStatus::FetchingMetadata => {
+            Some((bootstrap::pause_fill(), "pause", Message::Pause(id)))
+        },
+        DownloadStatus::Paused | DownloadStatus::Cancelled => {
+            Some((bootstrap::play_fill(), "resume", Message::Resume(id)))
+        },
+        DownloadStatus::Error => Some((bootstrap::arrow_clockwise(), "retry", Message::Retry(id))),
+        DownloadStatus::ExtractError => Some((
+            bootstrap::arrow_clockwise(),
+            "retry extraction",
+            Message::RetryExtract(id),
+        )),
+        DownloadStatus::PasswordRequired => Some((
+            bootstrap::key(),
+            "enter password",
+            Message::RequestPassword(id),
+        )),
+        DownloadStatus::Seeding => Some((
+            bootstrap::stop_fill(),
+            "stop seeding",
+            Message::StopSeeding(id),
+        )),
+        DownloadStatus::Extracting | DownloadStatus::Completed => None,
+    };
+    let primary = match primary {
+        Some((icon, hint, message)) => icon_button(icon, hint, Some(message), p),
+        None => Space::new().width(ICON_BUTTON).into(),
+    };
     row![
-        control_slot(primary_control(download), p),
-        control_slot(
-            cancel_control(download).or_else(|| remove_control(download)),
+        primary,
+        icon_button(
+            bootstrap::foldertwo_open(),
+            "open folder",
+            Some(Message::OpenFolder(id)),
+            p,
+        ),
+        icon_button(
+            bootstrap::trash(),
+            "remove…",
+            Some(Message::RequestRemove(id)),
             p,
         ),
     ]
-    .spacing(ACTION_BUTTON_GAP)
-    .align_y(iced::Alignment::Center)
-    .width(Length::Fixed(ACTION_COLUMN_WIDTH))
+    .spacing(SPACE_XS)
+    .align_y(Alignment::Center)
     .into()
 }
 
-struct InlineControl {
-    icon: InlineIcon,
-    message: Message,
-    tone: InlineControlTone,
-}
-
-#[derive(Clone, Copy)]
-enum InlineControlTone {
-    Primary,
-    Cancel,
-}
-
-#[derive(Clone, Copy)]
-enum InlineIcon {
-    Pause,
-    Play,
-    Stop,
-    Retry,
-    Key,
-    Folder,
-    Cancel,
-}
-
-const fn primary_control(download: &Download) -> Option<InlineControl> {
-    let id = download.id;
-    match download.status {
-        DownloadStatus::Downloading
-        | DownloadStatus::Starting
-        | DownloadStatus::FetchingMetadata => Some(InlineControl::primary(
-            InlineIcon::Pause,
-            Message::PauseDownload(id),
-        )),
-        DownloadStatus::Seeding => Some(InlineControl::primary(
-            InlineIcon::Stop,
-            Message::StopSeeding(id),
-        )),
-        DownloadStatus::Paused => Some(InlineControl::primary(
-            InlineIcon::Play,
-            Message::ResumeDownload(id),
-        )),
-        DownloadStatus::Error => Some(InlineControl::primary(
-            InlineIcon::Retry,
-            Message::RetryDownload(id),
-        )),
-        DownloadStatus::ExtractError => Some(InlineControl::primary(
-            InlineIcon::Retry,
-            Message::RetryExtract(id),
-        )),
-        DownloadStatus::PasswordRequired => Some(InlineControl::primary(
-            InlineIcon::Key,
-            Message::RequestPassword(id),
-        )),
-        DownloadStatus::Completed => Some(InlineControl::primary(
-            InlineIcon::Folder,
-            Message::OpenFolder(id),
-        )),
+const fn tone(status: DownloadStatus, p: &Palette) -> Color {
+    match status {
+        DownloadStatus::Starting
+        | DownloadStatus::Downloading
+        | DownloadStatus::FetchingMetadata
+        | DownloadStatus::Extracting => p.accent,
+        DownloadStatus::Seeding | DownloadStatus::Completed => p.success,
+        DownloadStatus::PasswordRequired => p.warning,
+        DownloadStatus::Error | DownloadStatus::ExtractError => p.error,
         DownloadStatus::Pending
         | DownloadStatus::Queued
-        | DownloadStatus::Extracting
-        | DownloadStatus::Cancelled => None,
+        | DownloadStatus::Paused
+        | DownloadStatus::Cancelled => p.text_tertiary,
     }
 }
 
-const fn cancel_control(download: &Download) -> Option<InlineControl> {
-    if can_cancel_inline(download.status) {
-        return Some(InlineControl::cancel(
-            InlineIcon::Cancel,
-            Message::RequestCancelDownload(download.id),
-        ));
-    }
-    None
-}
-
-const fn remove_control(download: &Download) -> Option<InlineControl> {
-    if can_remove_inline(download.status) {
-        return Some(InlineControl::cancel(
-            InlineIcon::Cancel,
-            Message::RequestDeleteWithFiles(download.id),
-        ));
-    }
-    None
-}
-
-const fn can_remove_inline(status: DownloadStatus) -> bool {
-    matches!(status, DownloadStatus::Cancelled)
-}
-
-const fn can_cancel_inline(status: DownloadStatus) -> bool {
-    matches!(
-        status,
+fn progress(r: &RowView<'_>) -> Option<f32> {
+    let working = matches!(
+        r.status,
         DownloadStatus::Pending
             | DownloadStatus::Queued
             | DownloadStatus::Starting
-            | DownloadStatus::Downloading
             | DownloadStatus::FetchingMetadata
+            | DownloadStatus::Downloading
             | DownloadStatus::Paused
-            | DownloadStatus::Error
-            | DownloadStatus::ExtractError
-            | DownloadStatus::PasswordRequired
-    )
+            | DownloadStatus::Extracting
+    );
+    let total = r.total.filter(|&total| working && total > 0)?;
+    Some((r.downloaded as f64 / total as f64).min(1.0) as f32)
 }
 
-impl InlineControl {
-    const fn primary(icon: InlineIcon, message: Message) -> Self {
-        Self {
-            icon,
-            message,
-            tone: InlineControlTone::Primary,
-        }
-    }
+struct Size(u64, Option<u64>);
 
-    const fn cancel(icon: InlineIcon, message: Message) -> Self {
-        Self {
-            icon,
-            message,
-            tone: InlineControlTone::Cancel,
+impl std::fmt::Display for Size {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.1 {
+            Some(total) => write!(f, "{} of {}", ByteSize(self.0), ByteSize(total)),
+            None => write!(f, "{}", ByteSize(self.0)),
         }
     }
 }
 
-impl InlineIcon {
-    fn view(self) -> Element<'static, Message> {
-        match self {
-            Self::Pause => iced_fonts::bootstrap::pause_fill().size(12).into(),
-            Self::Play => iced_fonts::bootstrap::play_fill().size(12).into(),
-            Self::Stop => iced_fonts::bootstrap::stop_fill().size(12).into(),
-            Self::Retry => iced_fonts::bootstrap::arrow_clockwise().size(12).into(),
-            Self::Key => iced_fonts::bootstrap::key().size(12).into(),
-            Self::Folder => iced_fonts::bootstrap::foldertwo_open().size(12).into(),
-            Self::Cancel => iced_fonts::bootstrap::x_lg().size(12).into(),
-        }
-    }
-}
-
-fn control_slot(control: Option<InlineControl>, p: &Palette) -> Element<'_, Message> {
-    match control {
-        Some(control) => control_button(control, p),
-        None => Space::new()
-            .width(ACTION_BUTTON_SIZE)
-            .height(ACTION_BUTTON_SIZE)
-            .into(),
-    }
-}
-
-fn control_button(control: InlineControl, p: &Palette) -> Element<'_, Message> {
-    let button = button(control.icon.view())
-        .on_press(control.message)
-        .padding(0)
-        .width(Length::Fixed(ACTION_BUTTON_SIZE))
-        .height(Length::Fixed(ACTION_BUTTON_SIZE))
-        .clip(true);
-
-    match control.tone {
-        InlineControlTone::Primary => button.style(style::btn_ghost(p)).into(),
-        InlineControlTone::Cancel => button.style(style::btn_icon(p)).into(),
-    }
-}
-
-fn drop_indicator<'a>(side: crate::app::DropSide, p: &Palette) -> Element<'a, Message> {
-    let accent = p.accent;
-    let line: Element<'_, Message> = container(Space::new().height(2))
-        .width(Length::Fill)
-        .style(move |_: &Theme| container::Style {
-            background: Some(accent.into()),
-            ..container::Style::default()
-        })
-        .into();
-    let align = match side {
-        crate::app::DropSide::Below => iced::Alignment::End,
-        crate::app::DropSide::Above => iced::Alignment::Start,
+fn detail(r: &RowView<'_>) -> String {
+    let size = Size(r.downloaded, r.total);
+    let failed = |label: &str| match r.error.and_then(|error| error.lines().next()) {
+        Some(error) => format!("{label} · {error}"),
+        None => label.to_owned(),
     };
-    container(line)
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .align_y(align)
-        .into()
-}
-
-#[derive(Clone, Copy)]
-struct MenuColors {
-    text_primary: iced::Color,
-    text_secondary: iced::Color,
-    text_tertiary: iced::Color,
-    bg_elevated: iced::Color,
-    border: iced::Color,
-    bg_hover: iced::Color,
-}
-
-fn context_menu_items(
-    id: DownloadId,
-    status: DownloadStatus,
-    pinned: bool,
-    is_torrent: bool,
-    can_copy_url: bool,
-    colors: MenuColors,
-) -> Element<'static, Message> {
-    let menu_btn =
-        |label: &str, shortcut: Option<&str>, msg: Message| -> Element<'static, Message> {
-            let label_text = text(label.to_string()).size(12).color(colors.text_primary);
-            let mut content = row![label_text, Space::new().width(Length::Fill)]
-                .spacing(12)
-                .align_y(iced::Alignment::Center);
-            if let Some(hint) = shortcut {
-                content = content.push(text(hint.to_string()).size(11).color(colors.text_tertiary));
-            }
-            let bg_hover = colors.bg_hover;
-            let text_primary = colors.text_primary;
-            let text_secondary = colors.text_secondary;
-            button(content)
-                .style(move |_theme: &Theme, status: button::Status| {
-                    let base = button::Style {
-                        background: None,
-                        text_color: text_secondary,
-                        border: Border {
-                            radius: 4.0.into(),
-                            ..Border::default()
-                        },
-                        ..button::Style::default()
-                    };
-                    match status {
-                        button::Status::Hovered => button::Style {
-                            background: Some(bg_hover.into()),
-                            text_color: text_primary,
-                            ..base
-                        },
-                        _ => base,
-                    }
-                })
-                .on_press(msg)
-                .padding([6, 16])
-                .width(Length::Fill)
-                .into()
-        };
-
-    let mut items: Vec<Element<'static, Message>> = Vec::new();
-
-    items.push(menu_btn(
-        if pinned { "unpin" } else { "pin to top" },
-        Some("P"),
-        Message::TogglePin(id),
-    ));
-
-    match status {
-        DownloadStatus::Downloading
-        | DownloadStatus::Starting
-        | DownloadStatus::FetchingMetadata => {
-            items.push(menu_btn("pause", Some("Space"), Message::PauseDownload(id)));
-        },
-        DownloadStatus::Seeding => {
-            items.push(menu_btn("stop seeding", None, Message::StopSeeding(id)));
-        },
-        DownloadStatus::Paused => {
-            items.push(menu_btn(
-                "resume",
-                Some("Space"),
-                Message::ResumeDownload(id),
-            ));
-        },
-        DownloadStatus::Error => {
-            items.push(menu_btn("retry", Some("R"), Message::RetryDownload(id)));
-        },
-        DownloadStatus::ExtractError => {
-            items.push(menu_btn(
-                "retry extract",
-                Some("R"),
-                Message::RetryExtract(id),
-            ));
-        },
-        DownloadStatus::PasswordRequired => {
-            items.push(menu_btn(
-                "enter password…",
-                Some("R"),
-                Message::RequestPassword(id),
-            ));
-        },
-        _ => {},
-    }
-
-    if is_torrent
-        && matches!(
-            status,
-            DownloadStatus::Paused
-                | DownloadStatus::Completed
-                | DownloadStatus::Seeding
-                | DownloadStatus::Error
-        )
-    {
-        items.push(menu_btn("force recheck", None, Message::ForceRecheck(id)));
-    }
-
-    if can_cancel_inline(status) {
-        items.push(menu_btn(
-            "cancel",
-            Some("C"),
-            Message::RequestCancelDownload(id),
-        ));
-    }
-    if can_copy_url {
-        items.push(menu_btn("copy url", Some("U"), Message::CopyUrl(id)));
-    }
-    items.push(menu_btn("edit", Some("E"), Message::RequestEdit(id)));
-
-    if can_open_file_from_menu(status) {
-        items.push(menu_btn("open file", Some("Enter"), Message::OpenFile(id)));
-    }
-    if can_open_folder_from_menu(status) || (is_torrent && torrent_can_open_folder(status)) {
-        items.push(menu_btn("open folder", Some("F"), Message::OpenFolder(id)));
-    }
-
-    items.push(menu_btn(
-        "delete",
-        Some("Del"),
-        Message::RequestDeleteWithFiles(id),
-    ));
-
-    let bg_elevated = colors.bg_elevated;
-    let border = colors.border;
-    container(column(items).width(160))
-        .style(move |_: &Theme| container::Style {
-            background: Some(bg_elevated.into()),
-            border: Border {
-                radius: 6.0.into(),
-                width: 1.0,
-                color: border,
+    match r.status {
+        DownloadStatus::Starting => "starting".to_owned(),
+        DownloadStatus::Downloading => match (r.torrent, r.speed) {
+            (Some(t), 0) if t.peers == 0 => format!("{size} · finding peers"),
+            (_, 0) => format!("{size} · waiting for data"),
+            (_, speed) => {
+                let left = r
+                    .total
+                    .and_then(|total| eta(total.saturating_sub(r.downloaded), speed));
+                match left {
+                    Some(left) => format!("{size} · {}/s · {left}", ByteSize(speed)),
+                    None => format!("{size} · {}/s", ByteSize(speed)),
+                }
             },
-            ..container::Style::default()
+        },
+        DownloadStatus::FetchingMetadata => match r.torrent {
+            Some(t) if t.peers > 0 => format!("getting metadata · {} peers", t.peers),
+            Some(t) if t.metadata_wait_secs >= 30 => "getting metadata · no peers yet".to_owned(),
+            _ => "getting metadata".to_owned(),
+        },
+        DownloadStatus::Pending | DownloadStatus::Queued if r.downloaded == 0 => {
+            "queued".to_owned()
+        },
+        DownloadStatus::Pending | DownloadStatus::Queued => format!("queued · {size}"),
+        DownloadStatus::Paused => format!("paused · {size}"),
+        DownloadStatus::Cancelled => format!("stopped · {size}"),
+        DownloadStatus::Extracting => "extracting".to_owned(),
+        DownloadStatus::PasswordRequired => "needs the archive password".to_owned(),
+        DownloadStatus::Seeding => match r.torrent {
+            Some(t) => format!(
+                "seeding · ↑ {}/s · ratio {:.2}",
+                ByteSize(t.upload_speed),
+                t.ratio
+            ),
+            None => "seeding".to_owned(),
+        },
+        DownloadStatus::Completed => {
+            format!("done · {}", ByteSize(r.total.unwrap_or(r.downloaded)))
+        },
+        DownloadStatus::Error => failed("failed"),
+        DownloadStatus::ExtractError => failed("extraction failed"),
+    }
+}
+
+fn eta(remaining: u64, speed: u64) -> Option<String> {
+    if speed == 0 || remaining == 0 {
+        return None;
+    }
+    let secs = remaining.div_ceil(speed);
+    let (days, hours, minutes) = (secs / 86_400, secs / 3_600 % 24, secs / 60 % 60);
+    Some(match (days, hours, minutes) {
+        (0, 0, 0) => "less than a minute left".to_owned(),
+        (0, 0, m) => format!("{m} min left"),
+        (0, h, 0) => format!("{h} h left"),
+        (0, h, m) => format!("{h} h {m} min left"),
+        (d, h, _) if h > 0 => format!("{d} d {h} h left"),
+        (d, _, _) => format!("{d} d left"),
+    })
+}
+
+/// Keeps the tail so the extension and any part number stay visible; wide chars take two cells.
+fn middle_ellipsis(name: &str, budget: usize) -> Cow<'_, str> {
+    let cells = |c: char| if is_wide(c) { 2 } else { 1 };
+    let width: usize = name.chars().map(cells).sum();
+    if width <= budget {
+        return Cow::Borrowed(name);
+    }
+    let room = budget.saturating_sub(1).max(2);
+    let extension: usize = name
+        .rfind('.')
+        .map_or(0, |dot| name[dot..].chars().map(cells).sum());
+    let tail_room = (room / 3).max(extension + 2).min(room - 1);
+    let head_room = room - tail_room;
+
+    let mut used = 0;
+    let head_end = name
+        .char_indices()
+        .find(|&(_, c)| {
+            used += cells(c);
+            used > head_room
         })
-        .padding(4)
-        .into()
+        .map_or(name.len(), |(i, _)| i);
+    let mut used = 0;
+    let tail_start = name
+        .char_indices()
+        .rev()
+        .find(|&(_, c)| {
+            used += cells(c);
+            used > tail_room
+        })
+        .map_or(0, |(i, c)| i + c.len_utf8());
+    Cow::Owned(format!(
+        "{}…{}",
+        name[..head_end].trim_end(),
+        name[tail_start.max(head_end)..].trim_start()
+    ))
 }
 
-const fn can_open_file_from_menu(status: DownloadStatus) -> bool {
+const fn is_wide(c: char) -> bool {
     matches!(
-        status,
-        DownloadStatus::Completed | DownloadStatus::ExtractError | DownloadStatus::PasswordRequired
+        c as u32,
+        0x1100..=0x115F
+            | 0x2E80..=0xA4CF
+            | 0xAC00..=0xD7A3
+            | 0xF900..=0xFAFF
+            | 0xFE30..=0xFE4F
+            | 0xFF00..=0xFF60
+            | 0xFFE0..=0xFFE6
+            | 0x1F300..=0x1FAFF
+            | 0x20000..=0x3FFFD
     )
-}
-
-const fn can_open_folder_from_menu(status: DownloadStatus) -> bool {
-    can_open_file_from_menu(status)
-}
-
-const fn torrent_can_open_folder(status: DownloadStatus) -> bool {
-    matches!(status, DownloadStatus::Seeding)
-}
-
-pub(crate) fn copyable_source(download: &Download) -> Option<&str> {
-    if let Some(url) = download.url() {
-        return Some(url);
-    }
-    let source = &download.torrent()?.source;
-    match source {
-        TorrentSource::Magnet(magnet) => Some(magnet.as_str()),
-        TorrentSource::File(_) => None,
-    }
-}
-
-fn highlighted_filename<'a>(filename: &str, indices: &[u32], p: &Palette) -> Element<'a, Message> {
-    let chars: Vec<char> = filename.chars().collect();
-    let max = indices.last().copied().unwrap_or(0) as usize;
-    let mask_len = chars.len().max(max + 1);
-    let mut mask = vec![false; mask_len];
-    for &idx in indices {
-        let i = idx as usize;
-        if i < mask.len() {
-            mask[i] = true;
-        }
-    }
-
-    let mut spans = Vec::new();
-    let mut i = 0;
-    while i < chars.len() {
-        let is_match = mask.get(i).copied().unwrap_or(false);
-        let start = i;
-        while i < chars.len() && mask.get(i).copied().unwrap_or(false) == is_match {
-            i += 1;
-        }
-        let chunk: String = chars[start..i].iter().collect();
-        let s: iced::widget::text::Span<'_> = if is_match {
-            span(chunk).color(p.accent)
-        } else {
-            span(chunk).color(p.text_primary)
-        };
-        spans.push(s);
-    }
-
-    rich_text(spans)
-        .size(13)
-        .width(Length::Fill)
-        .wrapping(Wrapping::WordOrGlyph)
-        .into()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
 
-    fn sample_torrent_bytes() -> Vec<u8> {
-        let pieces = b"abcdefghijklmnopqrst";
-        let mut bytes = b"d8:announce35:udp://tracker.example:1337/announce4:infod5:filesld6:lengthi123e4:pathl7:foo.txteed6:lengthi456e4:pathl3:bar7:baz.mkveee4:name7:release12:piece lengthi16384e6:pieces20:".to_vec();
-        bytes.extend_from_slice(pieces);
-        bytes.extend_from_slice(b"ee");
-        bytes
+    fn cells(text: &str) -> usize {
+        text.chars().map(|c| if is_wide(c) { 2 } else { 1 }).sum()
     }
 
     #[test]
-    fn size_pair_uses_one_shared_unit() {
-        assert_eq!(
-            format_size_pair(263_600_000, 263_600_000),
-            "251.4 / 251.4 MiB"
-        );
-    }
-
-    #[test]
-    fn long_filename_is_truncated_before_layout() {
-        assert_eq!(
-            truncated_filename(
-                "shio-portable-update-1.0.2-to-1.0.3-windows-x64.rar",
-                MAX_FILENAME_CHARS
-            ),
-            "shio-portable-update-...ws-x64.rar"
-        );
-    }
-
-    #[test]
-    fn display_filename_uses_more_text_when_name_column_is_wider() {
-        let filename = "shio-portable-update-1.0.2-to-1.0.3-windows-x64.rar";
-
-        assert_eq!(
-            display_filename(
-                filename,
-                NameDisplayOptions {
-                    carousel: false,
-                    carousel_offset: 0,
-                    name_width: 520.0,
-                },
-            ),
-            filename
-        );
-    }
-
-    #[test]
-    fn display_filename_scrolls_collapsed_long_names_when_enabled() {
-        let filename = "shio-portable-update-1.0.2-to-1.0.3-windows-x64.rar";
-
-        assert_eq!(
-            display_filename(
-                filename,
-                NameDisplayOptions {
-                    carousel: true,
-                    carousel_offset: 8,
-                    name_width: 280.0,
-                },
-            ),
-            "table-update-1.0.2-to-1.0...ws-x64.rar"
-        );
-    }
-
-    #[test]
-    fn copyable_source_handles_torrent_sources() {
-        let download = Download::try_from_torrent(
-            TorrentSource::File(sample_torrent_bytes()),
-            PathBuf::from("/tmp"),
-        )
-        .expect("torrent");
-        assert_eq!(copyable_source(&download), None);
-
-        let magnet = "magnet:?xt=urn:btih:cab507494d02ebb1178b38f2e9d7be299c86b862";
-        let download =
-            Download::try_from_torrent(TorrentSource::Magnet(magnet.into()), PathBuf::from("/tmp"))
-                .expect("valid magnet");
-        assert_eq!(copyable_source(&download), Some(magnet));
+    fn middle_ellipsis_fits_budget_and_keeps_the_extension() {
+        for (name, budget) in [
+            ("shio-portable-update-1.0.2-to-1.0.3-windows-x64.rar", 24),
+            ("shio-portable-update-1.0.2-to-1.0.3-windows-x64.rar", 12),
+            ("archive.part0042.rar", 14),
+            ("映画のタイトルがとても長いファイル名.mkv", 20),
+            ("no-extension-but-very-long-name-indeed", 16),
+        ] {
+            let short = middle_ellipsis(name, budget);
+            assert!(cells(&short) <= budget, "{short} exceeds {budget}");
+            assert!(short.contains('…'), "{short}");
+            if let Some(dot) = name.rfind('.') {
+                assert!(
+                    short.ends_with(&name[dot..]),
+                    "{short} lost {}",
+                    &name[dot..]
+                );
+            }
+        }
+        assert_eq!(middle_ellipsis("short.zip", 20), "short.zip");
     }
 }

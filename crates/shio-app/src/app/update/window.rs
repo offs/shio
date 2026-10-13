@@ -1,260 +1,230 @@
-#![expect(
-    clippy::unused_self,
-    reason = "update handlers stay as Shio methods for dispatch consistency"
-)]
-
-use super::super::state::{Shio, ToastKind};
-use super::super::vibrancy::apply_vibrancy;
-use crate::message::Message;
-use crate::widgets::download_row::copyable_source;
-use iced::Task;
-use iced::widget::text_editor;
-use shio_core::{DownloadId, EngineCommand};
+use super::super::blur;
+use super::super::state::{Overlay, Shio, StartupProblem};
+use super::super::subscription::install_engine_events;
+use crate::message::{FirstRunStep, Message};
+use crate::platform::AssociationLaunch;
+use iced::{Size, Task, window};
+use shio_core::{AppConfig, DownloadEngine, EngineCommand};
 use std::path::PathBuf;
 use std::time::Duration;
 
-const SHUTDOWN_SEND_TIMEOUT: Duration = Duration::from_millis(300);
-const SHUTDOWN_ACK_TIMEOUT: Duration = Duration::from_secs(5);
-
-const fn close_to_tray_mode() -> iced::window::Mode {
-    iced::window::Mode::Hidden
-}
-
-const fn tray_show_mode() -> iced::window::Mode {
-    iced::window::Mode::Windowed
-}
+pub(in crate::app) const WINDOW_SIZE: Size = Size::new(960.0, 640.0);
+const MIN_WINDOW_SIZE: Size = Size::new(720.0, 460.0);
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(20);
 
 impl Shio {
-    pub(super) fn open_file(&self, id: DownloadId) -> Task<Message> {
-        if let Some(dl) = self.downloads.iter().find(|d| d.id == id) {
-            let path = dl.file_path();
-            return Task::perform(open_path(path), Message::OpenFileCompleted);
-        }
-        Task::none()
-    }
-
-    pub(super) fn open_folder(&self, id: DownloadId) -> Task<Message> {
-        if let Some(dl) = self.downloads.iter().find(|d| d.id == id) {
-            let path = dl.file_dir();
-            return Task::perform(open_path(path), Message::OpenFolderCompleted);
-        }
-        Task::none()
-    }
-
-    pub(super) fn copy_url(&self, id: DownloadId) -> Task<Message> {
-        let url = self
-            .downloads
-            .iter()
-            .find(|d| d.id == id)
-            .and_then(|d| copyable_source(d).map(String::from));
-        let Some(url) = url else {
-            return Task::none();
+    pub(crate) fn new(launch: AssociationLaunch) -> (Self, Task<Message>) {
+        let first_run = !AppConfig::config_exists();
+        let loaded = if first_run {
+            Ok(AppConfig::default())
+        } else {
+            AppConfig::load()
         };
-        Task::perform(copy_text(url), Message::CopyUrlCompleted)
-    }
-
-    pub(super) fn open_file_completed(&mut self, result: Result<(), String>) -> Task<Message> {
-        if let Err(message) = result {
-            tracing::warn!("open file failed: {message}");
-            self.push_toast("open file failed", ToastKind::Error);
-        }
-        Task::none()
-    }
-
-    pub(super) fn open_folder_completed(&mut self, result: Result<(), String>) -> Task<Message> {
-        if let Err(message) = result {
-            tracing::warn!("open folder failed: {message}");
-            self.push_toast("open folder failed", ToastKind::Error);
-        }
-        Task::none()
-    }
-
-    pub(super) fn copy_url_completed(&mut self, result: Result<(), String>) -> Task<Message> {
-        match result {
-            Ok(()) => self.push_toast("url copied", ToastKind::Info),
-            Err(message) => {
-                tracing::warn!("clipboard write failed: {message}");
-                self.push_toast("copy failed", ToastKind::Error);
+        let (config, started) = match loaded {
+            Ok(config) => {
+                let data_dir = AppConfig::data_dir();
+                let started = DownloadEngine::new(config.clone(), &data_dir).map_err(|error| {
+                    StartupProblem {
+                        title: "the download database could not be opened",
+                        message: error.to_string(),
+                        location: data_dir,
+                    }
+                });
+                (config, started)
             },
-        }
-        Task::none()
-    }
-
-    pub(super) fn clipboard_url(&mut self, url: String) -> Task<Message> {
-        if self.show_first_run() || url == self.last_clipboard_url {
-            return Task::none();
-        }
-        let reset_task = self.reset_add_dialog_state();
-        self.add_urls = text_editor::Content::with_text(&url);
-        let refresh_task = self.refresh_add_sources();
-        self.last_clipboard_url = url;
-        Task::batch([reset_task, refresh_task])
-    }
-
-    pub(super) fn url_dropped(&mut self, url: &str) -> Task<Message> {
-        if self.show_first_run() {
-            return Task::none();
-        }
-        let reset_task = self.reset_add_dialog_state();
-        self.add_urls = text_editor::Content::with_text(url);
-        let refresh_task = self.refresh_add_sources();
-        Task::batch([reset_task, refresh_task])
-    }
-
-    pub(super) fn file_dropped(&self, path: PathBuf) -> Task<Message> {
-        Task::perform(read_dropped_shortcut(path), Message::DroppedShortcutRead)
-    }
-
-    pub(super) fn dropped_shortcut_read(&mut self, url: Option<String>) -> Task<Message> {
-        let Some(url) = url else {
-            return Task::none();
+            Err(error) => (
+                AppConfig::default(),
+                Err(StartupProblem {
+                    title: "the settings file could not be loaded",
+                    message: error.to_string(),
+                    location: AppConfig::config_dir(),
+                }),
+            ),
         };
-        self.url_dropped(&url)
+
+        let (engine, engine_task, startup_problem) = match started {
+            Ok((engine, commands, events)) => {
+                install_engine_events(events);
+                let run = Task::perform(
+                    async {
+                        tokio::spawn(engine.run())
+                            .await
+                            .map_err(|error| error.to_string())
+                    },
+                    Message::EngineStopped,
+                );
+                (commands, run, None)
+            },
+            Err(problem) => {
+                tracing::error!("{}: {}", problem.title, problem.message);
+                crate::instance::reject_activations();
+                (tokio::sync::mpsc::channel(1).0, Task::none(), Some(problem))
+            },
+        };
+
+        let mut app = Self::build(config, engine);
+        app.startup_problem = startup_problem;
+        app.resolve_theme();
+        if first_run {
+            app.overlay = Overlay::Welcome(FirstRunStep::Look);
+        }
+        let open = app.open_window();
+        let sources = app.open_sources(launch);
+        (app, Task::batch([engine_task, open, sources]))
     }
 
-    pub(super) fn window_opened(
-        &mut self,
-        id: iced::window::Id,
-        size: iced::Size,
-    ) -> Task<Message> {
+    fn open_window(&mut self) -> Task<Message> {
+        self.window.blur = self.wants_blur();
+        let (id, open) = window::open(window_settings(self.window.blur));
         self.window.id = Some(id);
-        self.window.focused = true;
-        self.window.size = Some(size);
-        tracing::info!("window opened: {:?}", id);
-        apply_vibrancy(id, self.config.window.material)
+        self.window.maximized = false;
+        open.map(|_| Message::WindowOpened)
     }
 
+    pub(super) fn with_window(
+        &self,
+        task: impl FnOnce(window::Id) -> Task<Message>,
+    ) -> Task<Message> {
+        self.window.id.map_or_else(Task::none, task)
+    }
+
+    pub(super) fn window_opened(&mut self) -> Task<Message> {
+        self.window.focused = true;
+        crate::tray::activate();
+        self.apply_blur()
+    }
+
+    pub(super) fn apply_blur(&self) -> Task<Message> {
+        let (on, created) = (self.wants_blur(), self.window.blur);
+        self.with_window(|id| blur::apply(id, on, created).map(Message::BlurActive))
+    }
+
+    // Only clipboard changes made while shio was unfocused were copied elsewhere.
     pub(super) fn window_focused(&mut self, focused: bool) -> Task<Message> {
         self.window.focused = focused;
-        Task::none()
-    }
-
-    pub(super) fn window_resized(&mut self, size: iced::Size) -> Task<Message> {
-        self.window.size = Some(size);
-        Task::none()
-    }
-
-    pub(super) fn window_minimize(&self) -> Task<Message> {
-        self.latest_window()
-            .and_then(|id| iced::window::minimize(id, true))
-    }
-
-    pub(super) fn window_maximize_toggle(&mut self) -> Task<Message> {
-        self.window.maximized = !self.window.maximized;
-        self.latest_window().and_then(iced::window::toggle_maximize)
-    }
-
-    pub(super) fn window_close(&self) -> Task<Message> {
-        if cfg!(target_os = "windows") && self.config.close_to_tray {
-            self.latest_window()
-                .and_then(|id| iced::window::set_mode(id, close_to_tray_mode()))
-        } else {
-            Task::done(Message::AppExit)
+        if !self.config.clipboard_monitor {
+            return Task::none();
         }
-    }
-
-    pub(super) fn window_drag_start(&self) -> Task<Message> {
-        self.latest_window().and_then(iced::window::drag)
-    }
-
-    pub(super) fn app_exit(&self) -> Task<Message> {
-        let tx = self.engine_tx.clone();
-        Task::perform(
-            async move {
-                let (cmd, ack) = EngineCommand::shutdown();
-                let notified = ack.notified();
-                match tokio::time::timeout(SHUTDOWN_SEND_TIMEOUT, tx.send(cmd)).await {
-                    Ok(Ok(())) => {
-                        if tokio::time::timeout(SHUTDOWN_ACK_TIMEOUT, notified)
-                            .await
-                            .is_err()
-                        {
-                            tracing::warn!("engine shutdown acknowledgement timed out");
-                        }
-                    },
-                    Ok(Err(e)) => tracing::warn!("engine shutdown command dropped: {e}"),
-                    Err(_) => tracing::warn!("engine shutdown command timed out"),
-                }
-            },
-            |()| std::process::exit(0),
-        )
-    }
-
-    pub(super) fn tray_show(&self) -> Task<Message> {
-        self.latest_window().and_then(|id| {
-            iced::window::set_mode(id, tray_show_mode())
-                .chain(iced::window::minimize(id, false))
-                .chain(iced::window::gain_focus(id))
+        iced::clipboard::read().map(if focused {
+            Message::ClipboardRead
+        } else {
+            Message::ClipboardBaseline
         })
     }
 
-    fn latest_window(&self) -> Task<Option<iced::window::Id>> {
-        if let Some(id) = self.window.id {
-            Task::done(Some(id))
+    pub(super) fn window_resized(&mut self, size: Size) -> Task<Message> {
+        self.window.size = size;
+        self.with_window(|id| window::is_maximized(id).map(Message::Maximized))
+    }
+
+    // Closing to the tray destroys the window because Wayland cannot hide one.
+    pub(super) fn window_close(&mut self) -> Task<Message> {
+        if self.config.close_to_tray && crate::tray::is_ready() && self.startup_problem.is_none() {
+            self.menu = None;
+            self.with_window(window::close)
         } else {
-            iced::window::latest()
+            self.quit()
         }
     }
-}
 
-async fn open_path(path: PathBuf) -> Result<(), String> {
-    tokio::task::spawn_blocking(move || open::that(&path).map_err(|e| e.to_string()))
-        .await
-        .map_err(|e| e.to_string())?
-}
-
-async fn copy_text(text: String) -> Result<(), String> {
-    tokio::task::spawn_blocking(move || {
-        let mut clipboard = arboard::Clipboard::new().map_err(|e| e.to_string())?;
-        clipboard.set_text(text).map_err(|e| e.to_string())
-    })
-    .await
-    .map_err(|e| e.to_string())?
-}
-
-async fn read_dropped_shortcut(path: PathBuf) -> Option<String> {
-    tokio::task::spawn_blocking(move || {
-        let content = std::fs::read_to_string(path).ok()?;
-        dropped_shortcut_url(&content)
-    })
-    .await
-    .ok()
-    .flatten()
-}
-
-fn dropped_shortcut_url(content: &str) -> Option<String> {
-    for line in content.lines().map(str::trim) {
-        if line.starts_with("http://") || line.starts_with("https://") {
-            return Some(line.to_string());
+    pub(super) fn window_closed(&mut self, id: window::Id) -> Task<Message> {
+        if self.window.id == Some(id) {
+            self.window.id = None;
+            self.window.focused = false;
         }
-        if let Some(url) = line.strip_prefix("URL=") {
-            return Some(url.to_string());
+        Task::none()
+    }
+
+    pub(super) fn show_window(&mut self, token: Option<String>) -> Task<Message> {
+        if self.shutting_down {
+            return Task::none();
+        }
+        let shown = match self.window.id {
+            Some(id) => window::minimize(id, false).chain(window::gain_focus(id)),
+            None => self.open_window(),
+        };
+        match (self.window.id, token) {
+            (Some(id), Some(token)) => shown.chain(activate(id, token)),
+            _ => shown,
         }
     }
-    None
+
+    pub(super) fn quit(&mut self) -> Task<Message> {
+        if self.shutting_down {
+            return Task::none();
+        }
+        self.shutting_down = true;
+        crate::instance::reject_activations();
+        let engine = self.engine.clone();
+        Task::perform(
+            async move {
+                let (reply, done) = tokio::sync::oneshot::channel();
+                if engine.send(EngineCommand::Shutdown { reply }).await.is_ok()
+                    && tokio::time::timeout(SHUTDOWN_TIMEOUT, done).await.is_err()
+                {
+                    tracing::error!("the engine did not stop within {SHUTDOWN_TIMEOUT:?}; exiting");
+                }
+            },
+            |()| Message::ShutdownComplete,
+        )
+    }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn dropped_shortcut_url_reads_url_key() {
-        let content = "[InternetShortcut]\nURL=https://example.com/file.zip\n";
-
-        assert_eq!(
-            dropped_shortcut_url(content),
-            Some("https://example.com/file.zip".to_string())
-        );
+fn window_settings(blur: bool) -> window::Settings {
+    let mut settings = window::Settings {
+        size: WINDOW_SIZE,
+        min_size: Some(MIN_WINDOW_SIZE),
+        icon: crate::platform::window_icon(),
+        exit_on_close_request: false,
+        transparent: cfg!(not(windows)),
+        blur,
+        decorations: cfg!(target_os = "macos") || runs_on_niri(),
+        ..window::Settings::default()
+    };
+    #[cfg(target_os = "linux")]
+    {
+        settings.platform_specific.application_id = crate::platform::APP_ID.into();
     }
-
-    #[test]
-    fn dropped_shortcut_url_reads_plain_url() {
-        let content = "Name=download\nhttps://example.com/file.zip\n";
-
-        assert_eq!(
-            dropped_shortcut_url(content),
-            Some("https://example.com/file.zip".to_string())
-        );
+    #[cfg(target_os = "macos")]
+    {
+        settings.platform_specific.title_hidden = true;
+        settings.platform_specific.titlebar_transparent = true;
+        settings.platform_specific.fullsize_content_view = true;
     }
+    #[cfg(windows)]
+    {
+        settings.platform_specific.corner_preference =
+            window::settings::platform::CornerPreference::Round;
+    }
+    settings
+}
+
+// niri paints a solid backdrop behind client-decorated windows that aren't tiled, hiding the
+// blur; it never draws titlebars, so asking it for server-side decorations only drops that fill.
+fn runs_on_niri() -> bool {
+    cfg!(target_os = "linux") && std::env::var_os("NIRI_SOCKET").is_some()
+}
+
+pub(super) fn open_path(path: impl Into<PathBuf>) -> Task<Message> {
+    let path = path.into();
+    Task::perform(
+        async move {
+            tokio::task::spawn_blocking(move || {
+                open::that(&path).map_err(|error| error.to_string())
+            })
+            .await
+            .map_err(|error| error.to_string())?
+        },
+        Message::Opened,
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn activate(id: window::Id, token: String) -> Task<Message> {
+    window::run(id, move |w| super::super::wayland::activate(w, token)).discard()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn activate(_: window::Id, _: String) -> Task<Message> {
+    Task::none()
 }

@@ -1,0 +1,16 @@
+
+## Rust crates
+
+Source for each crate is available from its repository or from https://crates.io.
+{{#each licenses}}
+
+### {{{name}}}
+
+{{#each used_by}}
+- {{crate.name}} {{crate.version}}{{#if crate.repository}} ({{crate.repository}}){{/if}}
+{{/each}}
+
+```
+{{{text}}}
+```
+{{/each}}

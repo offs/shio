@@ -1,228 +1,132 @@
-use crate::app::DragHover;
-use crate::message::{DownloadColumn, DownloadColumnWidths, Message, SortCol, SortDirection};
-use crate::style;
-use crate::widgets::download_row;
-use iced::widget::{
-    Space, button, column, container, keyed_column, mouse_area, row, scrollable, text,
-};
-use iced::{Element, Length};
-use shio_core::{Download, DownloadId};
-use std::collections::HashSet;
+use crate::message::{Message, SortKey, Tab};
+use crate::style::{self, Button, Palette, SPACE_S, SPACE_XS};
+use iced::widget::{Space, Text, button, center, column, keyed_column, row, scrollable, text};
+use iced::{Alignment, Element, Length};
+use iced_fonts::bootstrap;
+use shio_core::DownloadId;
 
-pub(crate) fn row_widget_id(id: DownloadId) -> iced::widget::Id {
-    iced::widget::Id::from(format!("dl-{}", id.0))
-}
+const BAR_BUTTON_PADDING: [f32; 2] = [3.0, SPACE_S];
 
-#[derive(Clone, Copy)]
-pub(crate) struct ViewOptions<'a> {
-    pub(crate) sort_col: SortCol,
-    pub(crate) sort_dir: SortDirection,
-    pub(crate) has_search: bool,
-    pub(crate) drag: Option<&'a DragHover>,
-    pub(crate) widths: DownloadColumnWidths,
-    pub(crate) available_width: Option<f32>,
-    pub(crate) scroll_long_names: bool,
-    pub(crate) carousel_offset: usize,
-}
-
-pub(crate) fn view<'a>(
-    downloads: &[(&'a Download, Option<Vec<u32>>)],
-    selection: &HashSet<DownloadId>,
-    options: ViewOptions<'_>,
-    p: &'a crate::style::Palette,
-) -> Element<'a, Message> {
-    let _span = tracing::trace_span!("download_list_view", rows = downloads.len()).entered();
-    if downloads.is_empty() {
-        return empty_state(p);
+pub(super) fn sort_arrow(descending: bool) -> Text<'static> {
+    if descending {
+        bootstrap::arrow_down()
+    } else {
+        bootstrap::arrow_up()
     }
-
-    let widths = effective_column_widths(options.widths, options.available_width);
-    let headers = column_headers(options.sort_col, options.sort_dir, widths, p);
-
-    let drop_target = options.drag.and_then(|d| d.target_id);
-    let drag_source = options.drag.map(|d| d.source_id);
-    let mut rows: Vec<(DownloadId, Element<'a, Message>)> = Vec::with_capacity(downloads.len());
-
-    for (dl, indices) in downloads {
-        let is_selected = selection.contains(&dl.id);
-        let drop_side = if drop_target == Some(dl.id) && drag_source != Some(dl.id) {
-            options.drag.map(|d| d.side)
-        } else {
-            None
-        };
-        let highlight = if options.has_search {
-            indices.as_deref()
-        } else {
-            None
-        };
-        let row_el = download_row::view(
-            dl,
-            is_selected,
-            highlight,
-            drop_side,
-            download_row::NameDisplayOptions {
-                carousel: options.scroll_long_names,
-                carousel_offset: options.carousel_offset,
-                name_width: widths.name,
-            },
-            widths,
-            p,
-        );
-
-        let dl_id = dl.id;
-        let widget_id = row_widget_id(dl.id);
-        let draggable: Element<'a, Message> = iced_drop::droppable(row_el)
-            .id(widget_id)
-            .on_click(Message::SelectClicked(dl_id))
-            .on_drop(move |_point, _rect| Message::DragDrop(dl_id))
-            .on_drag(move |point, _rect| Message::DragUpdate(dl_id, point))
-            .drag_overlay(true)
-            .drag_hide(true)
-            .drag_center(false)
-            .into();
-
-        rows.push((dl.id, draggable));
-    }
-
-    let rows = keyed_column(rows).spacing(2);
-
-    column![headers, scrollable(rows).height(Length::Fill)]
-        .width(Length::Fill)
-        .into()
 }
 
-fn column_headers<'a>(
-    sort_col: SortCol,
-    sort_dir: SortDirection,
-    widths: DownloadColumnWidths,
-    p: &'a crate::style::Palette,
+pub(crate) fn tabs<'a>(
+    active: Tab,
+    counts: impl IntoIterator<Item = (Tab, usize)>,
+    sort: SortKey,
+    descending: bool,
+    p: &Palette,
 ) -> Element<'a, Message> {
-    let arrow = match sort_dir {
-        SortDirection::Ascending => " \u{2191}",
-        SortDirection::Descending => " \u{2193}",
-    };
-
-    let fixed_header = |label: &str, col: SortCol, width: f32| -> Element<'a, Message> {
-        let label_text = if sort_col == col {
-            format!("{label}{arrow}")
-        } else {
-            label.to_string()
-        };
-        button(text(label_text).size(10).color(p.text_ghost))
-            .style(style::btn_ghost(p))
-            .on_press(Message::SortColumn(col))
-            .padding([4, 0])
-            .width(Length::Fixed(width))
-            .into()
-    };
-
-    let row = iced::widget::row![
-        Space::new().width(28),
-        fixed_header("name", SortCol::Name, widths.name),
-        resize_handle(DownloadColumn::Name, p),
-        fixed_header("size", SortCol::Size, widths.size),
-        resize_handle(DownloadColumn::Size, p),
-        fixed_header("progress", SortCol::Progress, widths.progress),
-        resize_handle(DownloadColumn::Progress, p),
-        fixed_header("speed", SortCol::Speed, widths.speed),
-        resize_handle(DownloadColumn::Speed, p),
-        fixed_header("eta", SortCol::Eta, widths.eta),
-        resize_handle(DownloadColumn::Eta, p),
-        Space::new().width(download_row::ACTION_COLUMN_WIDTH),
-    ]
-    .spacing(4)
-    .padding([0, 16])
-    .height(28)
-    .width(Length::Fill);
-
-    container(row)
-        .style(style::column_header(p))
-        .width(Length::Fill)
-        .into()
-}
-
-fn effective_column_widths(
-    widths: DownloadColumnWidths,
-    available_width: Option<f32>,
-) -> DownloadColumnWidths {
-    let Some(available_width) = available_width else {
-        return widths;
-    };
-
-    let fixed_width =
-        COLUMN_LAYOUT_CHROME_WIDTH + widths.size + widths.progress + widths.speed + widths.eta;
-    let name = widths.name.min((available_width - fixed_width).max(0.0));
-
-    DownloadColumnWidths { name, ..widths }
-}
-
-const COLUMN_LAYOUT_CHROME_WIDTH: f32 =
-    16.0 * 2.0 + 28.0 + 8.0 * 5.0 + download_row::ACTION_COLUMN_WIDTH + 4.0 * 11.0;
-
-fn resize_handle(column: DownloadColumn, p: &crate::style::Palette) -> Element<'_, Message> {
-    let line = container(Space::new().width(1).height(Length::Fill)).style(style::separator(p));
-    mouse_area(container(line).width(8).height(Length::Fill).center_x(8))
-        .on_press(Message::ColumnResizeStart(column))
-        .interaction(iced::mouse::Interaction::ResizingHorizontally)
-        .into()
-}
-
-fn empty_state(p: &crate::style::Palette) -> Element<'_, Message> {
-    let content = column![
-        text("no downloads").size(14).color(p.text_tertiary),
-        Space::new().height(4),
-        text("add a url or paste from clipboard")
-            .size(13)
-            .color(p.text_ghost),
-        Space::new().height(16),
-        button(
-            row![iced_fonts::bootstrap::plus().size(14), text("new").size(12)]
-                .spacing(4)
-                .align_y(iced::Alignment::Center),
+    let tabs = row(counts.into_iter().map(|(tab, count)| {
+        let selected = tab == active;
+        let label = row![
+            text(tab.label())
+                .size(style::TEXT_SMALL)
+                .color(if selected {
+                    p.text_primary
+                } else {
+                    p.text_tertiary
+                })
+        ]
+        .push(
+            (count > 0 || tab == Tab::All)
+                .then(|| text(count).size(style::TEXT_CAPTION).color(p.text_tertiary)),
         )
-        .style(style::btn_primary(p))
-        .on_press(Message::AddDownloadPressed)
-        .padding([6, 12]),
-    ]
-    .align_x(iced::Alignment::Center)
-    .max_width(280);
+        .spacing(5)
+        .align_y(Alignment::Center);
+        button(label)
+            .padding(BAR_BUTTON_PADDING)
+            .style(style::button(*p, Button::Nav { active: selected }))
+            .on_press(Message::TabSelected(tab))
+            .into()
+    }))
+    .spacing(2);
 
-    container(content)
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .center_x(Length::Fill)
-        .center_y(Length::Fill)
+    let sort = button(
+        row![
+            text(sort.label()).size(style::TEXT_SMALL),
+            sort_arrow(descending).size(10),
+        ]
+        .spacing(SPACE_XS)
+        .align_y(Alignment::Center),
+    )
+    .padding(BAR_BUTTON_PADDING)
+    .style(style::button(*p, Button::Ghost))
+    .on_press(Message::ToggleSortMenu);
+
+    row![tabs, Space::new().width(Length::Fill), sort]
+        .align_y(Alignment::Center)
+        .padding([SPACE_XS, SPACE_S])
         .into()
+}
+
+pub(crate) fn rows<'a>(
+    rows: impl IntoIterator<Item = (DownloadId, Element<'a, Message>)>,
+    p: &Palette,
+) -> Element<'a, Message> {
+    scrollable(
+        keyed_column(rows)
+            .width(Length::Fill)
+            .spacing(2)
+            .padding(SPACE_XS),
+    )
+    .height(Length::Fill)
+    .style(style::scrollable(*p))
+    .into()
+}
+
+pub(crate) fn empty<'a>(searching: bool, has_downloads: bool, p: &Palette) -> Element<'a, Message> {
+    let quiet = |label: &'a str| text(label).size(style::TEXT_SMALL).color(p.text_tertiary);
+    let content: Element<'a, Message> = if searching {
+        quiet("no matches").into()
+    } else if has_downloads {
+        quiet("nothing here").into()
+    } else {
+        column![
+            text("no downloads")
+                .size(style::TEXT_BODY)
+                .color(p.text_secondary),
+            quiet("paste a link or drop a .torrent"),
+        ]
+        .spacing(SPACE_XS)
+        .align_x(Alignment::Center)
+        .into()
+    };
+    center(content).into()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::theme::{ThemeCatalog, ThemeId};
+    use crate::widgets::download_row::{self, RowView};
+    use shio_core::DownloadStatus;
 
     #[test]
-    fn effective_widths_preserve_resized_fixed_columns() {
-        let widths = DownloadColumnWidths {
-            size: 180.0,
-            ..DownloadColumnWidths::default()
-        };
-
-        let effective = effective_column_widths(widths, Some(1_200.0));
-
-        assert_eq!(effective.size, 180.0);
-    }
-
-    #[test]
-    fn effective_widths_shrink_name_to_keep_actions_visible() {
-        let widths = DownloadColumnWidths::default();
-        let available_width = COLUMN_LAYOUT_CHROME_WIDTH
-            + widths.size
-            + widths.progress
-            + widths.speed
-            + widths.eta
-            + 120.0;
-
-        let effective = effective_column_widths(widths, Some(available_width));
-
-        assert_eq!(effective.name, 120.0);
+    fn lazy_rows_still_fill_the_list_width() {
+        let theme =
+            ThemeCatalog::load(std::path::Path::new("")).resolve(&ThemeId::default(), false);
+        let id = DownloadId(uuid::Uuid::nil());
+        let row = download_row::view(RowView {
+            id,
+            name: "file.iso",
+            error: None,
+            status: DownloadStatus::Downloading,
+            downloaded: 1,
+            total: Some(2),
+            speed: 1,
+            torrent: None,
+            pinned: false,
+            selected: false,
+            name_budget: 40,
+            palette: &theme.palette,
+        });
+        let list = rows([(id, row)], &theme.palette);
+        assert_eq!(list.as_widget().size().width, Length::Fill);
     }
 }

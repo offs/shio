@@ -1,0 +1,14 @@
+id = "flexoki-light"
+name = "flexoki light"
+appearance = "light"
+
+[colors]
+background = "#FFFCF0"
+text_primary = "#100F0F"
+text_secondary = "#403E3C"
+text_tertiary = "#575653"
+accent = "#205EA6"
+success = "#536907"
+warning = "#BC5215"
+error = "#AF3029"
+border = "#100F0F"

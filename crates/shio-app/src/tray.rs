@@ -1,8 +1,13 @@
-#[cfg(not(target_os = "windows"))]
-use std::sync::mpsc::Receiver;
+use parking_lot::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
-#[derive(Debug, Clone, Copy)]
-#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+static SUBSCRIBERS: Mutex<Vec<UnboundedSender<TrayEvent>>> = Mutex::new(Vec::new());
+static READY: AtomicBool = AtomicBool::new(false);
+static CAN_PAUSE: AtomicBool = AtomicBool::new(true);
+static CAN_RESUME: AtomicBool = AtomicBool::new(true);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TrayEvent {
     Show,
     PauseAll,
@@ -10,153 +15,280 @@ pub(crate) enum TrayEvent {
     Quit,
 }
 
+#[cfg(target_os = "linux")]
+pub(crate) use desktop::install as init;
 #[cfg(target_os = "windows")]
-pub(crate) use windows::{init, subscribe};
+pub(crate) use platform_thread::spawn as init;
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
+pub(crate) const fn init() {}
 
-#[cfg(not(target_os = "windows"))]
-#[allow(clippy::missing_const_for_fn)]
-pub(crate) fn init() {}
+// macOS can only create the tray once iced's native event loop runs.
+#[cfg(target_os = "macos")]
+pub(crate) use desktop::install as activate;
+#[cfg(not(target_os = "macos"))]
+pub(crate) const fn activate() {}
 
+// Windows leaves a stale icon behind unless it is removed before exit.
+#[cfg(target_os = "windows")]
+pub(crate) use platform_thread::stop as shutdown;
 #[cfg(not(target_os = "windows"))]
-#[allow(clippy::missing_const_for_fn)]
-pub(crate) fn subscribe() -> Option<Receiver<TrayEvent>> {
-    None
+pub(crate) const fn shutdown() {}
+
+pub(crate) fn subscribe() -> UnboundedReceiver<TrayEvent> {
+    let (tx, rx) = unbounded_channel();
+    SUBSCRIBERS.lock().push(tx);
+    rx
 }
 
-#[cfg(target_os = "windows")]
-mod windows {
-    use super::TrayEvent;
-    use parking_lot::Mutex;
-    use std::sync::OnceLock;
-    use std::sync::mpsc::{Receiver, Sender, channel};
-    use std::thread;
-    use tray_icon::Icon;
-    use tray_icon::TrayIconBuilder;
+pub(crate) fn is_ready() -> bool {
+    READY.load(Ordering::Acquire)
+}
+
+pub(crate) fn set_actions(can_pause: bool, can_resume: bool) {
+    if store_actions(can_pause, can_resume) {
+        #[cfg(target_os = "windows")]
+        platform_thread::wake();
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        desktop::sync_actions();
+    }
+}
+
+fn store_actions(can_pause: bool, can_resume: bool) -> bool {
+    let pause = CAN_PAUSE.swap(can_pause, Ordering::AcqRel) != can_pause;
+    let resume = CAN_RESUME.swap(can_resume, Ordering::AcqRel) != can_resume;
+    pause || resume
+}
+
+fn dispatch(event: TrayEvent) {
+    SUBSCRIBERS.lock().retain(|tx| tx.send(event).is_ok());
+}
+
+#[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
+mod desktop {
+    use super::{CAN_PAUSE, CAN_RESUME, TrayEvent, dispatch};
+    use std::cell::RefCell;
+    use std::sync::atomic::Ordering;
     use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
+    use tray_icon::{Icon, MouseButton, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
-    const ICON_BYTES: &[u8] = include_bytes!("../../../assets/icons/icon-32.png");
+    struct Tray {
+        _icon: TrayIcon,
+        pause: MenuItem,
+        resume: MenuItem,
+    }
 
-    static SUBSCRIBERS: OnceLock<Mutex<Vec<Sender<TrayEvent>>>> = OnceLock::new();
+    // The menu items are bound to the thread that created them.
+    thread_local!(static TRAY: RefCell<Option<Tray>> = const { RefCell::new(None) });
 
-    pub(crate) fn init() {
-        let _ = SUBSCRIBERS.set(Mutex::new(Vec::new()));
-        if let Err(e) = spawn_thread() {
-            tracing::warn!("tray thread failed to spawn: {e}");
+    pub(crate) fn install() {
+        if TRAY.with_borrow(Option::is_some) {
+            return;
+        }
+        match build() {
+            Ok(tray) => {
+                TRAY.set(Some(tray));
+                sync_actions();
+                #[cfg(target_os = "linux")]
+                super::host::watch();
+                #[cfg(not(target_os = "linux"))]
+                super::READY.store(true, Ordering::Release);
+            },
+            Err(error) => tracing::warn!("tray unavailable: {error}"),
         }
     }
 
-    pub(crate) fn subscribe() -> Option<Receiver<TrayEvent>> {
-        let (tx, rx) = channel::<TrayEvent>();
-        SUBSCRIBERS.get()?.lock().push(tx);
-        Some(rx)
+    #[cfg(target_os = "windows")]
+    pub(super) fn uninstall() {
+        TRAY.set(None);
+        super::READY.store(false, Ordering::Release);
     }
 
-    fn dispatch(event: TrayEvent) {
-        let Some(subscribers) = SUBSCRIBERS.get() else {
-            return;
-        };
-        let mut subscribers = subscribers.lock();
-        subscribers.retain(|tx| tx.send(event).is_ok());
-        if subscribers.is_empty() {
-            tracing::debug!("tray event dropped without subscribers");
-        }
+    pub(super) fn sync_actions() {
+        TRAY.with_borrow(|tray| {
+            if let Some(tray) = tray {
+                tray.pause.set_enabled(CAN_PAUSE.load(Ordering::Acquire));
+                tray.resume.set_enabled(CAN_RESUME.load(Ordering::Acquire));
+            }
+        });
     }
 
-    fn spawn_thread() -> std::io::Result<()> {
-        thread::Builder::new()
-            .name("shio-tray".into())
-            .spawn(run)
-            .map(|_| ())
-    }
-
-    fn run() {
-        let Some(icon) = load_icon() else {
-            tracing::warn!("failed to load tray icon");
-            return;
-        };
-
-        let menu = Menu::new();
+    fn build() -> Result<Tray, Box<dyn std::error::Error>> {
         let show = MenuItem::new("show shio", true, None);
         let pause = MenuItem::new("pause all", true, None);
         let resume = MenuItem::new("resume all", true, None);
-        let sep = PredefinedMenuItem::separator();
         let quit = MenuItem::new("quit", true, None);
-        for item in [&show, &pause, &resume] {
-            if let Err(error) = menu.append(item) {
-                tracing::warn!("tray menu item failed: {error}");
-            }
-        }
-        if let Err(error) = menu.append(&sep) {
-            tracing::warn!("tray menu separator failed: {error}");
-        }
-        if let Err(error) = menu.append(&quit) {
-            tracing::warn!("tray menu item failed: {error}");
-        }
-
-        let show_id = show.id().clone();
-        let pause_id = pause.id().clone();
-        let resume_id = resume.id().clone();
-        let quit_id = quit.id().clone();
-
-        let _tray = match TrayIconBuilder::new()
-            .with_tooltip("shio")
-            .with_icon(icon)
-            .with_menu(Box::new(menu))
-            .build()
-        {
-            Ok(t) => t,
-            Err(e) => {
-                tracing::warn!("tray build failed: {e}");
-                return;
-            },
-        };
-
+        let menu = Menu::with_items(&[
+            &show,
+            &pause,
+            &resume,
+            &PredefinedMenuItem::separator(),
+            &quit,
+        ])?;
+        let events = [
+            (show.id().clone(), TrayEvent::Show),
+            (pause.id().clone(), TrayEvent::PauseAll),
+            (resume.id().clone(), TrayEvent::ResumeAll),
+            (quit.id().clone(), TrayEvent::Quit),
+        ];
         MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
-            let id = &event.id;
-            let ev = if id == &show_id {
-                TrayEvent::Show
-            } else if id == &pause_id {
-                TrayEvent::PauseAll
-            } else if id == &resume_id {
-                TrayEvent::ResumeAll
-            } else if id == &quit_id {
-                TrayEvent::Quit
-            } else {
-                return;
-            };
-            dispatch(ev);
+            if let Some((_, event)) = events.iter().find(|(id, _)| *id == event.id) {
+                dispatch(*event);
+            }
         }));
-
-        tray_icon::TrayIconEvent::set_event_handler(Some(|event: tray_icon::TrayIconEvent| {
-            if let tray_icon::TrayIconEvent::DoubleClick { .. } = event {
+        TrayIconEvent::set_event_handler(Some(|event| {
+            // The StatusNotifierItem host reports its activate action as a left click.
+            let show = if cfg!(target_os = "linux") {
+                matches!(
+                    event,
+                    TrayIconEvent::Click {
+                        button: MouseButton::Left,
+                        ..
+                    }
+                )
+            } else {
+                matches!(event, TrayIconEvent::DoubleClick { .. })
+            };
+            if show {
                 dispatch(TrayEvent::Show);
             }
         }));
 
-        pump_messages();
+        let image = image::load_from_memory(include_bytes!("../../../assets/icons/icon-64.png"))?
+            .to_rgba8();
+        let (width, height) = image.dimensions();
+        let icon = TrayIconBuilder::new()
+            .with_id("shio")
+            .with_tooltip("shio")
+            .with_icon(Icon::from_rgba(image.into_raw(), width, height)?)
+            .with_menu(Box::new(menu))
+            .build()?;
+        Ok(Tray {
+            _icon: icon,
+            pause,
+            resume,
+        })
     }
+}
 
-    fn load_icon() -> Option<Icon> {
-        let img = image::load_from_memory(ICON_BYTES).ok()?.to_rgba8();
-        let (w, h) = img.dimensions();
-        Icon::from_rgba(img.into_raw(), w, h).ok()
-    }
+#[cfg(target_os = "linux")]
+mod host {
+    use super::{READY, TrayEvent, dispatch};
+    use std::sync::atomic::Ordering;
+    use zbus::blocking::{Connection, fdo::DBusProxy};
 
-    fn pump_messages() {
-        use windows_sys::Win32::UI::WindowsAndMessaging::{
-            DispatchMessageW, GetMessageW, MSG, TranslateMessage,
-        };
-        #[allow(unsafe_code)]
-        unsafe {
-            let mut msg: MSG = std::mem::zeroed();
-            loop {
-                let ret = GetMessageW(&raw mut msg, std::ptr::null_mut(), 0, 0);
-                if ret <= 0 {
-                    break;
+    const WATCHER: &str = "org.kde.StatusNotifierWatcher";
+
+    pub(super) fn watch() {
+        let spawned = std::thread::Builder::new()
+            .name("shio-tray".into())
+            .spawn(|| {
+                if let Err(error) = run() {
+                    tracing::warn!("no tray host watcher: {error}");
                 }
-                let _ = TranslateMessage(&raw const msg);
-                DispatchMessageW(&raw const msg);
+            });
+        if let Err(error) = spawned {
+            tracing::warn!("tray thread failed to spawn: {error}");
+        }
+    }
+
+    // GNOME without the AppIndicator extension has no watcher, and the window must never
+    // hide into a tray nobody shows. Watchers always claim a registered host, so the
+    // watcher's presence is the only signal.
+    fn run() -> zbus::Result<()> {
+        let bus = DBusProxy::new(&Connection::session()?)?;
+        let changes = bus.receive_name_owner_changed_with_args(&[(0, WATCHER)])?;
+        set_ready(bus.name_has_owner(WATCHER.try_into()?)?);
+        for change in changes {
+            set_ready(change.args()?.new_owner().is_some());
+        }
+        Ok(())
+    }
+
+    fn set_ready(ready: bool) {
+        if READY.swap(ready, Ordering::AcqRel) && !ready {
+            tracing::warn!("tray host disappeared; showing the window");
+            dispatch(TrayEvent::Show);
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+mod platform_thread {
+    #![allow(unsafe_code)]
+
+    use super::desktop;
+    use parking_lot::Mutex;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::thread::JoinHandle;
+    use windows_sys::Win32::System::Threading::GetCurrentThreadId;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        DispatchMessageW, GetMessageW, MSG, PostThreadMessageW, TranslateMessage, WM_APP, WM_QUIT,
+    };
+
+    static THREAD_ID: AtomicU32 = AtomicU32::new(0);
+    static THREAD: Mutex<Option<JoinHandle<()>>> = Mutex::new(None);
+
+    pub(crate) fn spawn() {
+        match std::thread::Builder::new()
+            .name("shio-tray".into())
+            .spawn(run)
+        {
+            Ok(handle) => *THREAD.lock() = Some(handle),
+            Err(error) => tracing::warn!("tray thread failed to spawn: {error}"),
+        }
+    }
+
+    pub(super) fn wake() {
+        post(WM_APP);
+    }
+
+    pub(crate) fn stop() {
+        if post(WM_QUIT)
+            && let Some(handle) = THREAD.lock().take()
+        {
+            let _ = handle.join();
+        }
+    }
+
+    fn post(message: u32) -> bool {
+        let id = THREAD_ID.load(Ordering::Acquire);
+        // SAFETY: posting to a thread id has no memory-safety preconditions; a stale id fails.
+        id != 0 && unsafe { PostThreadMessageW(id, message, 0, 0) } != 0
+    }
+
+    fn run() {
+        // SAFETY: GetCurrentThreadId has no preconditions.
+        THREAD_ID.store(unsafe { GetCurrentThreadId() }, Ordering::Release);
+        desktop::install();
+        // SAFETY: MSG is plain data and all-zero is a valid value.
+        let mut message: MSG = unsafe { std::mem::zeroed() };
+        // SAFETY: `message` is a valid out pointer for the duration of each call.
+        while unsafe { GetMessageW(&raw mut message, std::ptr::null_mut(), 0, 0) } > 0 {
+            if message.message == WM_APP {
+                desktop::sync_actions();
+            }
+            // SAFETY: `message` was just filled by GetMessageW.
+            unsafe {
+                TranslateMessage(&raw const message);
+                DispatchMessageW(&raw const message);
             }
         }
+        desktop::uninstall();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn action_changes_are_detected_per_item() {
+        store_actions(true, true);
+        assert!(
+            store_actions(true, false),
+            "a resume-only change must resync"
+        );
+        assert!(!store_actions(true, false));
+        assert!(store_actions(false, false));
     }
 }
