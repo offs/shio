@@ -152,7 +152,7 @@ async fn preview_blocks_html_landing_pages() {
 async fn preview_results_never_expose_redirect_tokens() {
     let (listener, base) = listen().await;
     let redirect = format!(
-        "HTTP/1.1 302 Found\r\nLocation: {base}/cdn/file.bin?token=secret-preview-token\r\nContent-Length: 2\r\n"
+        "HTTP/1.1 302 Found\r\nLocation: {base}/cdn/file.bin?token=secret-preview-token\r\nConnection: close\r\nContent-Length: 2\r\n"
     );
     let server = tokio::spawn(async move {
         answer(&listener, &redirect).await?;
@@ -166,7 +166,11 @@ async fn preview_results_never_expose_redirect_tokens() {
         .unwrap()
         .unwrap();
     engine.shutdown().await;
-    server.await.unwrap().unwrap();
+    tokio::time::timeout(Duration::from_secs(2), server)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
 
     assert!(!format!("{result:?}").contains("secret-preview-token"));
 }
