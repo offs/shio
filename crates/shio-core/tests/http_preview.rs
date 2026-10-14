@@ -90,7 +90,7 @@ impl Engine {
 
 async fn resolve(head: String, path: &str) -> HttpPreviewState {
     let (listener, base) = listen().await;
-    let server = tokio::spawn(async move { answer(&listener, &head).await });
+    let server = tokio::spawn(async move { while answer(&listener, &head).await.is_ok() {} });
     let engine = Engine::start();
     let mut results = engine.preview(7, format!("{base}{path}")).await;
 
@@ -99,7 +99,7 @@ async fn resolve(head: String, path: &str) -> HttpPreviewState {
         .unwrap()
         .unwrap();
     engine.shutdown().await;
-    server.await.unwrap().unwrap();
+    server.abort();
     assert_eq!(result.request_id, 7);
     result.state
 }
@@ -123,6 +123,10 @@ async fn preview_names_files_from_fragments_then_content_disposition() {
         ready("release.part01.rar")
     );
     assert_eq!(
+        resolve(FILE_RESPONSE.into(), "/opaque-id?file=a+b.mkv#a%20b.mkv").await,
+        ready("a b.mkv")
+    );
+    assert_eq!(
         resolve(with_disposition, "/downloads/ignored.dat").await,
         ready("server.bin")
     );
@@ -136,9 +140,11 @@ async fn preview_blocks_html_landing_pages() {
     )
     .await;
 
-    assert!(
-        matches!(state, HttpPreviewState::Blocked { .. }),
-        "{state:?}"
+    assert_eq!(
+        state,
+        HttpPreviewState::Blocked {
+            reason: shio_core::ShioError::NoFileOnPage.short_label()
+        }
     );
 }
 

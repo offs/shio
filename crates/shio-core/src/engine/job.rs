@@ -1,15 +1,19 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use tokio::sync::{Notify, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use super::{Context, Internal, PROGRESS_FLUSH_INTERVAL, ProgressEvent, WORKER_PROGRESS_CAPACITY};
 use crate::error::{Result, ShioError};
+use crate::probe::HttpProbe;
+use crate::resolve::{Resolved, Target};
 use crate::torrent::TorrentManifest;
 use crate::types::{Download, DownloadId, DownloadProgress};
 use crate::worker::blocking;
+
+const RESOLVE_TIMEOUT: Duration = Duration::from_mins(2);
 
 // Counts workers that occupy a `max_concurrent` slot; dropping one wakes the loop.
 pub(crate) struct ActiveSlot(Arc<Slots>);
@@ -93,10 +97,20 @@ pub(super) async fn run_http(
             .http()
             .map(|http| (http.url.clone(), http.headers.clone()))
             .ok_or_else(|| ShioError::Other("expected an HTTP download".into()))?;
-        let probe =
-            crate::probe::probe_with_retries(&http, &url, &headers, download.max_retries, &cancel)
-                .await?;
-        if may_rename && let Some(name) = probe.server_filename(&download) {
+        let max_retries = download.max_retries;
+        let direct = crate::probe::retrying(max_retries, &cancel, || {
+            crate::probe::probe(&http, &url, &headers)
+        })
+        .await;
+        let (probe, resolved) = match direct {
+            Ok(probe) => (probe, None),
+            Err(ShioError::NotADirectFile { .. } | ShioError::BrowserCheck) => {
+                let (probe, page) = probe_page(&http, &url, &headers, max_retries, &cancel).await?;
+                (probe, Some(page))
+            },
+            Err(error) => return Err(error),
+        };
+        if may_rename && let Some(name) = probe.server_filename(&download, resolved.is_some()) {
             let (reply, claimed) = oneshot::channel();
             ctx.loop_tx
                 .send(Internal::ClaimFilename {
@@ -107,6 +121,16 @@ pub(super) async fn run_http(
                 .map_err(|_| ShioError::Cancelled)?;
             download.filename = claimed.await.map_err(|_| ShioError::Cancelled)??;
         }
+        let host = ctx
+            .shared
+            .hosts
+            .get(resolved.as_ref().map_or(&url, |page| &page.url));
+        if let Some(page) = resolved
+            && let Some(state) = download.http_mut()
+        {
+            state.url = page.url;
+            state.headers = page.headers;
+        }
         let job = crate::worker::HttpJob {
             config: ctx.shared.config.subscribe(),
             client: http,
@@ -114,12 +138,57 @@ pub(super) async fn run_http(
             progress_tx,
             cancel,
             limiter: ctx.shared.limiter.clone(),
-            host: ctx.shared.hosts.get(&url),
+            host,
         };
         crate::worker::run(download, probe, job).await
     };
     let (result, ()) = tokio::join!(work, track_progress(&ctx, id, progress_rx));
     result
+}
+
+// The page's headers (`Referer`, cookies) replace user headers of the same name.
+async fn probe_page(
+    http: &reqwest::Client,
+    url: &str,
+    headers: &[(String, String)],
+    max_retries: u32,
+    cancel: &CancellationToken,
+) -> Result<(HttpProbe, Resolved)> {
+    let resolve = || async {
+        tokio::time::timeout(RESOLVE_TIMEOUT, crate::resolve::resolve(http, url))
+            .await
+            .map_err(|_| ShioError::Other("download page timed out".into()))?
+    };
+    let page = match crate::probe::retrying(max_retries, cancel, resolve).await? {
+        Target::File(page) => page,
+        Target::Folder(_) => {
+            return Err(ShioError::Other(
+                "folder link; add it again to pick files".into(),
+            ));
+        },
+    };
+    let mut merged: Vec<(String, String)> = headers
+        .iter()
+        .filter(|(name, _)| {
+            !page
+                .headers
+                .iter()
+                .any(|(page_name, _)| page_name.eq_ignore_ascii_case(name))
+        })
+        .cloned()
+        .collect();
+    merged.extend(page.headers);
+    let probe = crate::probe::retrying(max_retries, cancel, || {
+        crate::probe::probe(http, &page.url, &merged)
+    })
+    .await?;
+    Ok((
+        probe,
+        Resolved {
+            url: page.url,
+            headers: merged,
+        },
+    ))
 }
 
 pub(super) async fn run_torrent(

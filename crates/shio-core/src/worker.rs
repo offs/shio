@@ -18,7 +18,7 @@ use tokio::sync::{Semaphore, mpsc, watch};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 
-const USER_AGENT: &str = concat!("Shio/", env!("CARGO_PKG_VERSION"));
+pub(crate) const USER_AGENT: &str = concat!("Shio/", env!("CARGO_PKG_VERSION"));
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
 const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(10);
 const SPEED_WINDOW: Duration = Duration::from_secs(3);
@@ -585,9 +585,26 @@ fn publish(
 
 /// The completed file this download published, if it is still the one Shio wrote.
 pub(crate) fn published_file(download: &Download) -> Option<PathBuf> {
-    let size = read_resume_metadata(&Staging::of(download).metadata)?.published_size?;
+    let size = match read_resume_metadata(&Staging::of(download).metadata) {
+        Some(metadata) => metadata.published_size?,
+        // `settle_publication` moved the size into the durable row and dropped the staging.
+        None if download.status.is_downloaded() => download.total_size?,
+        None => return None,
+    };
     let path = download.file_path();
     (regular_file_len(&path) == Some(size)).then_some(path)
+}
+
+/// Moves the published size into the row; drop the staging only once that row is durable.
+pub(crate) fn settle_publication(download: &mut Download) -> bool {
+    let Some(size) =
+        read_resume_metadata(&Staging::of(download).metadata).and_then(|m| m.published_size)
+    else {
+        return false;
+    };
+    download.total_size = Some(size);
+    download.downloaded = size;
+    true
 }
 
 fn read_resume_metadata(path: &Path) -> Option<ResumeMetadata> {

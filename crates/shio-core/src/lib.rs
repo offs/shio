@@ -7,6 +7,7 @@ mod extract;
 mod filename;
 mod path;
 mod probe;
+mod resolve;
 mod torrent;
 mod types;
 mod worker;

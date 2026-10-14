@@ -9,7 +9,7 @@ use shio_core::{
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
-const MAX_LINKS: usize = 32;
+const MAX_LINKS: usize = 256;
 const MAX_TORRENTS: usize = 32;
 const HTTP_PREVIEW_LIMIT: usize = 8;
 pub(super) const MAX_URL_TEXT_BYTES: usize = 64 * 1024;
@@ -39,6 +39,7 @@ pub(crate) struct Link {
     pub(crate) url: String,
     pub(crate) name: String,
     pub(crate) state: LinkState,
+    pub(crate) mirror: bool,
     request: Option<u64>,
 }
 
@@ -77,6 +78,7 @@ enum Item {
     Http {
         url: String,
         name: String,
+        mirrors: Vec<String>,
     },
     ArchiveSet {
         name: String,
@@ -232,9 +234,36 @@ impl AddDialog {
         });
         let preview_http =
             lines.iter().filter(|line| !is_magnet(line)).count() <= HTTP_PREVIEW_LIMIT;
+        let mut previous = std::mem::take(&mut self.links);
+        let kept = |line: &str| previous.iter().find(|link| link.url == line);
+        let mut previewed_hosts: HashSet<String> = lines
+            .iter()
+            .filter_map(|line| kept(line))
+            .filter(|link| {
+                matches!(
+                    link.state,
+                    LinkState::Ready { .. } | LinkState::Blocked(_) | LinkState::Failed(_)
+                )
+            })
+            .filter_map(|link| host(&link.url))
+            .collect();
+        // In-flight previews claim their hosts first, so an inserted line never restarts one.
+        let mut in_flight = HashSet::new();
+        for link in lines.iter().take(MAX_LINKS).filter_map(|line| kept(line)) {
+            if link.state == LinkState::Resolving
+                && (preview_http || host(&link.url).is_some_and(|h| previewed_hosts.insert(h)))
+            {
+                in_flight.extend(link.request);
+            }
+        }
+        let mut preview_host = |line: &str| {
+            preview_http
+                || host(line).is_some_and(|host| {
+                    previewed_hosts.len() < HTTP_PREVIEW_LIMIT && previewed_hosts.insert(host)
+                })
+        };
 
         let mut previews = Previews::default();
-        let mut previous = std::mem::take(&mut self.links);
         for &line in lines.iter().take(MAX_LINKS) {
             if self
                 .torrents
@@ -246,14 +275,27 @@ impl AddDialog {
             let magnet = is_magnet(line);
             if let Some(index) = previous.iter().position(|link| link.url == line) {
                 let mut link = previous.swap_remove(index);
-                if !magnet && !preview_http && link.state == LinkState::Resolving {
-                    previews.cancel.extend(link.request.take());
-                    link.state = LinkState::Unchecked;
+                if !magnet {
+                    match link.state {
+                        LinkState::Resolving
+                            if !link.request.is_some_and(|id| in_flight.contains(&id)) =>
+                        {
+                            previews.cancel.extend(link.request.take());
+                            link.state = LinkState::Unchecked;
+                        },
+                        LinkState::Unchecked if preview_host(line) => {
+                            *next_request += 1;
+                            link.request = Some(*next_request);
+                            link.state = LinkState::Resolving;
+                            previews.http.push((*next_request, line.to_owned()));
+                        },
+                        _ => {},
+                    }
                 }
                 self.links.push(link);
                 continue;
             }
-            let request = (magnet || preview_http).then(|| {
+            let request = (magnet || preview_host(line)).then(|| {
                 *next_request += 1;
                 *next_request
             });
@@ -277,6 +319,7 @@ impl AddDialog {
                 } else {
                     LinkState::Unchecked
                 },
+                mirror: false,
                 request,
             });
         }
@@ -291,13 +334,17 @@ impl AddDialog {
         previews
     }
 
-    pub(super) fn apply_http_preview(&mut self, result: HttpPreviewResult) {
+    pub(super) fn apply_http_preview(
+        &mut self,
+        result: HttpPreviewResult,
+        next_request: &mut u64,
+    ) -> Previews {
         let Some(link) = self.links.iter_mut().find(|link| {
             link.request == Some(result.request_id) && link.state == LinkState::Resolving
         }) else {
-            return;
+            return Previews::default();
         };
-        link.state = match result.state {
+        let state = match result.state {
             HttpPreviewState::Ready(preview) => {
                 if !preview.filename.is_empty() {
                     link.name = preview.filename;
@@ -306,10 +353,76 @@ impl AddDialog {
                     size: preview.total_size,
                 }
             },
+            HttpPreviewState::Folder { files } => {
+                link.state = LinkState::Ready { size: None };
+                let url = link.url.clone();
+                return self.expand_folder(&url, &files, next_request);
+            },
             HttpPreviewState::Blocked { reason } => LinkState::Blocked(reason),
             HttpPreviewState::Error { message } => LinkState::Failed(message),
         };
+        link.state = state;
         self.revalidate();
+        Previews::default()
+    }
+
+    fn expand_folder(&mut self, url: &str, files: &[String], next_request: &mut u64) -> Previews {
+        let Ok(folder) = url::Url::parse(url) else {
+            return Previews::default();
+        };
+        let expanded: Vec<String> = files
+            .iter()
+            .map(|name| {
+                let mut file = folder.clone();
+                file.query_pairs_mut().append_pair("file", name);
+                // `set_fragment` leaves `%` alone; the fragment only names the line.
+                file.set_fragment(Some(&name.replace('%', "%25")));
+                file.into()
+            })
+            .collect();
+        let expanded = expanded.join("\n");
+        let text = self.urls.text();
+        let lines: Vec<&str> = text
+            .lines()
+            .map(|line| {
+                if line.trim() == url {
+                    expanded.as_str()
+                } else {
+                    line
+                }
+            })
+            .collect();
+        self.urls = text_editor::Content::with_text(&lines.join("\n"));
+        self.sync_links(next_request)
+    }
+
+    fn mark_mirrors(&mut self) {
+        let blocked_hosts: HashSet<String> = self
+            .links
+            .iter()
+            .filter(|link| matches!(link.state, LinkState::Blocked(_)))
+            .filter_map(|link| host(&link.url))
+            .collect();
+        let ranks: Vec<(bool, bool)> = self
+            .links
+            .iter()
+            .map(|link| {
+                let unpreviewed = matches!(link.state, LinkState::Unchecked | LinkState::Resolving);
+                let blocked = matches!(link.state, LinkState::Blocked(_))
+                    || (unpreviewed
+                        && host(&link.url).is_some_and(|host| blocked_hosts.contains(&host)));
+                (blocked, matches!(link.state, LinkState::Failed(_)))
+            })
+            .collect();
+        let mut order: Vec<usize> = (0..self.links.len()).collect();
+        order.sort_by_key(|&index| ranks[index]);
+        let mut seen = HashSet::new();
+        for index in order {
+            let link = &mut self.links[index];
+            link.mirror = !is_magnet(&link.url)
+                && shio_core::parse_archive_part(&link.name)
+                    .is_some_and(|part| !seen.insert((part.base_name, part.part_number)));
+        }
     }
 
     pub(super) fn apply_magnet_preview(&mut self, result: MagnetPreviewResult) {
@@ -397,6 +510,7 @@ impl AddDialog {
     }
 
     pub(super) fn revalidate(&mut self) {
+        self.mark_mirrors();
         if !self
             .selected_torrent
             .is_some_and(|id| self.torrents.iter().any(|pick| pick.id == id))
@@ -408,7 +522,9 @@ impl AddDialog {
                 .links
                 .iter()
                 .filter(|link| {
-                    !is_magnet(&link.url) && !matches!(link.state, LinkState::Blocked(_))
+                    !is_magnet(&link.url)
+                        && !link.mirror
+                        && !matches!(link.state, LinkState::Blocked(_))
                 })
                 .map(|link| link.name.as_str())
                 .chain(self.torrents.iter().map(|pick| pick.name.as_str()))
@@ -444,11 +560,20 @@ impl AddDialog {
         }
         let mut items = Vec::new();
         let mut sets: BTreeMap<String, Vec<(&Link, u32)>> = BTreeMap::new();
-        let addable = self
-            .links
-            .iter()
-            .filter(|link| !matches!(link.state, LinkState::Blocked(_)));
-        for link in addable {
+        let mut mirrors: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for link in &self.links {
+            if link.mirror {
+                if let Some(part) = shio_core::parse_archive_part(&link.name) {
+                    mirrors
+                        .entry(part.base_name)
+                        .or_default()
+                        .push(link.url.clone());
+                }
+                continue;
+            }
+            if matches!(link.state, LinkState::Blocked(_)) {
+                continue;
+            }
             if is_magnet(&link.url) {
                 items.push(Item::Magnet(link.url.clone()));
             } else if let Some(part) = shio_core::parse_archive_part(&link.name) {
@@ -459,6 +584,7 @@ impl AddDialog {
                 items.push(Item::Http {
                     url: link.url.clone(),
                     name: link.name.clone(),
+                    mirrors: Vec::new(),
                 });
             }
         }
@@ -467,11 +593,16 @@ impl AddDialog {
                 items.push(Item::Http {
                     url: link.url.clone(),
                     name: link.name.clone(),
+                    mirrors: mirrors.remove(&base_name).unwrap_or_default(),
                 });
                 continue;
             }
             let name = shio_core::subfolder_value(self.create_subfolder, &self.subfolder)
-                .unwrap_or_else(|| base_name.clone());
+                .unwrap_or_else(|| {
+                    let names: Vec<&str> =
+                        parts.iter().map(|(link, _)| link.name.as_str()).collect();
+                    shio_core::suggest_folder_name(&names).unwrap_or_else(|| base_name.clone())
+                });
             let request = parts
                 .iter()
                 .map(|(link, number)| {
@@ -495,7 +626,11 @@ impl AddDialog {
             items.push(Item::ArchiveSet {
                 name,
                 request,
-                urls: parts.iter().map(|(link, _)| link.url.clone()).collect(),
+                urls: parts
+                    .iter()
+                    .map(|(link, _)| link.url.clone())
+                    .chain(mirrors.remove(&base_name).unwrap_or_default())
+                    .collect(),
             });
         }
         for pick in &self.torrents {
@@ -521,7 +656,7 @@ impl AddDialog {
         let mut requests = Vec::with_capacity(self.plan.len());
         for item in &self.plan {
             let (label, source, request) = match item {
-                Item::Http { url, name } => {
+                Item::Http { url, name, mirrors } => {
                     let mut request = HttpDownloadRequest::new(url.clone(), save_path.clone())
                         .with_segments(self.segments)
                         .with_auto_extract(self.auto_extract);
@@ -533,7 +668,11 @@ impl AddDialog {
                     }
                     (
                         name.clone(),
-                        Source::Urls(vec![url.clone()]),
+                        Source::Urls(
+                            std::iter::once(url.clone())
+                                .chain(mirrors.iter().cloned())
+                                .collect(),
+                        ),
                         AddRequest::Http(request),
                     )
                 },
@@ -607,6 +746,10 @@ impl AddDialog {
         self.urls = text_editor::Content::with_text(&remaining.join("\n"));
         (added, self.sync_links(next_request))
     }
+}
+
+fn host(url: &str) -> Option<String> {
+    url::Url::parse(url).ok()?.host_str().map(str::to_owned)
 }
 
 fn summary(plan: &[Item]) -> String {
@@ -698,11 +841,11 @@ mod tests {
             },
         };
 
-        dialog.apply_http_preview(blocked(previews.http[0].0));
-        dialog.apply_http_preview(blocked(99));
+        dialog.apply_http_preview(blocked(previews.http[0].0), &mut 2);
+        dialog.apply_http_preview(blocked(99), &mut 2);
         assert_eq!(dialog.validation, AddValidation::Ready("1 link".to_owned()));
 
-        dialog.apply_http_preview(blocked(previews.http[1].0));
+        dialog.apply_http_preview(blocked(previews.http[1].0), &mut 2);
         assert_eq!(dialog.validation, AddValidation::Empty);
     }
 
@@ -723,5 +866,103 @@ mod tests {
         );
         assert_eq!(dialog.urls.text().trim(), "https://e.com/b.bin");
         assert_eq!(dialog.links.len(), 1);
+    }
+
+    #[test]
+    fn mirror_parts_are_skipped_and_cleared_on_submit() {
+        const PART1: &str =
+            "https://open.example/aaaaaaaaaaaa#Some_Game_--_uploader.example_--_.part1.rar";
+        const PART2: &str =
+            "https://open.example/bbbbbbbbbbbb#Some_Game_--_uploader.example_--_.part2.rar";
+        const MIRROR: &str =
+            "https://captcha.example/cccccccccccc/Some_Game_--_uploader.example_--_.part1.rar";
+        let one_set = AddValidation::Ready("1 archive set".to_owned());
+
+        let (mut dialog, _) = dialog(&format!("{PART1}\n{PART2}\n{MIRROR}"));
+        assert_eq!(dialog.validation, one_set);
+        assert!(dialog.links[2].mirror);
+        assert_eq!(dialog.subfolder, "Some Game");
+        assert_eq!(dialog.submit().len(), 1);
+        dialog.finish_submit(vec![Ok(())], &mut 3);
+        assert_eq!(dialog.urls.text().trim(), "");
+
+        let (mut dialog, previews) = self::dialog(&format!("{MIRROR}\n{PART1}\n{PART2}"));
+        let captcha = HttpPreviewResult {
+            request_id: previews.http[0].0,
+            state: HttpPreviewState::Blocked {
+                reason: "needs a captcha".to_owned(),
+            },
+        };
+        dialog.apply_http_preview(captcha, &mut 3);
+        assert!(dialog.links[0].mirror);
+        assert_eq!(dialog.validation, one_set);
+    }
+
+    #[test]
+    fn crowded_pastes_preview_one_link_per_host() {
+        let blocked_host =
+            (1..=5).map(|n| format!("https://captcha.example/aaaa1111/G.part{n}.rar"));
+        let open_host = (1..=5).map(|n| format!("https://open.example/bbbbbb{n}#G.part{n}.rar"));
+        let text = blocked_host.chain(open_host).collect::<Vec<_>>().join("\n");
+        let (mut dialog, previews) = dialog(&text);
+        assert_eq!(previews.http.len(), 2);
+        assert!(previews.http[0].1.contains("captcha.example"));
+        assert!(previews.http[1].1.contains("open.example"));
+
+        dialog.urls = text_editor::Content::with_text(&format!(
+            "https://open.example/bbbbbb6#G.part6.rar\n{text}"
+        ));
+        let again = dialog.sync_links(&mut 100);
+        assert_eq!(again.cancel, Vec::<u64>::new());
+        assert_eq!(again.http, Vec::<(u64, String)>::new());
+        assert_eq!(dialog.resolving().count(), 2);
+
+        let captcha = HttpPreviewResult {
+            request_id: previews.http[0].0,
+            state: HttpPreviewState::Blocked {
+                reason: "needs a captcha".to_owned(),
+            },
+        };
+        dialog.apply_http_preview(captcha, &mut 100);
+        for link in &dialog.links {
+            assert_eq!(
+                link.mirror,
+                link.url.contains("captcha.example"),
+                "{}",
+                link.url
+            );
+        }
+        assert_eq!(
+            dialog.validation,
+            AddValidation::Ready("1 archive set".to_owned())
+        );
+    }
+
+    #[test]
+    fn folder_previews_expand_into_one_link_per_file() {
+        let (mut dialog, previews) = dialog("https://files.example/d/abcd");
+        let mut next = previews.http[0].0;
+        let folder = HttpPreviewResult {
+            request_id: previews.http[0].0,
+            state: HttpPreviewState::Folder {
+                files: vec!["a b.mkv".to_owned(), "c.zip".to_owned()],
+            },
+        };
+        let expanded = dialog.apply_http_preview(folder, &mut next);
+
+        assert_eq!(
+            dialog.urls.text().lines().collect::<Vec<_>>(),
+            [
+                "https://files.example/d/abcd?file=a+b.mkv#a%20b.mkv",
+                "https://files.example/d/abcd?file=c.zip#c.zip",
+            ]
+        );
+        let names: Vec<&str> = dialog.links.iter().map(|link| link.name.as_str()).collect();
+        assert_eq!(names, ["a b.mkv", "c.zip"]);
+        assert_eq!(
+            dialog.validation,
+            AddValidation::Ready("2 links".to_owned())
+        );
+        assert_eq!(expanded.http.len(), 2, "each file is previewed on its own");
     }
 }
