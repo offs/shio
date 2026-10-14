@@ -95,6 +95,14 @@ impl Shio {
         self.preview_tasks(previews)
     }
 
+    pub(super) fn http_previewed(&mut self, result: HttpPreviewResult) -> Task<Message> {
+        let Overlay::Add(dialog) = &mut self.overlay else {
+            return Task::none();
+        };
+        let previews = dialog.apply_http_preview(result, &mut self.next_request);
+        self.preview_tasks(previews)
+    }
+
     pub(super) fn torrent_files_read(
         &mut self,
         picks: Vec<Result<TorrentPick, String>>,

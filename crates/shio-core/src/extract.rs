@@ -1,5 +1,7 @@
 use crate::error::{Result, ShioError};
-use crate::filename::{rar_part, sanitize_filename, sevenz_volume, strip_suffix_ignore_ascii_case};
+use crate::filename::{
+    rar_part, release_name, sanitize_filename, sevenz_volume, strip_suffix_ignore_ascii_case,
+};
 use crate::worker::{rename_no_clobber, sync_parent};
 use std::cell::Cell;
 use std::ffi::OsStr;
@@ -222,7 +224,7 @@ pub(crate) fn extract(
     }?;
     sync_tree(staging.path(), cancel)?;
 
-    let name = sanitize_filename(&plan.base_name);
+    let name = release_name(&plan.base_name);
     for attempt in 1..=MAX_DESTINATION_ATTEMPTS {
         let candidate = if attempt == 1 {
             name.clone()
@@ -793,7 +795,11 @@ pub(crate) mod tests {
             .build_volumes(None)
             .unwrap();
         assert!(volumes.len() > 1);
-        let volume_path = |number: usize| tmp.path().join(format!("set.part{number:02}.rar"));
+        let volume_path = |number: usize| {
+            tmp.path().join(format!(
+                "Some_Game_--_uploader.example_--_.part{number}.rar"
+            ))
+        };
         for (index, volume) in volumes.iter().enumerate() {
             std::fs::write(volume_path(index + 1), volume).unwrap();
         }
@@ -801,6 +807,7 @@ pub(crate) mod tests {
         let set = plan(&volume_path(2)).unwrap();
         assert_eq!(set.readiness(), Readiness::Ready);
         let out = extract(&set, None, &CancellationToken::new()).unwrap();
+        assert_eq!(out.file_name(), Some("Some Game".as_ref()));
 
         assert_eq!(std::fs::read(out.join("dir/run.sh")).unwrap(), payload);
         assert_eq!(std::fs::read(out.join("notes.txt")).unwrap(), b"notes");

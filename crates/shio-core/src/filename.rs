@@ -1,4 +1,5 @@
 use crate::path::{MAX_COMPONENT_BYTES, is_forbidden_char, is_reserved_name};
+use std::borrow::Cow;
 
 pub(crate) const FALLBACK_FILENAME: &str = "download";
 
@@ -10,9 +11,6 @@ pub struct ArchivePart {
 
 pub fn parse_archive_part(filename: &str) -> Option<ArchivePart> {
     let (base, digits) = rar_part(filename)?;
-    if digits.len() < 2 {
-        return None;
-    }
     let part_number = digits.parse().ok().filter(|&number| number > 0)?;
     let base_name = sanitize_filename(base);
     (base_name != FALLBACK_FILENAME).then_some(ArchivePart {
@@ -76,6 +74,12 @@ pub(crate) fn path_filename(url: &url::Url) -> Option<String> {
         .next_back()
         .map(decode_lossy)
         .filter(|name| !name.is_empty())
+}
+
+pub(crate) fn fragment_name(url: &url::Url) -> Option<String> {
+    let fragment = decode_lossy(url.fragment()?);
+    let fragment = fragment.trim();
+    (!fragment.is_empty()).then(|| sanitize_filename(fragment))
 }
 
 pub fn sanitize_filename(name: &str) -> String {
@@ -144,13 +148,55 @@ pub fn suggest_folder_name(filenames: &[&str]) -> Option<String> {
                 |((index, _), _)| index,
             )
     });
-    let prefix = first[..common]
-        .trim_end_matches(|c: char| matches!(c, '.' | '_' | '-') || c.is_whitespace());
+    let prefix = release_title(trim_release_suffix(&first[..common]));
     if prefix.len() < 3 || prefix.chars().all(|c| c.is_ascii_digit()) {
         return None;
     }
-    let name = sanitize_filename(prefix);
+    let name = sanitize_filename(&prefix);
     (name.len() >= 3 && !name.eq_ignore_ascii_case(FALLBACK_FILENAME)).then_some(name)
+}
+
+pub(crate) fn release_name(stem: &str) -> String {
+    sanitize_filename(&release_title(trim_release_suffix(stem)))
+}
+
+fn trim_release_suffix(name: &str) -> &str {
+    name.trim_end_matches(|c: char| matches!(c, '.' | '_' | '-') || c.is_whitespace())
+}
+
+fn release_title(prefix: &str) -> Cow<'_, str> {
+    let mut dropped_tag = false;
+    let mut segments = Vec::new();
+    for (index, segment) in prefix.split("--").enumerate() {
+        let segment =
+            segment.trim_matches(|c: char| matches!(c, '_' | '-' | '.') || c.is_whitespace());
+        if segment.is_empty() {
+            continue;
+        }
+        if index > 0 && is_site_tag(segment) {
+            dropped_tag = true;
+        } else {
+            segments.push(segment);
+        }
+    }
+    if segments.len() == 1 && !dropped_tag {
+        return Cow::Borrowed(prefix);
+    }
+    let mut title = segments.join(" - ");
+    if dropped_tag && !title.contains(' ') {
+        title = title.replace('_', " ");
+    }
+    Cow::Owned(title.split_whitespace().collect::<Vec<_>>().join(" "))
+}
+
+fn is_site_tag(segment: &str) -> bool {
+    segment.rsplit_once('.').is_some_and(|(head, tld)| {
+        !head.is_empty()
+            && (2..=24).contains(&tld.len())
+            && tld.bytes().all(|b| b.is_ascii_lowercase())
+    }) && segment
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.'))
 }
 
 fn archive_stem(name: &str) -> &str {
@@ -408,11 +454,12 @@ mod tests {
         };
         assert_eq!(parse_archive_part("Game.part01.rar"), part("Game", 1));
         assert_eq!(parse_archive_part("Game.PART002.RAR"), part("Game", 2));
+        assert_eq!(parse_archive_part("Game.part1.rar"), part("Game", 1));
         for name in [
             "Game.rar",
-            "Game.part1.rar",
             "Game.part01.zip",
             "Game.part00.rar",
+            "Game.part0.rar",
         ] {
             assert_eq!(parse_archive_part(name), None, "{name}");
         }
@@ -429,6 +476,20 @@ mod tests {
             (&["alpha.zip", "beta.zip"][..], None),
             (&["foo_-_.part01.rar", "foo_-_.part02.rar"][..], Some("foo")),
             (&["2024.zip", "2024.rar"][..], None),
+            (
+                &[
+                    "Some_Game_--_uploader.example_--_.part1.rar",
+                    "Some_Game_--_uploader.example_--_.part2.rar",
+                ][..],
+                Some("Some Game"),
+            ),
+            (
+                &["Some_Game_--_uploader.example_--_.part1.rar"][..],
+                Some("Some Game"),
+            ),
+            (&["Some.Movie--Extras.mkv"][..], Some("Some.Movie - Extras")),
+            (&["Dune--Part.Two.mkv"][..], Some("Dune - Part.Two")),
+            (&["ubuntu-24.04.iso"][..], Some("ubuntu-24.04")),
             (&[][..], None),
         ] {
             assert_eq!(suggest_folder_name(names).as_deref(), expected, "{names:?}");

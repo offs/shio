@@ -30,6 +30,7 @@ use crate::worker::blocking;
 pub use self::command::EngineCommand;
 pub(crate) use self::job::{ActiveSlot, MetadataCommit};
 use self::job::{Slots, run_http, run_torrent};
+pub(crate) use self::request::validate_http_url;
 pub use self::request::{
     HttpArchivePartRequest, HttpArchiveSetRequest, HttpDownloadRequest, TorrentDownloadRequest,
 };
@@ -1104,17 +1105,27 @@ impl DownloadEngine {
             row.status = status;
             row.error_message = error;
         }
-        if matches!(
-            row.status,
-            DownloadStatus::Completed
-                | DownloadStatus::ExtractError
-                | DownloadStatus::PasswordRequired
-        ) {
+        if row.status.is_downloaded() {
             row.completed_at.get_or_insert_with(chrono::Utc::now);
         }
-        if let Err(error) = self.ctx.db.update_downloads(std::slice::from_ref(&row)) {
-            row.status = DownloadStatus::Error;
-            row.error_message = Some(format!("database write failed: {}", error.short_label()));
+        let settled = row.kind.is_http()
+            && row.status.is_downloaded()
+            && crate::worker::settle_publication(&mut row);
+        let committed = match self.ctx.db.update_downloads(std::slice::from_ref(&row)) {
+            Ok(()) => true,
+            Err(error) => {
+                row.status = DownloadStatus::Error;
+                row.error_message = Some(format!("database write failed: {}", error.short_label()));
+                false
+            },
+        };
+        if settled && committed {
+            // The worker has exited, so no progress update can overwrite the final size.
+            if let Some(current) = self.ctx.shared.rows.write().downloads.get_mut(&id) {
+                current.total_size = row.total_size;
+                current.downloaded = row.downloaded;
+            }
+            remove_settled_staging(&row);
         }
         self.apply(std::slice::from_ref(&row));
         self.ctx.shared.refresh_speed_limits();
@@ -1313,6 +1324,7 @@ fn restore(db: &Database) -> Result<(Rows, VecDeque<DownloadId>)> {
     let mut rows = Rows::default();
     let mut queue = VecDeque::new();
     let mut interrupted = Vec::new();
+    let mut settled = Vec::new();
     let mut active_hashes = HashSet::new();
     for mut download in db.downloads()? {
         if let Some(torrent) = download.torrent()
@@ -1341,9 +1353,18 @@ fn restore(db: &Database) -> Result<(Rows, VecDeque<DownloadId>)> {
             },
             _ => {},
         }
+        // Covers a crash between the completion commit and the staging removal.
+        if download.kind.is_http()
+            && download.status.is_downloaded()
+            && crate::worker::settle_publication(&mut download)
+        {
+            settled.push(snapshot(&download));
+        }
         rows.downloads.insert(download.id, download);
     }
     db.update_downloads(&interrupted)?;
+    db.update_downloads(&settled)?;
+    settled.iter().for_each(remove_settled_staging);
     for mut package in db.packages()? {
         if package.extract_state == PackageExtractState::Extracting {
             package.extract_state = PackageExtractState::Error;
@@ -1354,6 +1375,12 @@ fn restore(db: &Database) -> Result<(Rows, VecDeque<DownloadId>)> {
         rows.packages.insert(package.id, package);
     }
     Ok((rows, queue))
+}
+
+fn remove_settled_staging(download: &Download) {
+    if let Err(error) = delete::remove_http_staging(download) {
+        tracing::warn!(download = %download.id, "completed download left HTTP staging behind: {error}");
+    }
 }
 
 fn remove_stale_extraction(dir: &Path) {
@@ -1566,6 +1593,35 @@ mod tests {
             db.get(ids[3]).unwrap().unwrap().status,
             DownloadStatus::ExtractError
         );
+    }
+
+    #[test]
+    fn restart_settles_a_completed_download_without_losing_ownership() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::in_memory().unwrap();
+        let mut download = Download::new(
+            "https://example.com/done.bin".into(),
+            dir.path().to_path_buf(),
+        );
+        download.status = DownloadStatus::Completed;
+        db.insert_download(&download).unwrap();
+        let staging = crate::worker::http_staging_root(&download);
+        std::fs::create_dir(&staging).unwrap();
+        std::fs::write(staging.join("owner"), download.id.to_string()).unwrap();
+        std::fs::write(staging.join("resume.json"), br#"{"published_size":7}"#).unwrap();
+        std::fs::write(download.file_path(), b"payload").unwrap();
+
+        let (rows, _) = restore(&db).unwrap();
+
+        assert!(!staging.exists());
+        let row = &rows.downloads[&download.id];
+        assert_eq!(db.get(download.id).unwrap().unwrap().total_size, Some(7));
+        assert_eq!(
+            crate::worker::published_file(row),
+            Some(download.file_path())
+        );
+        std::fs::write(download.file_path(), b"a user's file").unwrap();
+        assert_eq!(crate::worker::published_file(row), None);
     }
 
     #[tokio::test]

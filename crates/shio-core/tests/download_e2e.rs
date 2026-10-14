@@ -1,14 +1,15 @@
 use parking_lot::Mutex;
 use shio_core::{
     AppConfig, Download, DownloadEngine, DownloadId, DownloadStatus, EngineCommand,
-    HttpDownloadRequest, ProgressEvent, ProgressStream,
+    HttpArchivePartRequest, HttpArchiveSetRequest, HttpDownloadRequest, PackageExtractState,
+    ProgressEvent, ProgressStream, ShioError,
 };
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 use tempfile::TempDir;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot};
 
@@ -21,8 +22,10 @@ fn payload(len: usize) -> Vec<u8> {
 }
 
 struct Request {
+    method: String,
     path: String,
     headers: Vec<(String, String)>,
+    body: String,
 }
 
 impl Request {
@@ -51,19 +54,34 @@ async fn read_request(stream: &mut TcpStream) -> Option<Request> {
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
     reader.read_line(&mut line).await.ok()?;
-    let path = line.split_whitespace().nth(1)?.to_owned();
+    let mut words = line.split_whitespace();
+    let method = words.next()?.to_owned();
+    let path = words.next()?.to_owned();
     let mut headers = Vec::new();
     loop {
         let mut line = String::new();
         reader.read_line(&mut line).await.ok()?;
         let line = line.trim_end();
         if line.is_empty() {
-            return Some(Request { path, headers });
+            break;
         }
         if let Some((key, value)) = line.split_once(':') {
             headers.push((key.trim().to_ascii_lowercase(), value.trim().to_owned()));
         }
     }
+    let length = headers
+        .iter()
+        .find(|(key, _)| key == "content-length")
+        .and_then(|(_, value)| value.parse().ok())
+        .unwrap_or(0);
+    let mut body = vec![0; length];
+    reader.read_exact(&mut body).await.ok()?;
+    Some(Request {
+        method,
+        path,
+        headers,
+        body: String::from_utf8_lossy(&body).into_owned(),
+    })
 }
 
 async fn spawn_handler<F, Fut>(handle: F) -> String
@@ -106,6 +124,18 @@ fn response(status: &str, headers: &str, body: &[u8]) -> Vec<u8> {
     .into_bytes();
     bytes.extend_from_slice(body);
     bytes
+}
+
+fn html(body: &str) -> Vec<u8> {
+    response(
+        "200 OK",
+        "Content-Type: text/html; charset=utf-8\r\n",
+        body.as_bytes(),
+    )
+}
+
+fn not_found() -> Vec<u8> {
+    response("404 Not Found", "", b"")
 }
 
 fn head_len(response: &[u8]) -> usize {
@@ -276,13 +306,20 @@ async fn downloads_complete_exactly() {
         (ignores_ranges, 4, &body[..]),
         (empty, 4, &[][..]),
     ] {
-        let (row, _dir) = download(format!("{server}/file.bin"), segments).await;
+        let (row, dir) = download(format!("{server}/file.bin"), segments).await;
         assert_eq!(row.status, DownloadStatus::Completed, "{server}");
         assert_eq!(
             std::fs::read(row.file_path()).unwrap(),
             expected,
             "{server}"
         );
+        assert_eq!(row.downloaded, expected.len() as u64, "{server}");
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .filter(|name| name.to_string_lossy().starts_with(".shio-"))
+            .collect();
+        assert!(leftovers.is_empty(), "{server}: {leftovers:?}");
     }
 }
 
@@ -535,4 +572,243 @@ async fn redirects_keep_tokens_private_and_resolve_per_request() {
         "every request starts at the origin"
     );
     assert!(cdn_requests.iter().all(Option::is_none));
+}
+
+fn htmx_page(request: &Request, file: &str) -> Option<Vec<u8>> {
+    match (request.method.as_str(), request.path.as_str()) {
+        ("GET", "/page") if request.header("hx-request").is_none() => Some(response(
+            "403 Forbidden",
+            "cf-mitigated: challenge\r\nContent-Type: text/html; charset=utf-8\r\n",
+            b"<html>just a moment</html>",
+        )),
+        ("GET", "/page") => Some(html(r#"<a class="btn" hx-post="/go">DOWNLOAD</a>"#)),
+        ("POST", "/go") if request.header("hx-request") == Some("true") => {
+            Some(response("200 OK", &format!("HX-Redirect: {file}\r\n"), b""))
+        },
+        _ => None,
+    }
+}
+
+#[tokio::test]
+async fn download_pages_resolve_to_their_file() {
+    let body = payload(BODY_LEN);
+    let htmx = spawn_server({
+        let body = body.clone();
+        move |request| {
+            htmx_page(request, "/file.bin").unwrap_or_else(|| match request.path.as_str() {
+                "/file.bin" => ranged(&body, request),
+                _ => not_found(),
+            })
+        }
+    })
+    .await;
+    let xfs = spawn_server({
+        let body = body.clone();
+        move |request| match (request.method.as_str(), request.path.as_str()) {
+            ("GET", "/page") => response(
+                "200 OK",
+                "Set-Cookie: xfss=1\r\nContent-Type: text/html; charset=utf-8\r\n",
+                br#"<form name="F1" method="POST" action="">
+                    <input type="hidden" name="op" value="download2">
+                    <input type="hidden" name="method_free" value="">
+                    </form><span class="seconds">1</span>"#,
+            ),
+            ("POST", "/page")
+                if request.body.contains("op=download2")
+                    && request.body.contains("method_free=Free+Download")
+                    && request
+                        .header("cookie")
+                        .is_some_and(|c| c.contains("xfss=1")) =>
+            {
+                html(r#"<a href="/cdn/file.bin">file.bin</a>"#)
+            },
+            ("POST", "/page") => response("403 Forbidden", "", b""),
+            (_, "/cdn/file.bin") => ranged(&body, request),
+            _ => not_found(),
+        }
+    })
+    .await;
+    let confirm = spawn_server({
+        let body = body.clone();
+        move |request| match request.path.as_str() {
+            "/page" => html(
+                r#"<form id="download-form" method="get" action="/dl">
+                <input type="hidden" name="confirm" value="t">
+                <input type="submit" value="Download anyway"></form>"#,
+            ),
+            "/dl?confirm=t" => {
+                let mut reply = ranged(&body, request);
+                let head = head_len(&reply) - 2;
+                let disposition = b"Content-Disposition: attachment; filename=\"file.bin\"\r\n";
+                reply.splice(head..head, disposition.iter().copied());
+                reply
+            },
+            _ => not_found(),
+        }
+    })
+    .await;
+
+    for server in [htmx, xfs, confirm] {
+        let (row, _dir) = download(format!("{server}/page#file.bin"), 4).await;
+        assert_eq!(row.status, DownloadStatus::Completed, "{server}");
+        assert_eq!(row.filename, "file.bin", "{server}");
+        assert_eq!(std::fs::read(row.file_path()).unwrap(), body, "{server}");
+    }
+}
+
+#[tokio::test]
+async fn decoy_files_are_never_downloaded() {
+    let ads = spawn_server(|request| match request.path.as_str() {
+        "/landing" => html(
+            r#"<meta http-equiv="refresh" content="0;url=/x.rar">
+            <div class="cf-turnstile" data-sitekey="k"></div>"#,
+        ),
+        "/x.rar" => response(
+            "200 OK",
+            "Content-Disposition: attachment; filename=\"x.rar\"\r\n",
+            b"Rar! decoy",
+        ),
+        _ => not_found(),
+    })
+    .await;
+    // `localhost` is another site than `127.0.0.1`, as an ad network would be.
+    let ads = ads.replace("127.0.0.1", "localhost");
+    let server = spawn_server(move |request| match request.path.as_str() {
+        "/page" => html(
+            r#"<p>Your file</p><a href="/setup.exe">Download</a>
+            <a href="/out?u=1">Download now</a>"#,
+        ),
+        "/setup.exe" => response(
+            "200 OK",
+            "Content-Disposition: attachment; filename=\"setup.exe\"\r\n",
+            b"MZ decoy",
+        ),
+        "/out?u=1" => response("302 Found", &format!("Location: {ads}/landing\r\n"), b""),
+        _ => not_found(),
+    })
+    .await;
+
+    let (row, dir) = download(format!("{server}/page#file.rar"), 1).await;
+
+    assert_eq!(row.status, DownloadStatus::Error);
+    assert_eq!(
+        row.error_message,
+        Some(ShioError::NoFileOnPage.short_label())
+    );
+    assert!(!dir.path().join("file.rar").exists());
+    assert!(!dir.path().join("setup.exe").exists());
+    assert!(!dir.path().join("x.rar").exists());
+}
+
+#[tokio::test]
+async fn captcha_and_password_pages_fail_with_a_clear_reason() {
+    let captcha = spawn_server(|_| {
+        html(
+            r#"<form method="post"><div class="cf-turnstile" data-sitekey="k"></div>
+            <button>Download</button></form>"#,
+        )
+    })
+    .await;
+    let password = spawn_server(|_| {
+        html(
+            r#"<form name="F1" method="POST"><input type="hidden" name="op" value="download2">
+            <input type="password" name="password"></form>
+            <form action="/login"><input type="password" name="pass"></form>"#,
+        )
+    })
+    .await;
+
+    for (server, error) in [
+        (captcha, ShioError::PageNeedsCaptcha),
+        (password, ShioError::PagePasswordProtected),
+    ] {
+        let (row, _dir) = download(format!("{server}/page#file.bin"), 1).await;
+        assert_eq!(row.status, DownloadStatus::Error, "{server}");
+        assert_eq!(row.error_message, Some(error.short_label()), "{server}");
+    }
+}
+
+#[tokio::test]
+async fn mixed_host_part_sets_download_and_extract() {
+    let mut builder = rars::Builder::new(rars::ArchiveVersion::Rar50).store(true);
+    for (name, content) in [("notes.txt", &b"notes"[..]), ("payload.bin", &[7; 900][..])] {
+        builder
+            .add_bytes(name.as_bytes().to_vec(), content.to_vec(), None, None)
+            .unwrap();
+    }
+    let volumes = Arc::new(builder.volume_size(Some(600)).build_volumes(None).unwrap());
+    assert!((2..=9).contains(&volumes.len()), "{}", volumes.len());
+
+    let page_host = spawn_server({
+        let volumes = volumes.clone();
+        move |request| {
+            htmx_page(request, "/v1.rar").unwrap_or_else(|| match request.path.as_str() {
+                "/v1.rar" => ranged(&volumes[0], request),
+                _ => not_found(),
+            })
+        }
+    })
+    .await;
+    let direct_host = spawn_server({
+        let volumes = volumes.clone();
+        move |request| {
+            let part = request
+                .path
+                .strip_prefix("/p")
+                .and_then(|path| path.strip_suffix(".rar"))
+                .and_then(|number| number.parse::<usize>().ok());
+            match part.and_then(|number| volumes.get(number - 1)) {
+                Some(volume) => ranged(volume, request),
+                None => not_found(),
+            }
+        }
+    })
+    .await;
+
+    let dir = TempDir::new().unwrap();
+    let mut engine = Engine::start(dir.path());
+    let parts = (1..=volumes.len() as u32)
+        .map(|number| {
+            let name = format!("Some_Game_--_uploader.example_--_.part{number}.rar");
+            let url = if number == 1 {
+                format!("{page_host}/page#{name}")
+            } else {
+                format!("{direct_host}/p{number}.rar")
+            };
+            HttpArchivePartRequest::new(url, name, number, 1).unwrap()
+        })
+        .collect();
+    let request =
+        HttpArchiveSetRequest::new("Some Game".into(), dir.path().to_owned(), parts, true).unwrap();
+    let package = request.id();
+    engine
+        .command(|reply| EngineCommand::AddHttpArchiveSet { request, reply })
+        .await;
+
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let (ProgressEvent::Changed { packages, .. } | ProgressEvent::Resync { packages, .. }) =
+                engine.progress.recv().await.expect("engine running")
+            else {
+                continue;
+            };
+            if let Some(state) = packages
+                .iter()
+                .find(|candidate| candidate.id == package)
+                .map(|package| package.extract_state)
+            {
+                assert_ne!(state, PackageExtractState::Error);
+                if state == PackageExtractState::Completed {
+                    return;
+                }
+            }
+        }
+    })
+    .await
+    .expect("the set downloaded and extracted");
+
+    assert_eq!(
+        std::fs::read(dir.path().join("Some Game/Some Game/notes.txt")).unwrap(),
+        b"notes"
+    );
 }

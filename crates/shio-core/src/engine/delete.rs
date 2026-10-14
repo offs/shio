@@ -100,10 +100,14 @@ fn is_generated_folder(download: &Download, files: &[TorrentFile]) -> bool {
             Some(name)
         },
     };
-    let name = name.map(|name| crate::filename::sanitize_filename(&name));
     name.is_some_and(|name| {
-        !name.is_empty()
-            && download.save_path.file_name().and_then(|dir| dir.to_str()) == Some(name.as_str())
+        let dir = download.save_path.file_name().and_then(|dir| dir.to_str());
+        [
+            crate::filename::sanitize_filename(&name),
+            crate::filename::release_name(&name),
+        ]
+        .iter()
+        .any(|name| !name.is_empty() && dir == Some(name.as_str()))
     })
 }
 
@@ -407,5 +411,44 @@ mod tests {
 
         assert!(result.is_err());
         assert_eq!(std::fs::read(outside.join("payload.bin")).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn only_the_dialog_named_folder_counts_as_generated() {
+        let file = |path: &str| TorrentFile {
+            path: path.into(),
+            size: 1,
+            selected: true,
+        };
+        for (folder, files, generated) in [
+            (
+                "Some Game",
+                vec![file("Some_Game_--_uploader.example_--_.iso")],
+                true,
+            ),
+            (
+                "Some_Game_--_uploader.example_--_",
+                vec![file("Some_Game_--_uploader.example_--_.iso")],
+                true,
+            ),
+            (
+                "Downloads",
+                vec![file("Some_Game_--_uploader.example_--_.iso")],
+                false,
+            ),
+            ("Show", vec![file("Show/a.mkv"), file("Show/b.mkv")], true),
+            ("Other", vec![file("Show/a.mkv"), file("Show/b.mkv")], false),
+        ] {
+            let mut download = Download::new(
+                "https://example.com/x.torrent".into(),
+                std::path::PathBuf::from("/data").join(folder),
+            );
+            download.filename = "x".into();
+            assert_eq!(
+                is_generated_folder(&download, &files),
+                generated,
+                "{folder}"
+            );
+        }
     }
 }

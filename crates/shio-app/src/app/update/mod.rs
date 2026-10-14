@@ -128,9 +128,7 @@ impl Shio {
             Message::MagnetPreviewed(result) => {
                 self.edit_add(|dialog| dialog.apply_magnet_preview(result))
             },
-            Message::HttpPreviewed(result) => {
-                self.edit_add(|dialog| dialog.apply_http_preview(result))
-            },
+            Message::HttpPreviewed(result) => self.http_previewed(result),
             Message::ClipboardBaseline(text) => {
                 self.note_clipboard(text.as_deref());
                 Task::none()
