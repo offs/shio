@@ -5164,7 +5164,7 @@ dependencies = [
 
 [[package]]
 name = "shio-app"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "bytesize",
  "iced",
@@ -5194,7 +5194,7 @@ dependencies = [
 
 [[package]]
 name = "shio-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "chrono",
  "directories",

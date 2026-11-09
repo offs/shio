@@ -9,7 +9,7 @@
   </developer>
   <summary>Download manager for links, torrents, and archives</summary>
   <description>
-    <p>Shio is a small desktop download manager for direct links, magnet links, and torrent files.</p>
+    <p>Shio is a small desktop download manager for direct links, file host links, magnet links, and torrent files.</p>
     <p>Downloads are split into segments, survive restarts, and can be speed limited. Finished archives, including multi-part zip, 7z, tar, and rar sets, are unpacked automatically.</p>
     <p>It also offers seeding rules, a tray icon, notifications, opt-in clipboard link detection, and custom themes.</p>
   </description>
@@ -36,6 +36,12 @@
     <mediatype>x-scheme-handler/magnet</mediatype>
   </provides>
   <releases>
+    <release version="0.3.0" date="2026-11-10">
+      <description>
+        <p>Adds file host links, including pixeldrain and gofile, and multi-part sets mixed across hosts.</p>
+        <p>Fixes many download, torrent, extraction, and add dialog bugs, and updates dependencies with security fixes.</p>
+      </description>
+    </release>
     <release version="0.2.0" date="2026-10-13">
       <description>
         <p>First public release.</p>

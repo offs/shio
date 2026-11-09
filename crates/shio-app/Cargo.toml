@@ -14,7 +14,7 @@ name = "shio"
 path = "src/main.rs"
 
 [dependencies]
-shio-core = { path = "../shio-core", version = "0.2.0" }
+shio-core = { path = "../shio-core", version = "0.3.0" }
 iced = { workspace = true, features = [
     "wgpu",
     "tiny-skia",
