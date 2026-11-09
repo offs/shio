@@ -30,7 +30,6 @@ pub(crate) fn build_client(config: &AppConfig) -> Result<reqwest::Client> {
         .redirect(reqwest::redirect::Policy::limited(10))
         .referer(false)
         .connect_timeout(Duration::from_secs(30))
-        .read_timeout(Duration::from_secs(30))
         .pool_idle_timeout(Duration::from_secs(90))
         .default_headers(reqwest::header::HeaderMap::from_iter([(
             reqwest::header::ACCEPT_ENCODING,
@@ -96,19 +95,35 @@ pub(crate) async fn run(download: Download, probe: HttpProbe, job: HttpJob) -> R
         Some(size) => size,
         None => download_payload(&download, http, &probe, &job).await?,
     };
-    if http.auto_extract {
-        auto_extract(&download, size, &job).await
+    after_publish(&download, size, &job).await
+}
+
+pub(crate) async fn after_publish(download: &Download, size: u64, job: &HttpJob) -> Result<()> {
+    if download.http().is_some_and(|http| http.auto_extract) {
+        auto_extract(download, size, job).await
     } else {
         Ok(())
     }
 }
 
-/// `Some(size)` when an earlier run already published the payload.
-fn prepare_destination(download: &Download) -> Result<Option<u64>> {
+/// `Some(size)` when an earlier run already published the payload; creates nothing for a
+/// download that was never staged.
+pub(crate) fn recover_published(download: &Download) -> Result<Option<u64>> {
+    if !is_real_dir(&http_staging_root(download)) {
+        return Ok(None);
+    }
+    recover(download)
+}
+
+fn recover(download: &Download) -> Result<Option<u64>> {
     ensure_output_directory(download)?;
     ensure_owned_staging(download)?;
+    recover_publication(&Staging::of(download), &download.file_path())
+}
+
+fn prepare_destination(download: &Download) -> Result<Option<u64>> {
+    let published = recover(download)?;
     let destination = download.file_path();
-    let published = recover_publication(&Staging::of(download), &destination)?;
     if published.is_none() && std::fs::symlink_metadata(&destination).is_ok() {
         return Err(ShioError::DestinationExists(destination));
     }
@@ -273,6 +288,17 @@ async fn download_payload(
             actual: size,
         });
     }
+    let _ = job
+        .progress_tx
+        .send(DownloadProgress {
+            id: download.id,
+            status: DownloadStatus::Downloading,
+            downloaded: size,
+            total_size: Some(size),
+            speed: 0,
+            torrent: None,
+        })
+        .await;
     let destination = download.file_path();
     blocking(move || publish(&staging, &destination, identity, &transfer.file, size)).await?;
     Ok(size)
@@ -398,8 +424,9 @@ async fn checkpoint(id: DownloadId, transfer: Arc<Transfer>, db: Arc<Database>) 
 async fn auto_extract(download: &Download, size: u64, job: &HttpJob) -> Result<()> {
     match extraction_readiness(download).await {
         None => Ok(()),
-        Some(Readiness::PasswordRequired) => Err(ShioError::PasswordRequired),
+        Some(Readiness::Incomplete) if is_volume(&download.filename) => Ok(()),
         Some(Readiness::Incomplete) => Err(ShioError::Extract("archive set is incomplete".into())),
+        Some(Readiness::PasswordRequired) => Err(ShioError::PasswordRequired),
         Some(Readiness::Ready) => {
             let _ = job
                 .progress_tx
@@ -422,6 +449,11 @@ async fn auto_extract(download: &Download, size: u64, job: &HttpJob) -> Result<(
             .await
         },
     }
+}
+
+fn is_volume(filename: &str) -> bool {
+    crate::filename::rar_part(filename).is_some()
+        || crate::filename::sevenz_volume(filename).is_some()
 }
 
 pub(crate) async fn blocking<T: Send + 'static>(

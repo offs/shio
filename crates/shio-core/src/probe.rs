@@ -12,6 +12,8 @@ const MAX_RETRIES: u32 = 30;
 const MAX_RETRY_DELAY: Duration = Duration::from_mins(1);
 const PROBE_BODY_TIMEOUT: Duration = Duration::from_secs(1);
 const MAX_LANDING_PAGE_BYTES: u64 = 64 * 1024 * 1024;
+/// Bounds the wait for response headers and for each body read, never a speed-limiter wait.
+pub(crate) const READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub(crate) struct HttpProbe {
     pub(crate) content_length: Option<u64>,
@@ -84,9 +86,12 @@ pub(crate) async fn probe(
     let request = client
         .get(crate::worker::url_without_fragment(url))
         .header(header::RANGE, "bytes=0-1");
-    let response = apply_custom_headers(request, custom_headers)?
-        .send()
-        .await?;
+    let response = tokio::time::timeout(
+        READ_TIMEOUT,
+        apply_custom_headers(request, custom_headers)?.send(),
+    )
+    .await
+    .map_err(|_| ShioError::TimedOut)??;
     let status = response.status();
     let headers = response.headers();
     let empty = status == StatusCode::RANGE_NOT_SATISFIABLE
@@ -109,7 +114,11 @@ pub(crate) async fn probe(
     } else {
         header_str(headers, header::CONTENT_LENGTH).and_then(|length| length.parse().ok())
     };
-    let content_type = content_type_essence(headers);
+    let content_type = if empty {
+        None
+    } else {
+        content_type_essence(headers)
+    };
     let disposition =
         header_str(headers, header::CONTENT_DISPOSITION).map(parse_content_disposition);
     let attachment = disposition.as_ref().is_some_and(|d| d.attachment);
@@ -153,7 +162,7 @@ pub(crate) fn reject_encoded_body(headers: &HeaderMap) -> Result<()> {
 
 pub(crate) const fn is_transient(error: &ShioError) -> bool {
     match error {
-        ShioError::Network(_) | ShioError::SizeMismatch { .. } => true,
+        ShioError::Network(_) | ShioError::TimedOut | ShioError::SizeMismatch { .. } => true,
         ShioError::Http { code, .. } => matches!(code, 408 | 429 | 500..=599),
         _ => false,
     }
@@ -310,7 +319,7 @@ pub(crate) mod tests {
         assert_eq!(ignored.validator, None);
 
         let empty = probe_response(
-            "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */0\r\nContent-Length: 0\r\n\r\n",
+            "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */0\r\nContent-Type: text/html\r\nContent-Length: 7\r\n\r\n<html/>",
         )
         .await
         .expect("empty file probe");

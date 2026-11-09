@@ -6,6 +6,9 @@ pub enum ShioError {
     #[error("network: {0}")]
     Network(#[from] reqwest::Error),
 
+    #[error("connection timed out")]
+    TimedOut,
+
     #[error("HTTP {code}")]
     Http {
         code: u16,
@@ -120,6 +123,7 @@ impl ShioError {
             Self::DestinationExists(_) => "destination already exists".into(),
             Self::NotADirectFile { .. } => "not a direct file link".into(),
             Self::SizeMismatch { .. } => "incomplete download".into(),
+            Self::TimedOut => "connection timed out".into(),
             Self::Cancelled => "cancelled".into(),
             Self::PasswordRequired => "password required".into(),
             Self::BrowserCheck => "blocked by a bot check".into(),
