@@ -228,6 +228,7 @@ fn source_line<'a>(
 
 fn link_item<'a>(link: &'a Link, p: &Palette) -> Element<'a, Message> {
     let (detail, color): (Cow<'_, str>, _) = match &link.state {
+        _ if link.mirror => ("mirror · skipped".into(), p.text_tertiary),
         LinkState::Unchecked => (Cow::Borrowed(""), p.text_tertiary),
         LinkState::Resolving => ("checking…".into(), p.text_tertiary),
         LinkState::Ready { size: Some(size) } => {

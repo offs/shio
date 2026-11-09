@@ -18,7 +18,7 @@ use tokio::sync::{Semaphore, mpsc, watch};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 
-const USER_AGENT: &str = concat!("Shio/", env!("CARGO_PKG_VERSION"));
+pub(crate) const USER_AGENT: &str = concat!("Shio/", env!("CARGO_PKG_VERSION"));
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
 const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(10);
 const SPEED_WINDOW: Duration = Duration::from_secs(3);

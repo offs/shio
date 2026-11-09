@@ -90,7 +90,7 @@ impl Engine {
 
 async fn resolve(head: String, path: &str) -> HttpPreviewState {
     let (listener, base) = listen().await;
-    let server = tokio::spawn(async move { answer(&listener, &head).await });
+    let server = tokio::spawn(async move { while answer(&listener, &head).await.is_ok() {} });
     let engine = Engine::start();
     let mut results = engine.preview(7, format!("{base}{path}")).await;
 
@@ -99,7 +99,7 @@ async fn resolve(head: String, path: &str) -> HttpPreviewState {
         .unwrap()
         .unwrap();
     engine.shutdown().await;
-    server.await.unwrap().unwrap();
+    server.abort();
     assert_eq!(result.request_id, 7);
     result.state
 }
@@ -123,6 +123,10 @@ async fn preview_names_files_from_fragments_then_content_disposition() {
         ready("release.part01.rar")
     );
     assert_eq!(
+        resolve(FILE_RESPONSE.into(), "/opaque-id?file=a+b.mkv#a%20b.mkv").await,
+        ready("a b.mkv")
+    );
+    assert_eq!(
         resolve(with_disposition, "/downloads/ignored.dat").await,
         ready("server.bin")
     );
@@ -136,9 +140,11 @@ async fn preview_blocks_html_landing_pages() {
     )
     .await;
 
-    assert!(
-        matches!(state, HttpPreviewState::Blocked { .. }),
-        "{state:?}"
+    assert_eq!(
+        state,
+        HttpPreviewState::Blocked {
+            reason: shio_core::ShioError::NoFileOnPage.short_label()
+        }
     );
 }
 
@@ -146,7 +152,7 @@ async fn preview_blocks_html_landing_pages() {
 async fn preview_results_never_expose_redirect_tokens() {
     let (listener, base) = listen().await;
     let redirect = format!(
-        "HTTP/1.1 302 Found\r\nLocation: {base}/cdn/file.bin?token=secret-preview-token\r\nContent-Length: 2\r\n"
+        "HTTP/1.1 302 Found\r\nLocation: {base}/cdn/file.bin?token=secret-preview-token\r\nConnection: close\r\nContent-Length: 2\r\n"
     );
     let server = tokio::spawn(async move {
         answer(&listener, &redirect).await?;
@@ -160,7 +166,11 @@ async fn preview_results_never_expose_redirect_tokens() {
         .unwrap()
         .unwrap();
     engine.shutdown().await;
-    server.await.unwrap().unwrap();
+    tokio::time::timeout(Duration::from_secs(2), server)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
 
     assert!(!format!("{result:?}").contains("secret-preview-token"));
 }

@@ -30,6 +30,7 @@ use crate::worker::blocking;
 pub use self::command::EngineCommand;
 pub(crate) use self::job::{ActiveSlot, MetadataCommit};
 use self::job::{Slots, run_http, run_torrent};
+pub(crate) use self::request::validate_http_url;
 pub use self::request::{
     HttpArchivePartRequest, HttpArchiveSetRequest, HttpDownloadRequest, TorrentDownloadRequest,
 };

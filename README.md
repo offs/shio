@@ -31,6 +31,8 @@ builds aren't signed yet, so smartscreen and gatekeeper will warn once.
 ## features
 
 - direct links, magnet links, and .torrent files
+- file host links, including pixeldrain and gofile; captcha-gated hosts aren't supported
+- multi-part sets mixed across hosts, with duplicate mirror links skipped
 - segmented downloads that survive restarts, with speed limits
 - unpacks zip, 7z, tar, and rar, including multi-part sets
 - seeding rules, tray, notifications, and opt-in clipboard detection

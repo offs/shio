@@ -4,7 +4,9 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use super::{DownloadEngine, Internal};
-use crate::error::ShioError;
+use crate::error::{Result, ShioError};
+use crate::probe::HttpProbe;
+use crate::resolve::Target;
 use crate::types::{HttpPreview, HttpPreviewResult, HttpPreviewState, MagnetPreviewResult};
 
 const HTTP_PREVIEW_TIMEOUT: Duration = Duration::from_secs(30);
@@ -25,23 +27,29 @@ impl DownloadEngine {
         let client = self.http.clone();
         let loop_tx = self.ctx.loop_tx.clone();
         self.tasks.spawn(async move {
-            let probe = tokio::time::timeout(
-                HTTP_PREVIEW_TIMEOUT,
-                crate::probe::probe(&client, &url, &[]),
-            );
+            let preview = tokio::time::timeout(HTTP_PREVIEW_TIMEOUT, preview(&client, &url));
             let state = tokio::select! {
                 () = cancel.cancelled() => None,
-                probe = probe => Some(match probe {
-                    Ok(Ok(probe)) => HttpPreviewState::Ready(HttpPreview {
-                        filename: fragment_filename(&url)
+                preview = preview => Some(match preview {
+                    Ok(Ok(Preview::File(probe))) => HttpPreviewState::Ready(HttpPreview {
+                        filename: url::Url::parse(&url)
+                            .ok()
+                            .and_then(|url| crate::filename::fragment_name(&url))
                             .or_else(|| probe.filename().map(str::to_owned))
                             .unwrap_or_else(|| crate::filename::extract_filename(&url)),
                         total_size: probe.content_length,
                         content_type: probe.content_type,
                         accept_ranges: probe.accept_ranges,
                     }),
-                    Ok(Err(ShioError::NotADirectFile { .. })) => HttpPreviewState::Blocked {
-                        reason: "not a direct file link".into(),
+                    Ok(Ok(Preview::Folder(files))) => HttpPreviewState::Folder { files },
+                    Ok(Err(
+                        error @ (ShioError::BrowserCheck
+                        | ShioError::PageNeedsCaptcha
+                        | ShioError::PagePasswordProtected
+                        | ShioError::NoFileOnPage
+                        | ShioError::NotADirectFile { .. }),
+                    )) => HttpPreviewState::Blocked {
+                        reason: error.short_label(),
                     },
                     Ok(Err(error)) => HttpPreviewState::Error {
                         message: error.short_label(),
@@ -116,8 +124,21 @@ impl DownloadEngine {
     }
 }
 
-fn fragment_filename(url: &str) -> Option<String> {
-    let url = url::Url::parse(url).ok()?;
-    let fragment = url.fragment()?.trim();
-    (!fragment.is_empty()).then(|| crate::filename::sanitize_filename(fragment))
+enum Preview {
+    File(HttpProbe),
+    Folder(Vec<String>),
+}
+
+async fn preview(client: &reqwest::Client, url: &str) -> Result<Preview> {
+    match crate::probe::probe(client, url, &[]).await {
+        Err(ShioError::NotADirectFile { .. } | ShioError::BrowserCheck) => {
+            match crate::resolve::resolve(client, url).await? {
+                Target::File(page) => crate::probe::probe(client, &page.url, &page.headers)
+                    .await
+                    .map(Preview::File),
+                Target::Folder(files) => Ok(Preview::Folder(files)),
+            }
+        },
+        result => result.map(Preview::File),
+    }
 }
