@@ -11,8 +11,10 @@ version = 2
 ignore = [
     { id = "RUSTSEC-2024-0436", reason = "review 2027-01-15: unmaintained paste behind iced's wgpu Metal backend" },
     { id = "RUSTSEC-2026-0192", reason = "review 2027-01-15: unmaintained ttf-parser behind iced; parses bundled and system fonts only" },
-    { id = "RUSTSEC-2026-0253", reason = "review 2027-01-15: lru 0.16 via iced's cryoglyph; its keys have no panicking Drop" },
     { id = "RUSTSEC-2026-0293", reason = "review 2027-01-15: ringbuf 0.4 via librqbit-utp holds u8, whose Drop cannot panic" },
+    { id = "RUSTSEC-2026-0370", reason = "review 2027-01-15: zvariant split crate of zbus 5, still required by ksni and notify-rust" },
+    { id = "RUSTSEC-2026-0371", reason = "review 2027-01-15: zbus_names split crate of zbus 5, still required by ksni and notify-rust" },
+    { id = "RUSTSEC-2026-0372", reason = "review 2027-01-15: zvariant_derive split crate of zbus 5, still required by ksni and notify-rust" },
 ]
 
 [licenses]
