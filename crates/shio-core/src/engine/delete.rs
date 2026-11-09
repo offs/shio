@@ -326,14 +326,11 @@ fn ensure_real_parents(root: &Path, target: &Path) -> Result<()> {
         .strip_prefix(root)
         .map_err(|_| ShioError::Other("refusing to delete outside the save path".into()))?;
     let mut current = root.to_path_buf();
-    let parents = relative.parent().into_iter().flat_map(Path::components);
-    for component in std::iter::once(None).chain(parents.map(Some)) {
-        if let Some(component) = component {
-            let Component::Normal(component) = component else {
-                return Err(ShioError::Other("unsafe delete path".into()));
-            };
-            current.push(component);
-        }
+    for component in relative.parent().into_iter().flat_map(Path::components) {
+        let Component::Normal(component) = component else {
+            return Err(ShioError::Other("unsafe delete path".into()));
+        };
+        current.push(component);
         match std::fs::symlink_metadata(&current) {
             Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {},
             Ok(_) => {
@@ -385,13 +382,16 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn quarantine_refuses_symlinked_parents() {
+    fn quarantine_follows_a_symlinked_root_but_refuses_symlinked_parents() {
         let tmp = tempfile::tempdir().unwrap();
         let outside = tmp.path().join("outside");
         std::fs::create_dir(&outside).unwrap();
         std::fs::write(outside.join("payload.bin"), b"keep").unwrap();
+        let data = tmp.path().join("data");
+        std::fs::create_dir(&data).unwrap();
+        std::fs::write(data.join("own.bin"), b"published").unwrap();
         let root = tmp.path().join("root");
-        std::fs::create_dir(&root).unwrap();
+        std::os::unix::fs::symlink(&data, &root).unwrap();
         std::os::unix::fs::symlink(&outside, root.join("sub")).unwrap();
         let db = Database::in_memory().unwrap();
 
@@ -404,8 +404,21 @@ mod tests {
                 dirs: vec![root.join("sub")],
             }],
         );
-
         assert!(result.is_err());
         assert_eq!(std::fs::read(outside.join("payload.bin")).unwrap(), b"keep");
+
+        let quarantines = quarantine(
+            &db,
+            &[Targets {
+                owner: DownloadId::new(),
+                root: root.clone(),
+                files: vec![root.join("own.bin")],
+                dirs: Vec::new(),
+            }],
+        )
+        .unwrap();
+        commit(&db, quarantines);
+        assert!(!data.join("own.bin").exists());
+        assert!(db.delete_journals().unwrap().is_empty());
     }
 }

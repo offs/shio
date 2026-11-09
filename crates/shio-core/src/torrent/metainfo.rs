@@ -117,7 +117,7 @@ fn bencode_depth_within_limit(bytes: &[u8]) -> bool {
     let mut depth = 0_usize;
     let mut at = 0;
     while let Some(&byte) = bytes.get(at) {
-        at += match byte {
+        at = at.saturating_add(match byte {
             b'd' | b'l' => {
                 depth += 1;
                 if depth > MAX_BENCODE_DEPTH {
@@ -145,7 +145,7 @@ fn bencode_depth_within_limit(bytes: &[u8]) -> bool {
                 };
                 (colon + 1).saturating_add(len)
             },
-        };
+        });
     }
     true
 }
@@ -442,6 +442,7 @@ pub(super) mod tests {
         let mut deep = b"d4:infod1:x".to_vec();
         deep.extend(std::iter::repeat_n(b'l', 1_000_000));
         assert!(parse_torrent(&deep).is_err());
+        assert!(parse_torrent(b"de18446744073709551615:").is_err());
         assert!(parse_torrent(&[0_u8; 16]).is_err());
         assert!(parse_magnet_info_hash("not a magnet").is_err());
     }

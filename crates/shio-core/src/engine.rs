@@ -110,6 +110,19 @@ impl Rows {
             .values()
             .find(|package| package.child_ids().any(|id| id == child))
     }
+
+    fn package_ready_to_extract(&self, package: &ArchivePackage) -> bool {
+        package.auto_extract
+            && !matches!(
+                package.extract_state,
+                PackageExtractState::Extracting | PackageExtractState::Completed
+            )
+            && package.child_ids().all(|child| {
+                self.downloads
+                    .get(&child)
+                    .is_some_and(|d| d.status == DownloadStatus::Completed)
+            })
+    }
 }
 
 impl Shared {
@@ -346,6 +359,7 @@ impl DownloadEngine {
     }
 
     pub async fn run(mut self) {
+        self.start_pending_package_extracts();
         let reply = loop {
             self.start_queued();
             while self.tasks.try_join_next().is_some() {}
@@ -808,25 +822,18 @@ impl DownloadEngine {
                 .get(&id)
                 .cloned()
                 .ok_or_else(|| ShioError::Other("package not found".into()))?;
+            if !rows.package_ready_to_extract(&package) || self.workers.contains_key(&id.row_id()) {
+                return Err(ShioError::Other(
+                    "package is not ready for extraction".into(),
+                ));
+            }
             let parts: Vec<Download> = package
                 .child_ids()
                 .filter_map(|child| rows.downloads.get(&child))
-                .filter(|d| d.status == DownloadStatus::Completed)
                 .cloned()
                 .collect();
             (package, parts)
         };
-        let ready = package.auto_extract
-            && parts.len() == package.items.len()
-            && !matches!(
-                package.extract_state,
-                PackageExtractState::Extracting | PackageExtractState::Completed
-            );
-        if !ready || self.workers.contains_key(&id.row_id()) {
-            return Err(ShioError::Other(
-                "package is not ready for extraction".into(),
-            ));
-        }
         package.extract_state = PackageExtractState::Extracting;
         package.error_message = None;
         self.commit_package(package)?;
@@ -837,6 +844,27 @@ impl DownloadEngine {
             crate::worker::run_extract(&parts, &config, password, token).await
         });
         Ok(())
+    }
+
+    // `finish` skips the start while shutting down, so a set whose last part completed then
+    // starts here.
+    fn start_pending_package_extracts(&mut self) {
+        let pending: Vec<PackageId> = {
+            let rows = self.ctx.shared.rows.read();
+            rows.packages
+                .values()
+                .filter(|package| {
+                    package.extract_state == PackageExtractState::NotStarted
+                        && rows.package_ready_to_extract(package)
+                })
+                .map(|package| package.id)
+                .collect()
+        };
+        for package in pending {
+            if let Err(error) = self.start_package_extract(package, None) {
+                tracing::warn!(%package, "package extraction not started: {error}");
+            }
+        }
     }
 
     async fn remove(&mut self, id: DownloadId, delete_files: bool) -> Result<()> {
@@ -920,7 +948,15 @@ impl DownloadEngine {
     }
 
     async fn force_recheck(&mut self, id: DownloadId) -> Result<()> {
-        let row = self.snapshot(id)?;
+        let row = self
+            .ctx
+            .shared
+            .rows
+            .read()
+            .downloads
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| ShioError::Other("download not found".into()))?;
         if !row.kind.is_torrent()
             || !matches!(
                 row.status,
@@ -974,9 +1010,8 @@ impl DownloadEngine {
     }
 
     async fn stop_torrent_session(&self, download: &Download) {
-        if let (Some(session), Some(torrent)) = (self.ctx.shared.session.get(), download.torrent())
-            && let Err(error) =
-                crate::torrent::stop_torrent_in_session(session, torrent.info_hash).await
+        if let Some(session) = self.ctx.shared.session.get()
+            && let Err(error) = crate::torrent::stop_torrent_in_session(session, download).await
         {
             tracing::warn!(download = %download.id, "failed to remove torrent from session: {error}");
         }
@@ -984,14 +1019,11 @@ impl DownloadEngine {
 
     // Without an open session there is nothing to do: the next open keeps only owned rows.
     fn forget_torrent(&mut self, download: Download, cleanup_staging: bool) {
-        let (Some(session), Some(info_hash)) = (
-            self.ctx.shared.session.get().cloned(),
-            download.torrent().map(|torrent| torrent.info_hash),
-        ) else {
+        let Some(session) = self.ctx.shared.session.get().cloned() else {
             return;
         };
         self.tasks.spawn(async move {
-            if let Err(error) = crate::torrent::stop_torrent_in_session(&session, info_hash).await {
+            if let Err(error) = crate::torrent::stop_torrent_in_session(&session, &download).await {
                 tracing::warn!(download = %download.id, "failed to remove torrent from session: {error}");
             } else if cleanup_staging
                 && let Err(error) = crate::torrent::cleanup_staging(&download).await
@@ -1120,17 +1152,16 @@ impl DownloadEngine {
         self.apply(std::slice::from_ref(&row));
         self.ctx.shared.refresh_speed_limits();
         if row.status == DownloadStatus::Completed && !self.shutdown.is_cancelled() {
-            let package = self
-                .ctx
-                .shared
-                .rows
-                .read()
-                .package_containing(id)
-                .map(|package| package.id);
+            let package = {
+                let rows = self.ctx.shared.rows.read();
+                rows.package_containing(id)
+                    .filter(|package| rows.package_ready_to_extract(package))
+                    .map(|package| package.id)
+            };
             if let Some(package) = package
                 && let Err(error) = self.start_package_extract(package, None)
             {
-                tracing::debug!(%package, "package extraction not started: {error}");
+                tracing::warn!(%package, "package extraction not started: {error}");
             }
         }
         if cancelled
@@ -1291,13 +1322,13 @@ fn exit_status(
     };
     if cancelled {
         return match current {
-            status if shutdown && job == Job::Download && status.is_active() => {
-                Some((DownloadStatus::Queued, None))
-            },
             DownloadStatus::Extracting => Some((
                 DownloadStatus::ExtractError,
                 Some("extraction cancelled".into()),
             )),
+            status if shutdown && job == Job::Download && status.is_active() => {
+                Some((DownloadStatus::Queued, None))
+            },
             status if status.is_active() => Some((DownloadStatus::Cancelled, None)),
             _ => None,
         };
@@ -1471,7 +1502,14 @@ mod tests {
             (Completed, &cancelled, true, false, None),
             (Downloading, &failed, true, false, Some((Cancelled, None))),
             (Seeding, &cancelled, true, true, Some((Queued, None))),
-            (Extracting, &cancelled, true, false, cancelled_extract),
+            (
+                Extracting,
+                &cancelled,
+                true,
+                false,
+                cancelled_extract.clone(),
+            ),
+            (Extracting, &cancelled, true, true, cancelled_extract),
             (
                 Downloading,
                 &failed,
@@ -1593,6 +1631,74 @@ mod tests {
             events.resubscribe().recv().await,
             Some(ProgressEvent::Resync { .. })
         ));
+    }
+
+    fn restored(dir: &Path, db: Database) -> DownloadEngine {
+        DownloadEngine::with_database(AppConfig::default(), dir.to_path_buf(), db)
+            .unwrap()
+            .0
+    }
+
+    #[tokio::test]
+    async fn rechecking_a_completed_torrent_rebuilds_its_staging() {
+        let dir = tempfile::tempdir().unwrap();
+        let save = dir.path().join("downloads");
+        std::fs::create_dir(&save).unwrap();
+        std::fs::write(save.join("a.bin"), b"hello").unwrap();
+        let bytes = b"d4:infod6:lengthi5e4:name5:a.bin12:piece lengthi16384e6:pieces20:aaaaaaaaaaaaaaaaaaaaee".to_vec();
+        let manifest = crate::torrent::parse_torrent_manifest(&bytes).unwrap();
+        let mut state = TorrentState::new(TorrentSource::File(bytes), manifest.info_hash);
+        state.files = manifest.files;
+        let mut download = Download::with_kind(manifest.name, save, DownloadKind::Torrent(state));
+        download.status = DownloadStatus::Completed;
+        let db = Database::in_memory().unwrap();
+        db.insert_download(&download).unwrap();
+        let mut engine = restored(dir.path(), db);
+
+        engine.force_recheck(download.id).await.unwrap();
+
+        assert_eq!(
+            engine.snapshot(download.id).unwrap().status,
+            DownloadStatus::Queued
+        );
+        let staged = crate::torrent::staging_root(&download).join("payload/a.bin");
+        assert_eq!(std::fs::read(staged).unwrap(), b"hello");
+    }
+
+    #[tokio::test]
+    async fn restart_starts_extracting_a_completed_archive_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let part = |number: u32| {
+            HttpArchivePartRequest::new(
+                format!("https://example.com/set.part{number}.rar"),
+                format!("set.part{number}.rar"),
+                number,
+                1,
+            )
+            .unwrap()
+        };
+        let request = HttpArchiveSetRequest::new(
+            "set".into(),
+            dir.path().to_path_buf(),
+            vec![part(1), part(2)],
+            true,
+        )
+        .unwrap();
+        let (package, mut downloads) = request.into_rows(&AppConfig::default()).unwrap();
+        for download in &mut downloads {
+            download.status = DownloadStatus::Completed;
+        }
+        let db = Database::in_memory().unwrap();
+        db.insert_package(&package, &downloads).unwrap();
+        let mut engine = restored(dir.path(), db);
+
+        engine.start_pending_package_extracts();
+
+        assert_eq!(
+            engine.ctx.db.packages().unwrap()[0].extract_state,
+            PackageExtractState::Extracting
+        );
+        assert!(engine.workers.contains_key(&package.id.row_id()));
     }
 
     #[cfg(unix)]
