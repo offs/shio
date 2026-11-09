@@ -2,9 +2,7 @@ use super::super::notification::notify;
 use super::super::state::{Overlay, Shio, ToastKind};
 use crate::message::{Message, NoticeId};
 use iced::Task;
-use shio_core::{
-    ArchivePackage, DownloadId, DownloadKind, DownloadStatus, PackageExtractState, ProgressEvent,
-};
+use shio_core::{DownloadId, DownloadKind, DownloadStatus, PackageExtractState, ProgressEvent};
 
 struct Transition {
     id: DownloadId,
@@ -17,9 +15,16 @@ struct Transition {
 impl Shio {
     pub(super) fn apply_engine_events(&mut self, events: Vec<ProgressEvent>) -> Task<Message> {
         let mut transitions = Vec::new();
+        let packages: Vec<(DownloadId, DownloadStatus)> = self
+            .packages
+            .iter()
+            .map(|package| package.id.row_id())
+            .zip(self.package_statuses())
+            .collect();
         for event in events {
             self.apply_engine_event(event, &mut transitions);
         }
+        self.note_packages(&packages, &mut transitions);
         self.refresh();
         Task::batch(
             transitions
@@ -63,10 +68,7 @@ impl Shio {
                 }
                 for package in packages {
                     match self.packages.iter_mut().find(|p| p.id == package.id) {
-                        Some(existing) => {
-                            let from = std::mem::replace(existing, package);
-                            self.note_package(&from, transitions);
-                        },
+                        Some(existing) => *existing = package,
                         None => self.packages.push(package),
                     }
                 }
@@ -83,12 +85,9 @@ impl Shio {
                 packages,
             } => {
                 let previous_downloads = std::mem::replace(&mut self.downloads, downloads);
-                let previous_packages = std::mem::replace(&mut self.packages, packages);
+                self.packages = packages;
                 for previous in &previous_downloads {
                     self.note_download(previous.id, previous.status, transitions);
-                }
-                for previous in &previous_packages {
-                    self.note_package(previous, transitions);
                 }
             },
         }
@@ -121,21 +120,29 @@ impl Shio {
         });
     }
 
-    fn note_package(&self, previous: &ArchivePackage, transitions: &mut Vec<Transition>) {
-        let Some(package) = self.packages.iter().find(|p| p.id == previous.id) else {
-            return;
-        };
-        if package.extract_state == previous.extract_state {
-            return;
-        }
-        let (from, to) = (extract_status(previous), extract_status(package));
-        if let Some(to) = to {
+    // A completed set whose extraction is about to start is announced by the extraction.
+    fn note_packages(
+        &self,
+        before: &[(DownloadId, DownloadStatus)],
+        transitions: &mut Vec<Transition>,
+    ) {
+        for (package, to) in self.packages.iter().zip(self.package_statuses()) {
+            let id = package.id.row_id();
+            let Some(&(_, from)) = before.iter().find(|(row, _)| *row == id) else {
+                continue;
+            };
+            let extraction_follows = to == DownloadStatus::Completed
+                && package.auto_extract
+                && package.extract_state == PackageExtractState::NotStarted;
+            if from == to || extraction_follows {
+                continue;
+            }
             transitions.push(Transition {
-                id: package.id.row_id(),
+                id,
                 name: package.name.clone(),
                 to,
-                from: from.unwrap_or(DownloadStatus::Downloading),
-                reason: package.error_message.clone(),
+                from,
+                reason: self.package_error(package).map(str::to_owned),
             });
         }
     }
@@ -198,21 +205,11 @@ impl Shio {
     }
 }
 
-const fn extract_status(package: &ArchivePackage) -> Option<DownloadStatus> {
-    match package.extract_state {
-        PackageExtractState::NotStarted => None,
-        PackageExtractState::Extracting => Some(DownloadStatus::Extracting),
-        PackageExtractState::Completed => Some(DownloadStatus::Completed),
-        PackageExtractState::Error => Some(DownloadStatus::ExtractError),
-        PackageExtractState::PasswordRequired => Some(DownloadStatus::PasswordRequired),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::app::tests::{download, id};
-    use shio_core::{Download, PackageId, PackageItem};
+    use shio_core::{ArchivePackage, Download, PackageId, PackageItem};
     use tokio::sync::mpsc;
 
     fn shio() -> Shio {
@@ -369,6 +366,42 @@ mod tests {
             Some(DownloadStatus::PasswordRequired)
         );
         assert!(matches!(app.overlay, Overlay::Password { id, .. } if id == row_id));
+    }
+
+    #[test]
+    fn archive_sets_announce_completion_and_failure_once() {
+        let toast_after = |auto_extract: bool, parts: [DownloadStatus; 2]| {
+            let mut app = shio();
+            let mut set = package(&[1, 2]);
+            set.auto_extract = auto_extract;
+            let _ = app.apply_engine_events(vec![resync(
+                vec![
+                    download(1, DownloadStatus::Downloading),
+                    download(2, DownloadStatus::Downloading),
+                ],
+                vec![set.clone()],
+            )]);
+            let _ = app.apply_engine_events(vec![ProgressEvent::Changed {
+                downloads: vec![download(1, parts[0]), download(2, parts[1])],
+                packages: vec![set],
+            }]);
+            app.toast.map(|toast| toast.message)
+        };
+        let (done, failed) = (DownloadStatus::Completed, DownloadStatus::Error);
+
+        assert_eq!(
+            toast_after(false, [done, done]).as_deref(),
+            Some("done · set")
+        );
+        assert_eq!(
+            toast_after(true, [done, failed]).as_deref(),
+            Some("failed · set")
+        );
+        assert_eq!(
+            toast_after(true, [done, done]),
+            None,
+            "extraction announces it"
+        );
     }
 
     #[test]

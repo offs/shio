@@ -2,7 +2,7 @@ use super::ADD_URLS_ID;
 use crate::app::{AddDialog, AddValidation, Link, LinkState, TorrentPick};
 use crate::message::Message;
 use crate::style::{self, Button, Palette, SPACE_L, SPACE_M, SPACE_S, SPACE_XL, SPACE_XS};
-use crate::widgets::{setting, switch, text_button};
+use crate::widgets::{modal_body, setting, switch, text_button};
 use bytesize::ByteSize;
 use iced::keyboard::{Key, key};
 use iced::widget::text::Wrapping;
@@ -15,9 +15,15 @@ use std::borrow::Cow;
 const FILE_ROW_LIMIT: usize = 500;
 const FILE_SEARCH_THRESHOLD: usize = 20;
 const CHECKBOX_SIZE: f32 = 14.0;
+const CHROME: f32 =
+    2.0 * SPACE_XL + 2.0 * SPACE_L + style::TEXT_TITLE * style::LINE_HEIGHT + style::CONTROL_HEIGHT;
 
-pub(crate) fn view<'a>(add: &'a AddDialog, p: &Palette) -> Element<'a, Message> {
-    let busy = add.submitting;
+pub(crate) fn view<'a>(
+    add: &'a AddDialog,
+    window_height: f32,
+    p: &Palette,
+) -> Element<'a, Message> {
+    let busy = add.submitting.is_some();
 
     let mut urls = text_editor(&add.urls)
         .id(ADD_URLS_ID)
@@ -175,7 +181,7 @@ pub(crate) fn view<'a>(add: &'a AddDialog, p: &Palette) -> Element<'a, Message> 
             text("add downloads")
                 .size(style::TEXT_TITLE)
                 .color(p.text_primary),
-            scrollable(body).style(style::scrollable(*p)),
+            modal_body(body, window_height, CHROME, p),
             actions
         ]
         .spacing(SPACE_L),

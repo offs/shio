@@ -21,6 +21,8 @@ pub(crate) const TEXT_SMALL: f32 = 12.0;
 pub(crate) const TEXT_BODY: f32 = 13.0;
 pub(crate) const TEXT_TITLE: f32 = 14.0;
 pub(crate) const TEXT_DISPLAY: f32 = 18.0;
+/// iced's default relative text line height.
+pub(crate) const LINE_HEIGHT: f32 = 1.3;
 
 const RADIUS_CONTROL: f32 = 4.0;
 pub(crate) const RADIUS_FIELD: f32 = 6.0;
@@ -29,6 +31,7 @@ const RADIUS_DIALOG: f32 = 12.0;
 
 pub(crate) const ICON_BUTTON: f32 = 28.0;
 pub(crate) const CONTROL_PADDING: [f32; 2] = [6.0, SPACE_M];
+pub(crate) const CONTROL_HEIGHT: f32 = TEXT_SMALL * LINE_HEIGHT + 2.0 * CONTROL_PADDING[0];
 
 pub(crate) const DANGER_ALPHA: f32 = 0.14;
 pub(crate) const SOFT_ALPHA: [f32; 3] = [0.15, 0.22, 0.28];

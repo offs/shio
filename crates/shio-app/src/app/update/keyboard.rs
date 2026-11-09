@@ -1,9 +1,10 @@
 use super::super::state::{Overlay, Shio, is_pausable};
+use super::list::is_resumable;
 use crate::message::{Message, Tab};
 use iced::Task;
 use iced::keyboard::{Key, Modifiers, key::Named};
 use iced::widget::operation;
-use shio_core::{DownloadId, DownloadStatus, EngineCommand};
+use shio_core::{DownloadId, DownloadStatus};
 
 impl Shio {
     pub(super) fn key_pressed(
@@ -30,16 +31,24 @@ impl Shio {
             Key::Named(Named::Space) => self.first_selected().map_or_else(Task::none, |id| {
                 if self.selected_rows_any(is_pausable) {
                     self.pause(id)
-                } else {
+                } else if self.selected_rows_any(is_resumable) {
                     self.resume(id)
+                } else {
+                    Task::none()
                 }
             }),
             Key::Named(Named::Delete | Named::Backspace) => self
                 .first_selected()
                 .map_or_else(Task::none, |id| self.request_remove(id)),
             Key::Named(Named::F5) => self.first_selected().map_or_else(Task::none, |id| {
-                let ids = self.targets(id, |row| row.status == DownloadStatus::Error);
-                self.command_each(ids, |id, reply| EngineCommand::Retry { id, reply })
+                if self
+                    .row(id)
+                    .is_some_and(|row| row.status == DownloadStatus::ExtractError)
+                {
+                    self.retry_extract(id)
+                } else {
+                    self.retry(id)
+                }
             }),
             Key::Character(text) if !modifiers.alt() => {
                 let tab = match text.as_str() {

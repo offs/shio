@@ -225,4 +225,27 @@ mod tests {
         assert_eq!(draft.apply(&config).speed_limit, config.speed_limit);
         assert!(draft.speed_limit_error.is_some());
     }
+
+    #[test]
+    fn unedited_settings_keep_hand_edited_config_values() {
+        let mut config = AppConfig {
+            speed_limit: Some(1500),
+            ..AppConfig::default()
+        };
+        config.torrent.seed_policy = shio_core::SeedPolicy::StopAtTime { seconds: 43_200 };
+        assert_eq!(SettingsDraft::new(&config).apply(&config), config);
+
+        config.torrent.seed_policy = shio_core::SeedPolicy::StopAtRatio { ratio: 1.234 };
+        let mut draft = SettingsDraft::new(&config);
+        assert_eq!(draft.apply(&config), config);
+
+        draft.days = "2".to_owned();
+        assert_eq!(
+            draft.apply(&config).torrent.seed_policy,
+            shio_core::SeedPolicy::RatioOrTime {
+                ratio: 1.234,
+                seconds: 2 * 86_400
+            }
+        );
+    }
 }

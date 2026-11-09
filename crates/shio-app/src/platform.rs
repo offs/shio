@@ -97,6 +97,16 @@ fn app_id_key() -> String {
     format!("Software\\Classes\\AppUserModelId\\{APP_ID}")
 }
 
+/// Uninstall-only: notifications are sent under this identity for the rest of the session.
+#[cfg(windows)]
+pub(crate) fn unregister_app_id() -> io::Result<()> {
+    registry::delete_tree(&app_id_key())?;
+    match icon_path() {
+        Some(icon) => remove_if_exists(&icon),
+        None => Ok(()),
+    }
+}
+
 #[cfg(windows)]
 fn icon_path() -> Option<std::path::PathBuf> {
     Some(std::path::PathBuf::from(std::env::var_os("LOCALAPPDATA")?).join("shio/icon.png"))

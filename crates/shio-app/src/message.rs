@@ -55,7 +55,10 @@ pub(crate) enum Message {
     OpenAdd,
     AddUrlsAction(text_editor::Action),
     AddSubmit,
-    AddSubmitted(Vec<Result<(), String>>),
+    AddSubmitted {
+        id: u64,
+        results: Vec<Result<(), String>>,
+    },
     PickTorrentFiles,
     TorrentFilesPicked(Vec<PathBuf>),
     TorrentFilesRead(Vec<Result<TorrentPick, String>>),
