@@ -167,7 +167,6 @@ impl Download {
         }
     }
 
-    #[cfg(test)]
     pub(crate) const fn http_mut(&mut self) -> Option<&mut HttpState> {
         match &mut self.kind {
             DownloadKind::Http(http) => Some(http),
@@ -286,6 +285,7 @@ pub(crate) fn is_sensitive_header(name: &str) -> bool {
         "authorization",
         "cookie",
         "proxy-authorization",
+        "referer",
         "set-cookie",
     ]
     .iter()
@@ -446,6 +446,7 @@ pub struct HttpPreview {
 pub enum HttpPreviewState {
     Ready(HttpPreview),
     Blocked { reason: String },
+    Folder { files: Vec<String> },
     Error { message: String },
 }
 

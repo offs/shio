@@ -10,9 +10,6 @@ pub struct ArchivePart {
 
 pub fn parse_archive_part(filename: &str) -> Option<ArchivePart> {
     let (base, digits) = rar_part(filename)?;
-    if digits.len() < 2 {
-        return None;
-    }
     let part_number = digits.parse().ok().filter(|&number| number > 0)?;
     let base_name = sanitize_filename(base);
     (base_name != FALLBACK_FILENAME).then_some(ArchivePart {
@@ -76,6 +73,12 @@ pub(crate) fn path_filename(url: &url::Url) -> Option<String> {
         .next_back()
         .map(decode_lossy)
         .filter(|name| !name.is_empty())
+}
+
+pub(crate) fn fragment_name(url: &url::Url) -> Option<String> {
+    let fragment = decode_lossy(url.fragment()?);
+    let fragment = fragment.trim();
+    (!fragment.is_empty()).then(|| sanitize_filename(fragment))
 }
 
 pub fn sanitize_filename(name: &str) -> String {
@@ -408,11 +411,12 @@ mod tests {
         };
         assert_eq!(parse_archive_part("Game.part01.rar"), part("Game", 1));
         assert_eq!(parse_archive_part("Game.PART002.RAR"), part("Game", 2));
+        assert_eq!(parse_archive_part("Game.part1.rar"), part("Game", 1));
         for name in [
             "Game.rar",
-            "Game.part1.rar",
             "Game.part01.zip",
             "Game.part00.rar",
+            "Game.part0.rar",
         ] {
             assert_eq!(parse_archive_part(name), None, "{name}");
         }

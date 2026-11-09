@@ -62,6 +62,18 @@ pub enum ShioError {
     #[error("password required")]
     PasswordRequired,
 
+    #[error("the site blocked automated access")]
+    BrowserCheck,
+
+    #[error("the download page needs a captcha")]
+    PageNeedsCaptcha,
+
+    #[error("no file was found on the download page")]
+    NoFileOnPage,
+
+    #[error("the download page is password protected")]
+    PagePasswordProtected,
+
     #[error("{0}")]
     Other(String),
 }
@@ -110,6 +122,10 @@ impl ShioError {
             Self::SizeMismatch { .. } => "incomplete download".into(),
             Self::Cancelled => "cancelled".into(),
             Self::PasswordRequired => "password required".into(),
+            Self::BrowserCheck => "blocked by a bot check".into(),
+            Self::PageNeedsCaptcha => "needs a captcha".into(),
+            Self::NoFileOnPage => "no file found on page".into(),
+            Self::PagePasswordProtected => "link is password protected".into(),
             Self::DatabaseJson { .. }
             | Self::DatabaseTimestamp { .. }
             | Self::DatabaseValue { .. }

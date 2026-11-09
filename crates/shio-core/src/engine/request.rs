@@ -346,7 +346,7 @@ pub(super) fn selected_size(files: &[TorrentFile]) -> u64 {
         .fold(0, u64::saturating_add)
 }
 
-fn validate_http_url(url: &str) -> Result<()> {
+pub(crate) fn validate_http_url(url: &str) -> Result<()> {
     if url.len() > MAX_SOURCE_URL_BYTES {
         return Err(ShioError::Other("source URL is too long".into()));
     }

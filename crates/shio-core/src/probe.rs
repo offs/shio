@@ -30,7 +30,7 @@ impl HttpProbe {
     }
 
     /// Replaces only URL-path-derived names; user, fragment and archive-part names stay.
-    pub(crate) fn server_filename(&self, download: &Download) -> Option<&str> {
+    pub(crate) fn server_filename(&self, download: &Download, resolved: bool) -> Option<&str> {
         let url = url::Url::parse(&download.http()?.url).ok()?;
         let derived = path_filename(&url).map(|name| sanitize_filename(&name));
         if rar_part(&download.filename).is_some()
@@ -38,27 +38,26 @@ impl HttpProbe {
         {
             return None;
         }
-        let name = self
-            .disposition_filename
-            .as_deref()
-            .or_else(|| self.url_filename.as_deref().filter(|_| derived.is_none()))?;
+        let name = self.disposition_filename.as_deref().or_else(|| {
+            self.url_filename
+                .as_deref()
+                .filter(|_| resolved || derived.is_none())
+        })?;
         (name != download.filename).then_some(name)
     }
 }
 
-pub(crate) async fn probe_with_retries(
-    client: &reqwest::Client,
-    url: &str,
-    custom_headers: &[(String, String)],
+pub(crate) async fn retrying<T, Fut: Future<Output = Result<T>>>(
     max_retries: u32,
     cancel: &CancellationToken,
-) -> Result<HttpProbe> {
+    mut run: impl FnMut() -> Fut,
+) -> Result<T> {
     let mut attempt = 0;
     loop {
         let error = tokio::select! {
             () = cancel.cancelled() => return Err(ShioError::Cancelled),
-            result = probe(client, url, custom_headers) => match result {
-                Ok(probe) => return Ok(probe),
+            result = run() => match result {
+                Ok(value) => return Ok(value),
                 Err(error) => error,
             },
         };
@@ -67,7 +66,7 @@ pub(crate) async fn probe_with_retries(
             return Err(error);
         };
         tracing::warn!(
-            "probe retry {attempt}/{max_retries} in {delay:?}: {}",
+            "retry {attempt}/{max_retries} in {delay:?}: {}",
             error.safe_diagnostic()
         );
         tokio::select! {
@@ -94,6 +93,9 @@ pub(crate) async fn probe(
         && header_str(headers, header::CONTENT_RANGE)
             .is_some_and(|range| range.trim() == "bytes */0");
     if !status.is_success() && !empty {
+        if is_browser_challenge(&response) {
+            return Err(ShioError::BrowserCheck);
+        }
         return Err(http_error(&response));
     }
     reject_encoded_body(headers)?;
@@ -107,10 +109,7 @@ pub(crate) async fn probe(
     } else {
         header_str(headers, header::CONTENT_LENGTH).and_then(|length| length.parse().ok())
     };
-    let content_type = header_str(headers, header::CONTENT_TYPE).map(|value| {
-        let essence = value.split(';').next().unwrap_or(value);
-        essence.trim().to_ascii_lowercase()
-    });
+    let content_type = content_type_essence(headers);
     let disposition =
         header_str(headers, header::CONTENT_DISPOSITION).map(parse_content_disposition);
     let attachment = disposition.as_ref().is_some_and(|d| d.attachment);
@@ -174,6 +173,12 @@ pub(crate) fn retry_delay(error: &ShioError, attempt: u32, max_retries: u32) -> 
     Some(delay.min(MAX_RETRY_DELAY))
 }
 
+pub(crate) fn content_type_essence(headers: &HeaderMap) -> Option<String> {
+    let value = header_str(headers, header::CONTENT_TYPE)?;
+    let essence = value.split(';').next().unwrap_or(value);
+    Some(essence.trim().to_ascii_lowercase())
+}
+
 fn header_str(headers: &HeaderMap, name: header::HeaderName) -> Option<&str> {
     headers.get(name).and_then(|value| value.to_str().ok())
 }
@@ -194,6 +199,13 @@ pub(crate) fn http_error(response: &reqwest::Response) -> ShioError {
         code: response.status().as_u16(),
         retry_after,
     }
+}
+
+pub(crate) fn is_browser_challenge(response: &reqwest::Response) -> bool {
+    response
+        .headers()
+        .get("cf-mitigated")
+        .is_some_and(|value| value.as_bytes().eq_ignore_ascii_case(b"challenge"))
 }
 
 pub(crate) fn apply_custom_headers(
@@ -317,6 +329,17 @@ pub(crate) mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn cloudflare_challenge_is_a_browser_check() {
+        let challenged = probe_response(
+            "HTTP/1.1 403 Forbidden\r\ncf-mitigated: challenge\r\nContent-Length: 0\r\n\r\n",
+        )
+        .await;
+        assert!(matches!(challenged, Err(ShioError::BrowserCheck)));
+        let forbidden = probe_response("HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n").await;
+        assert!(matches!(forbidden, Err(ShioError::Http { code: 403, .. })));
+    }
+
     #[test]
     fn html_landing_pages_are_blocked_unless_large() {
         for (content_type, length, blocked) in [
@@ -384,12 +407,15 @@ pub(crate) mod tests {
             ),
         ] {
             assert_eq!(
-                probe.server_filename(&download),
+                probe.server_filename(&download, false),
                 expected,
                 "{}",
                 download.filename
             );
         }
+        let page = download("https://x.test/abc/page.html", "page.html");
+        assert_eq!(redirect.server_filename(&page, false), None);
+        assert_eq!(redirect.server_filename(&page, true), Some("real.zip"));
     }
 
     #[tokio::test]
