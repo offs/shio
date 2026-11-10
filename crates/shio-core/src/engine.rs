@@ -28,7 +28,7 @@ use crate::types::{
 use crate::worker::blocking;
 
 pub use self::command::EngineCommand;
-pub(crate) use self::job::{ActiveSlot, MetadataCommit};
+pub(crate) use self::job::{ActiveSlot, MetadataCommit, StatusCommit};
 use self::job::{Slots, run_http, run_torrent};
 pub(crate) use self::request::validate_http_url;
 pub use self::request::{
@@ -264,6 +264,11 @@ enum Internal {
         filename: String,
         reply: oneshot::Sender<Result<String>>,
     },
+    CommitStatus {
+        id: DownloadId,
+        status: DownloadStatus,
+        reply: oneshot::Sender<Result<()>>,
+    },
     TorrentMetadata {
         id: DownloadId,
         manifest: TorrentManifest,
@@ -369,7 +374,7 @@ impl DownloadEngine {
                     Some(command) => self.handle(command).await,
                     None => break None,
                 },
-                Some(message) = self.loop_rx.recv() => self.handle_internal(message),
+                Some(message) = self.loop_rx.recv() => self.handle_internal(message).await,
                 () = self.slots.freed.notified() => {},
             }
         };
@@ -381,12 +386,12 @@ impl DownloadEngine {
 
     async fn handle(&mut self, command: EngineCommand) {
         let (reply, result) = match command {
-            EngineCommand::AddHttp { request, reply } => (reply, self.add_http(request)),
+            EngineCommand::AddHttp { request, reply } => (reply, self.add_http(request).await),
             EngineCommand::AddHttpArchiveSet { request, reply } => {
-                (reply, self.add_archive_set(request))
+                (reply, self.add_archive_set(request).await)
             },
             EngineCommand::AddTorrentPrepared { request, reply } => {
-                (reply, self.add_torrent(request))
+                (reply, self.add_torrent(request).await)
             },
             EngineCommand::Pause { id, reply } => (reply, self.pause(id)),
             EngineCommand::Resume { id, reply } => (reply, self.resume(id)),
@@ -426,7 +431,7 @@ impl DownloadEngine {
         }
     }
 
-    fn handle_internal(&mut self, message: Internal) {
+    async fn handle_internal(&mut self, message: Internal) {
         match message {
             Internal::Exit { id, job, result } => self.finish(id, job, &result),
             Internal::ClaimFilename {
@@ -434,7 +439,10 @@ impl DownloadEngine {
                 filename,
                 reply,
             } => {
-                let _ = reply.send(self.claim_filename(id, &filename));
+                let _ = reply.send(self.claim_filename(id, &filename).await);
+            },
+            Internal::CommitStatus { id, status, reply } => {
+                let _ = reply.send(self.commit_worker_status(id, status));
             },
             Internal::TorrentMetadata {
                 id,
@@ -442,7 +450,10 @@ impl DownloadEngine {
                 metadata_bytes,
                 reply,
             } => {
-                let _ = reply.send(self.commit_torrent_metadata(id, manifest, metadata_bytes));
+                let _ = reply.send(
+                    self.commit_torrent_metadata(id, manifest, metadata_bytes)
+                        .await,
+                );
             },
             Internal::PreviewDone(request_id) => {
                 self.previews.remove(&request_id);
@@ -543,22 +554,23 @@ impl DownloadEngine {
         Ok(targets)
     }
 
-    fn add_http(&mut self, request: HttpDownloadRequest) -> Result<()> {
+    async fn add_http(&mut self, request: HttpDownloadRequest) -> Result<()> {
         let download = request.into_download(&self.ctx.shared.config.borrow())?;
-        self.reject_collisions(&[&download], true)?;
+        self.reject_collisions(&[&download], true).await?;
         self.insert(vec![download], None)
     }
 
-    fn add_archive_set(&mut self, request: HttpArchiveSetRequest) -> Result<()> {
+    async fn add_archive_set(&mut self, request: HttpArchiveSetRequest) -> Result<()> {
         let (package, downloads) = request.into_rows(&self.ctx.shared.config.borrow())?;
-        self.reject_collisions(&downloads.iter().collect::<Vec<_>>(), true)?;
+        self.reject_collisions(&downloads.iter().collect::<Vec<_>>(), true)
+            .await?;
         self.insert(downloads, Some(package))
     }
 
-    fn add_torrent(&mut self, request: TorrentDownloadRequest) -> Result<()> {
+    async fn add_torrent(&mut self, request: TorrentDownloadRequest) -> Result<()> {
         let download = request.into_download()?;
         self.reject_active_duplicate(&download)?;
-        self.reject_collisions(&[&download], true)?;
+        self.reject_collisions(&[&download], true).await?;
         self.insert(vec![download], None)
     }
 
@@ -605,23 +617,46 @@ impl DownloadEngine {
 
     // Rejects payloads (and, for new rows, staging) that exist on disk or overlap a path
     // another row owns; paths compare case-insensitively.
-    fn reject_collisions(&self, candidates: &[&Download], new_rows: bool) -> Result<()> {
-        let mut claimed: Vec<(Vec<String>, PathBuf)> = Vec::new();
-        for candidate in candidates {
-            let staging = new_rows.then(|| staging_root(candidate));
-            for path in payload_paths(candidate).into_iter().chain(staging) {
-                let path = std::path::absolute(&path).unwrap_or(path);
-                match std::fs::symlink_metadata(&path) {
-                    Ok(_) => return Err(ShioError::DestinationExists(path)),
+    async fn reject_collisions(&self, candidates: &[&Download], new_rows: bool) -> Result<()> {
+        let paths: Vec<PathBuf> = candidates
+            .iter()
+            .flat_map(|candidate| {
+                let staging = new_rows.then(|| staging_root(candidate));
+                payload_paths(candidate).into_iter().chain(staging)
+            })
+            .map(|path| std::path::absolute(&path).unwrap_or(path))
+            .collect();
+        let mut keys: Vec<Vec<String>> = Vec::new();
+        let mut conflict = None;
+        for path in &paths {
+            let key = match path_key(path) {
+                Ok(key) => key,
+                Err(error) => {
+                    conflict = Some(error);
+                    break;
+                },
+            };
+            if keys.iter().any(|other| overlaps(&key, other)) {
+                conflict = Some(ShioError::DestinationExists(path.clone()));
+                break;
+            }
+            keys.push(key);
+        }
+        // A path that exists on disk wins over a conflict found at or after it.
+        let probed = keys.len() + usize::from(conflict.is_some());
+        let paths = blocking(move || {
+            for path in &paths[..probed] {
+                match std::fs::symlink_metadata(path) {
+                    Ok(_) => return Err(ShioError::DestinationExists(path.clone())),
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
                     Err(error) => return Err(error.into()),
                 }
-                let key = path_key(&path)?;
-                if claimed.iter().any(|(other, _)| overlaps(&key, other)) {
-                    return Err(ShioError::DestinationExists(path));
-                }
-                claimed.push((key, path));
             }
+            Ok(paths)
+        })
+        .await?;
+        if let Some(conflict) = conflict {
+            return Err(conflict);
         }
         let rows = self.ctx.shared.rows.read();
         let others = rows
@@ -634,8 +669,8 @@ impl DownloadEngine {
                 .chain([staging_root(other)])
             {
                 let key = path_key(&std::path::absolute(&path).unwrap_or(path))?;
-                if let Some((_, path)) = claimed.iter().find(|(new, _)| overlaps(new, &key)) {
-                    return Err(ShioError::DestinationExists(path.clone()));
+                if let Some(index) = keys.iter().position(|new| overlaps(new, &key)) {
+                    return Err(ShioError::DestinationExists(paths[index].clone()));
                 }
             }
         }
@@ -998,7 +1033,7 @@ impl DownloadEngine {
         let deadline = tokio::time::Instant::now() + STOP_TIMEOUT;
         while self.workers.contains_key(&id) {
             match tokio::time::timeout_at(deadline, self.loop_rx.recv()).await {
-                Ok(Some(message)) => self.handle_internal(message),
+                Ok(Some(message)) => self.handle_internal(message).await,
                 Ok(None) | Err(_) => {
                     return Err(ShioError::Other(
                         "timed out waiting for the download to stop".into(),
@@ -1017,16 +1052,21 @@ impl DownloadEngine {
         }
     }
 
-    // Without an open session there is nothing to do: the next open keeps only owned rows.
+    // Without an open session the torrent is in none: the next open keeps only owned rows.
     fn forget_torrent(&mut self, download: Download, cleanup_staging: bool) {
-        let Some(session) = self.ctx.shared.session.get().cloned() else {
+        let session = self.ctx.shared.session.get().cloned();
+        if session.is_none() && !cleanup_staging {
             return;
-        };
+        }
         self.tasks.spawn(async move {
-            if let Err(error) = crate::torrent::stop_torrent_in_session(&session, &download).await {
+            if let Some(session) = session
+                && let Err(error) =
+                    crate::torrent::stop_torrent_in_session(&session, &download).await
+            {
                 tracing::warn!(download = %download.id, "failed to remove torrent from session: {error}");
-            } else if cleanup_staging
-                && let Err(error) = crate::torrent::cleanup_staging(&download).await
+                return;
+            }
+            if cleanup_staging && let Err(error) = crate::torrent::cleanup_staging(&download).await
             {
                 tracing::warn!(download = %download.id, "failed to remove torrent staging: {error}");
             }
@@ -1164,12 +1204,14 @@ impl DownloadEngine {
                 tracing::warn!(%package, "package extraction not started: {error}");
             }
         }
-        if cancelled
-            && row.kind.is_torrent()
-            && matches!(
-                row.status,
-                DownloadStatus::Cancelled | DownloadStatus::Completed
-            )
+        // A retried extraction completes a torrent whose download job ended before seeding.
+        if row.kind.is_torrent()
+            && ((cancelled
+                && matches!(
+                    row.status,
+                    DownloadStatus::Cancelled | DownloadStatus::Completed
+                ))
+                || (job == Job::Extract && row.status == DownloadStatus::Completed))
         {
             let cleanup = row.status == DownloadStatus::Completed;
             self.forget_torrent(row, cleanup);
@@ -1201,16 +1243,19 @@ impl DownloadEngine {
     }
 
     // Numbers a server-provided name when it is taken; the worker publishes under the result.
-    fn claim_filename(&self, id: DownloadId, filename: &str) -> Result<String> {
+    async fn claim_filename(&self, id: DownloadId, filename: &str) -> Result<String> {
         let mut row = self.snapshot(id)?;
         let original = row.filename.clone();
-        let available = (0..MAX_NAME_SUFFIX)
-            .map(|n| numbered(filename, n))
-            .find(|name| {
-                row.filename.clone_from(name);
-                crate::path::validate_leaf_filename(name).is_ok()
-                    && self.reject_collisions(&[&row], false).is_ok()
-            });
+        let mut available = None;
+        for name in (0..MAX_NAME_SUFFIX).map(|n| numbered(filename, n)) {
+            row.filename.clone_from(&name);
+            if crate::path::validate_leaf_filename(&name).is_ok()
+                && self.reject_collisions(&[&row], false).await.is_ok()
+            {
+                available = Some(name);
+                break;
+            }
+        }
         let Some(name) = available else {
             return Ok(original);
         };
@@ -1223,7 +1268,20 @@ impl DownloadEngine {
         Ok(name)
     }
 
-    fn commit_torrent_metadata(
+    // Only a live worker moves its row, and only between active statuses, so a status a
+    // command committed (pause, cancel, shutdown) is never overwritten.
+    fn commit_worker_status(&self, id: DownloadId, status: DownloadStatus) -> Result<()> {
+        let live = self
+            .workers
+            .get(&id)
+            .is_some_and(|worker| !worker.cancel.is_cancelled());
+        if !live || !status.is_active() || !self.snapshot(id)?.status.is_active() {
+            return Err(ShioError::Cancelled);
+        }
+        self.set_status(&[id], status, |_| {})
+    }
+
+    async fn commit_torrent_metadata(
         &self,
         id: DownloadId,
         manifest: TorrentManifest,
@@ -1252,7 +1310,7 @@ impl DownloadEngine {
             row.filename = crate::filename::sanitize_filename(&manifest.name);
         }
         crate::path::validate_leaf_filename(&row.filename)?;
-        self.reject_collisions(&[&row], false)?;
+        self.reject_collisions(&[&row], false).await?;
         self.ctx.db.update_torrent_metadata(&row)?;
         let mut rows = self.ctx.shared.rows.write();
         if let Some(current) = rows.downloads.get_mut(&id) {
@@ -1276,7 +1334,7 @@ impl DownloadEngine {
         let deadline = tokio::time::Instant::now() + STOP_TIMEOUT;
         while !self.workers.is_empty() {
             match tokio::time::timeout_at(deadline, self.loop_rx.recv()).await {
-                Ok(Some(message)) => self.handle_internal(message),
+                Ok(Some(message)) => self.handle_internal(message).await,
                 Ok(None) | Err(_) => break,
             }
         }
@@ -1368,7 +1426,9 @@ fn restore(db: &Database) -> Result<(Rows, VecDeque<DownloadId>)> {
             DownloadStatus::Extracting => {
                 download.status = DownloadStatus::ExtractError;
                 download.error_message = Some("extraction interrupted".into());
-                remove_stale_extraction(&download.file_dir());
+                for dir in crate::worker::extraction_dirs(&download) {
+                    remove_stale_extraction(&dir, &[download.id]);
+                }
                 interrupted.push(snapshot(&download));
             },
             _ => {},
@@ -1380,7 +1440,10 @@ fn restore(db: &Database) -> Result<(Rows, VecDeque<DownloadId>)> {
         if package.extract_state == PackageExtractState::Extracting {
             package.extract_state = PackageExtractState::Error;
             package.error_message = Some("extraction interrupted".into());
-            remove_stale_extraction(&package.folder_path());
+            remove_stale_extraction(
+                &package.folder_path(),
+                &package.child_ids().collect::<Vec<_>>(),
+            );
             db.update_package(&package)?;
         }
         rows.packages.insert(package.id, package);
@@ -1388,8 +1451,8 @@ fn restore(db: &Database) -> Result<(Rows, VecDeque<DownloadId>)> {
     Ok((rows, queue))
 }
 
-fn remove_stale_extraction(dir: &Path) {
-    if let Err(error) = crate::extract::remove_stale_staging(dir) {
+fn remove_stale_extraction(dir: &Path, owners: &[DownloadId]) {
+    if let Err(error) = crate::extract::remove_stale_staging(dir, owners) {
         tracing::warn!(path = %dir.display(), "failed to remove interrupted extraction: {error}");
     }
 }
@@ -1480,9 +1543,9 @@ mod tests {
         (engine, events)
     }
 
-    fn add(engine: &mut DownloadEngine, request: HttpDownloadRequest) -> DownloadId {
+    async fn add(engine: &mut DownloadEngine, request: HttpDownloadRequest) -> DownloadId {
         let id = request.id();
-        engine.add_http(request).unwrap();
+        engine.add_http(request).await.unwrap();
         id
     }
 
@@ -1538,7 +1601,8 @@ mod tests {
                 "https://example.com/report.pdf".into(),
                 dir.path().to_path_buf(),
             ),
-        );
+        )
+        .await;
         let foreign = dir.path().join("report.pdf");
         std::fs::write(&foreign, b"user file").unwrap();
 
@@ -1556,13 +1620,15 @@ mod tests {
         add(
             &mut engine,
             HttpDownloadRequest::new("https://example.com/movie.mkv".into(), save.clone()),
-        );
+        )
+        .await;
         let id = add(
             &mut engine,
             HttpDownloadRequest::new("https://example.com/get.php".into(), save),
-        );
+        )
+        .await;
 
-        let claimed = engine.claim_filename(id, "movie.mkv").unwrap();
+        let claimed = engine.claim_filename(id, "movie.mkv").await.unwrap();
 
         assert_eq!(claimed, "movie (1).mkv");
         assert_eq!(engine.ctx.db.get(id).unwrap().unwrap().filename, claimed);
@@ -1663,6 +1729,107 @@ mod tests {
         );
         let staged = crate::torrent::staging_root(&download).join("payload/a.bin");
         assert_eq!(std::fs::read(staged).unwrap(), b"hello");
+    }
+
+    #[tokio::test]
+    async fn a_retried_torrent_extraction_removes_its_staging() {
+        let dir = tempfile::tempdir().unwrap();
+        let save = dir.path().join("downloads");
+        std::fs::create_dir(&save).unwrap();
+        crate::extract::tests::write_zip(&save.join("a.zip"), &[("hello.txt", b"hello")]);
+        let length = std::fs::metadata(save.join("a.zip")).unwrap().len();
+        let bytes = format!(
+            "d4:infod6:lengthi{length}e4:name5:a.zip12:piece lengthi16384e6:pieces20:aaaaaaaaaaaaaaaaaaaaee"
+        )
+        .into_bytes();
+        let manifest = crate::torrent::parse_torrent_manifest(&bytes).unwrap();
+        let mut state = TorrentState::new(TorrentSource::File(bytes), manifest.info_hash);
+        state.files = manifest.files;
+        let mut download =
+            Download::with_kind(manifest.name, save.clone(), DownloadKind::Torrent(state));
+        download.status = DownloadStatus::ExtractError;
+        let staging = crate::torrent::staging_root(&download);
+        std::fs::create_dir(&staging).unwrap();
+        std::fs::write(staging.join("owner"), download.id.to_string()).unwrap();
+        let db = Database::in_memory().unwrap();
+        db.insert_download(&download).unwrap();
+        let mut engine = restored(dir.path(), db);
+
+        engine.retry_extract(download.id, None).unwrap();
+        let exit = engine.loop_rx.recv().await.unwrap();
+        engine.handle_internal(exit).await;
+        while engine.tasks.join_next().await.is_some() {}
+
+        assert_eq!(
+            engine.snapshot(download.id).unwrap().status,
+            DownloadStatus::Completed
+        );
+        assert_eq!(std::fs::read(save.join("a/hello.txt")).unwrap(), b"hello");
+        assert!(!staging.exists());
+    }
+
+    #[tokio::test]
+    async fn a_crash_during_auto_extract_restores_as_interrupted_without_staging() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        let save = dir.path().join("downloads");
+        std::fs::create_dir(&save).unwrap();
+        let source = dir.path().join("source.zip");
+        crate::extract::tests::write_zip(&source, &[("hello.txt", b"hello")]);
+        let body = std::fs::read(&source).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut request = vec![0_u8; 4096];
+                let _ = socket.read(&mut request).await;
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = socket.write_all(head.as_bytes()).await;
+                let _ = socket.write_all(&body).await;
+            }
+        });
+        let config = AppConfig {
+            download_dir: save.clone(),
+            ..AppConfig::default()
+        };
+        let (mut engine, _commands, _events) = DownloadEngine::new(config.clone(), &data).unwrap();
+        let id = add(
+            &mut engine,
+            HttpDownloadRequest::new(format!("http://{address}/set.zip"), save.clone())
+                .with_auto_extract(true),
+        )
+        .await;
+        engine.start_queued();
+        loop {
+            match engine.loop_rx.recv().await.unwrap() {
+                message @ Internal::CommitStatus { .. } => {
+                    engine.handle_internal(message).await;
+                    break;
+                },
+                Internal::Exit { result, .. } => panic!("job ended before extracting: {result:?}"),
+                message => engine.handle_internal(message).await,
+            }
+        }
+        // The process dies after `Extracting` is committed, mid-way through the extraction.
+        let worker = engine.workers.remove(&id).unwrap();
+        worker.task.abort();
+        let _ = worker.task.await;
+        let staging = crate::extract::tests::interrupted_staging(&save, id);
+        drop(engine);
+
+        let (engine, _commands, _events) = DownloadEngine::new(config, &data).unwrap();
+
+        assert_eq!(
+            engine.ctx.db.get(id).unwrap().unwrap().status,
+            DownloadStatus::ExtractError
+        );
+        assert!(!staging.exists());
+        assert!(save.join("set.zip").exists());
     }
 
     #[tokio::test]

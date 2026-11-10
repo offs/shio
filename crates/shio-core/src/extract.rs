@@ -1,5 +1,6 @@
 use crate::error::{Result, ShioError};
 use crate::filename::{rar_part, sanitize_filename, sevenz_volume, strip_suffix_ignore_ascii_case};
+use crate::types::DownloadId;
 use crate::worker::{rename_no_clobber, sync_parent};
 use std::cell::Cell;
 use std::ffi::OsStr;
@@ -9,6 +10,8 @@ use std::path::{Component, Path, PathBuf};
 use tokio_util::sync::CancellationToken;
 
 const STAGING_PREFIX: &str = ".shio-extract-";
+const STAGING_OWNER: &str = "owner";
+const STAGING_PAYLOAD: &str = "payload";
 const MAX_EXTRACTED_FILES: usize = 100_000;
 #[cfg(not(test))]
 const MAX_EXTRACTED_FILE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
@@ -110,13 +113,19 @@ pub(crate) fn plan(completed: &Path) -> Option<Plan> {
             .find_map(|(suffix, _)| strip_suffix_ignore_ascii_case(name, suffix))?;
         (base, vec![completed.to_owned()], true)
     };
-    Some(Plan {
+    let plan = Plan {
         first_volume: members.first()?.clone(),
         members,
         base_name: base.to_owned(),
         format,
         sequence_complete,
-    })
+    };
+    // Only `.partN.rar` volumes are grouped, so a lone `.rar` that continues heads a set named
+    // another way (`.r00`, …), which Shio does not extract.
+    let unsupported = format == Format::Rar
+        && volume(name).is_none()
+        && rar_layout(&plan).is_ok_and(|layout| layout.continues);
+    (!unsupported).then_some(plan)
 }
 
 impl Plan {
@@ -142,23 +151,36 @@ impl Plan {
     }
 }
 
-fn rar_ready(plan: &Plan) -> Result<bool> {
+struct RarLayout {
+    encrypted: bool,
+    continues: bool,
+}
+
+fn rar_layout(plan: &Plan) -> Result<RarLayout> {
     let archives = rar_volumes(plan, rars::ArchiveReadOptions::new())?;
     let members = rars::volume_members(&archives).map_err(|error| map_rar_error(&error))?;
-    if members.iter().any(|member| member.meta.is_encrypted) {
-        return Err(ShioError::PasswordRequired);
-    }
     // A RAR5 volume may end exactly on a member boundary; only its end header says more follow.
-    let continues = matches!(
+    let next_volume = matches!(
         archives.last(),
         Some(rars::Archive::Rar50Plus(last)) if last.blocks.iter().any(
             |block| matches!(block, rars::rar50::Block::End(end) if end.has_next_volume())
         )
     );
-    Ok(!continues
-        && members
-            .last()
-            .is_none_or(|member| !member.meta.is_split_after))
+    Ok(RarLayout {
+        encrypted: members.iter().any(|member| member.meta.is_encrypted),
+        continues: next_volume
+            || members
+                .last()
+                .is_some_and(|member| member.meta.is_split_after),
+    })
+}
+
+fn rar_ready(plan: &Plan) -> Result<bool> {
+    let layout = rar_layout(plan)?;
+    if layout.encrypted {
+        return Err(ShioError::PasswordRequired);
+    }
+    Ok(!layout.continues)
 }
 
 fn zip_ready(path: &Path) -> Result<bool> {
@@ -172,8 +194,9 @@ fn zip_ready(path: &Path) -> Result<bool> {
     Ok(true)
 }
 
-/// Removes staging directories a crash left in `dir`; call before any extraction into `dir`.
-pub(crate) fn remove_stale_staging(dir: &Path) -> Result<()> {
+/// Removes the staging a crash left in `dir` for `owners`. A folder without its owner file may be
+/// a look-alike from a download or torrent, so it is kept.
+pub(crate) fn remove_stale_staging(dir: &Path, owners: &[DownloadId]) -> Result<()> {
     let entries = match std::fs::read_dir(dir) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
         entries => entries?,
@@ -184,16 +207,47 @@ pub(crate) fn remove_stale_staging(dir: &Path) -> Result<()> {
             .file_name()
             .to_str()
             .is_some_and(|name| name.starts_with(STAGING_PREFIX));
-        if is_staging && entry.file_type()?.is_dir() {
+        if is_staging && entry.file_type()?.is_dir() && staging_owned_by(&entry.path(), owners)? {
             std::fs::remove_dir_all(entry.path())?;
         }
     }
     Ok(())
 }
 
+fn staging_owned_by(staging: &Path, owners: &[DownloadId]) -> Result<bool> {
+    let marker = staging.join(STAGING_OWNER);
+    match std::fs::symlink_metadata(&marker) {
+        Ok(metadata) if metadata.is_file() => {},
+        Ok(_) => return Ok(false),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    }
+    let mut recorded = Vec::new();
+    File::open(&marker)?.take(64).read_to_end(&mut recorded)?;
+    Ok(owners
+        .iter()
+        .any(|owner| recorded == owner.to_string().as_bytes()))
+}
+
+/// Output goes to `payload`, so the owner file never reaches the published folder and stays
+/// until the staging is gone.
+fn create_staging(parent: &Path, owner: DownloadId) -> Result<tempfile::TempDir> {
+    let staging = tempfile::Builder::new()
+        .prefix(STAGING_PREFIX)
+        .tempdir_in(parent)?;
+    let marker = staging.path().join(STAGING_OWNER);
+    let mut file = File::create_new(&marker)?;
+    file.write_all(owner.to_string().as_bytes())?;
+    file.sync_all()?;
+    sync_parent(&marker)?;
+    std::fs::create_dir(staging.path().join(STAGING_PAYLOAD))?;
+    Ok(staging)
+}
+
 pub(crate) fn extract(
     plan: &Plan,
     password: Option<&str>,
+    owner: DownloadId,
     cancel: &CancellationToken,
 ) -> Result<PathBuf> {
     ensure_not_cancelled(cancel)?;
@@ -201,11 +255,10 @@ pub(crate) fn extract(
         .first_volume
         .parent()
         .ok_or_else(|| invalid("archive has no parent directory"))?;
-    let staging = tempfile::Builder::new()
-        .prefix(STAGING_PREFIX)
-        .tempdir_in(parent)?;
+    let staging = create_staging(parent, owner)?;
+    let root = staging.path().join(STAGING_PAYLOAD);
     let mut output = Output {
-        root: staging.path(),
+        root: &root,
         cancel,
         entries: 0,
         file_bytes: 0,
@@ -215,12 +268,12 @@ pub(crate) fn extract(
     match plan.format {
         Format::Zip => extract_zip(&plan.first_volume, password, &mut output),
         Format::SevenZ => extract_7z(plan, password, &mut output),
-        Format::Rar => extract_rar(plan, password, parent, &mut output),
+        Format::Rar => extract_rar(plan, password, staging.path(), &mut output),
         Format::TarGz => unpack_tar(flate2::read::MultiGzDecoder::new(open()?), &mut output),
         Format::TarZst => unpack_tar(zstd::Decoder::new(open()?)?, &mut output),
         Format::Tar => unpack_tar(open()?, &mut output),
     }?;
-    sync_tree(staging.path(), cancel)?;
+    sync_tree(&root, cancel)?;
 
     let name = sanitize_filename(&plan.base_name);
     for attempt in 1..=MAX_DESTINATION_ATTEMPTS {
@@ -230,7 +283,7 @@ pub(crate) fn extract(
             sanitize_filename(&format!("{name} ({attempt})"))
         };
         let destination = parent.join(candidate);
-        match rename_no_clobber(staging.path(), &destination) {
+        match rename_no_clobber(&root, &destination) {
             Ok(()) => {
                 sync_parent(&destination)?;
                 return Ok(destination);
@@ -435,12 +488,10 @@ fn rar_volumes(plan: &Plan, options: rars::ArchiveReadOptions<'_>) -> Result<Vec
 fn extract_rar(
     plan: &Plan,
     password: Option<&str>,
-    parent: &Path,
+    staging: &Path,
     output: &mut Output<'_>,
 ) -> Result<()> {
-    let scratch_dir = tempfile::Builder::new()
-        .prefix(STAGING_PREFIX)
-        .tempdir_in(parent)?;
+    let scratch_dir = tempfile::tempdir_in(staging)?;
     // rars admits a member only with room for twice its declared size (raw + filtered output).
     let scratch = rars::Rar50Scratch::new(scratch_dir.path(), MAX_EXTRACTED_FILE_BYTES * 2);
     let options = rars::ArchiveReadOptions::with_optional_password(password.map(str::as_bytes))
@@ -748,7 +799,17 @@ pub(crate) mod tests {
 
     fn extract_path(archive: &Path, password: Option<&str>) -> Result<PathBuf> {
         let plan = plan(archive).expect("archive plan");
-        extract(&plan, password, &CancellationToken::new())
+        extract(
+            &plan,
+            password,
+            DownloadId::new(),
+            &CancellationToken::new(),
+        )
+    }
+
+    /// The staging an extraction leaves when the process dies mid-way.
+    pub(crate) fn interrupted_staging(parent: &Path, owner: DownloadId) -> PathBuf {
+        create_staging(parent, owner).unwrap().keep()
     }
 
     #[test]
@@ -802,7 +863,7 @@ pub(crate) mod tests {
 
         let set = plan(&tmp.path().join("game.7z.002")).unwrap();
         assert_eq!(set.readiness(), Readiness::Ready);
-        let out = extract(&set, None, &CancellationToken::new()).unwrap();
+        let out = extract(&set, None, DownloadId::new(), &CancellationToken::new()).unwrap();
         assert_eq!(out, tmp.path().join("game"));
         assert_eq!(
             std::fs::read(out.join("nested/hello.txt")).unwrap(),
@@ -834,7 +895,7 @@ pub(crate) mod tests {
 
         let set = plan(&volume_path(2)).unwrap();
         assert_eq!(set.readiness(), Readiness::Ready);
-        let out = extract(&set, None, &CancellationToken::new()).unwrap();
+        let out = extract(&set, None, DownloadId::new(), &CancellationToken::new()).unwrap();
 
         assert_eq!(std::fs::read(out.join("dir/run.sh")).unwrap(), payload);
         assert_eq!(std::fs::read(out.join("notes.txt")).unwrap(), b"notes");
@@ -853,6 +914,23 @@ pub(crate) mod tests {
             plan(&volume_path(1)).unwrap().readiness(),
             Readiness::Incomplete
         );
+    }
+
+    #[test]
+    fn old_style_rar_volumes_are_not_an_extractable_set() {
+        let tmp = tempdir().unwrap();
+        let volumes = rar_builder(&[("payload.bin", &[7_u8; 900])])
+            .volume_size(Some(600))
+            .build_volumes(None)
+            .unwrap();
+        assert!(volumes.len() > 1);
+        let first = tmp.path().join("release.rar");
+        std::fs::write(&first, &volumes[0]).unwrap();
+        for (index, volume) in volumes[1..].iter().enumerate() {
+            std::fs::write(tmp.path().join(format!("release.r{index:02}")), volume).unwrap();
+        }
+
+        assert!(plan(&first).is_none());
     }
 
     #[test]
@@ -1004,34 +1082,42 @@ pub(crate) mod tests {
         let cancel = CancellationToken::new();
         cancel.cancel();
 
-        let result = extract(&plan(&archive).unwrap(), None, &cancel);
+        let result = extract(&plan(&archive).unwrap(), None, DownloadId::new(), &cancel);
 
         assert!(matches!(result, Err(ShioError::Cancelled)));
         assert!(!tmp.path().join("test").exists());
     }
 
     #[test]
-    fn stale_staging_is_removed_but_symlinks_are_not_followed() {
+    fn only_owned_stale_staging_is_removed() {
         let tmp = tempdir().unwrap();
-        let stale = tmp.path().join(format!("{STAGING_PREFIX}abc"));
-        std::fs::create_dir(&stale).unwrap();
-        std::fs::write(stale.join("partial.bin"), b"x").unwrap();
+        let owner = DownloadId::new();
+        let stale = interrupted_staging(tmp.path(), owner);
+        std::fs::write(stale.join(STAGING_PAYLOAD).join("partial.bin"), b"x").unwrap();
+        let other = interrupted_staging(tmp.path(), DownloadId::new());
+        let foreign = tmp.path().join(format!("{STAGING_PREFIX}x"));
+        std::fs::create_dir(&foreign).unwrap();
+        std::fs::write(foreign.join(STAGING_OWNER), b"forged").unwrap();
+        std::fs::write(foreign.join("photo.jpg"), b"x").unwrap();
         std::fs::write(tmp.path().join("keep.zip"), b"x").unwrap();
         #[cfg(unix)]
         {
             let outside = tempdir().unwrap();
+            std::fs::write(outside.path().join(STAGING_OWNER), owner.to_string()).unwrap();
             std::fs::write(outside.path().join("precious"), b"x").unwrap();
             std::os::unix::fs::symlink(
                 outside.path(),
                 tmp.path().join(format!("{STAGING_PREFIX}link")),
             )
             .unwrap();
-            remove_stale_staging(tmp.path()).unwrap();
+            remove_stale_staging(tmp.path(), &[owner]).unwrap();
             assert!(outside.path().join("precious").exists());
         }
-        remove_stale_staging(tmp.path()).unwrap();
+        remove_stale_staging(tmp.path(), &[owner]).unwrap();
 
         assert!(!stale.exists());
+        assert!(other.exists());
+        assert!(foreign.join("photo.jpg").exists());
         assert!(tmp.path().join("keep.zip").exists());
     }
 

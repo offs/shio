@@ -1,6 +1,7 @@
 use crate::chunk::{BandwidthLimiter, Exit, Pieces, Transfer, connect, plan_pieces};
 use crate::config::AppConfig;
 use crate::db::Database;
+use crate::engine::StatusCommit;
 use crate::error::{Result, ShioError};
 use crate::extract::{Plan, Readiness};
 use crate::probe::HttpProbe;
@@ -72,6 +73,7 @@ pub(crate) struct HttpJob {
     pub(crate) client: reqwest::Client,
     pub(crate) db: Arc<Database>,
     pub(crate) progress_tx: mpsc::Sender<DownloadProgress>,
+    pub(crate) status: StatusCommit,
     pub(crate) cancel: CancellationToken,
     pub(crate) limiter: BandwidthLimiter,
     pub(crate) host: Arc<Semaphore>,
@@ -428,6 +430,7 @@ async fn auto_extract(download: &Download, size: u64, job: &HttpJob) -> Result<(
         Some(Readiness::Incomplete) => Err(ShioError::Extract("archive set is incomplete".into())),
         Some(Readiness::PasswordRequired) => Err(ShioError::PasswordRequired),
         Some(Readiness::Ready) => {
+            job.status.commit(DownloadStatus::Extracting).await?;
             let _ = job
                 .progress_tx
                 .send(DownloadProgress {
@@ -797,6 +800,18 @@ fn archive_files(download: &Download) -> Vec<PathBuf> {
         .collect()
 }
 
+/// Every folder an extraction of `download` may stage in: its archives' folders.
+pub(crate) fn extraction_dirs(download: &Download) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = archive_files(download)
+        .iter()
+        .filter_map(|file| file.parent())
+        .map(Path::to_path_buf)
+        .collect();
+    dirs.sort_unstable();
+    dirs.dedup();
+    dirs
+}
+
 /// The one archive set formed by `files`; several distinct sets are ambiguous.
 fn archive_plan(files: &[PathBuf]) -> Option<Plan> {
     let mut plans: Vec<Plan> = Vec::new();
@@ -808,15 +823,14 @@ fn archive_plan(files: &[PathBuf]) -> Option<Plan> {
     if plans.len() == 1 { plans.pop() } else { None }
 }
 
+/// `None` when there is nothing to extract, including unsupported or ambiguous archive layouts.
 pub(crate) async fn extraction_readiness(download: &Download) -> Option<Readiness> {
     let files = archive_files(download);
     if files.is_empty() {
         return None;
     }
-    let readiness = blocking(move || {
-        Ok(archive_plan(&files).map_or(Readiness::Incomplete, |plan| plan.readiness()))
-    });
-    Some(readiness.await.unwrap_or(Readiness::Incomplete))
+    let readiness = blocking(move || Ok(archive_plan(&files).map(|plan| plan.readiness())));
+    readiness.await.unwrap_or(Some(Readiness::Incomplete))
 }
 
 /// Extracts the set formed by `parts`, then deletes only volumes those parts wrote, never a
@@ -828,11 +842,13 @@ pub(crate) async fn run_extract(
     cancel: CancellationToken,
 ) -> Result<()> {
     let owned: Vec<PathBuf> = parts.iter().flat_map(archive_files).collect();
+    let owner = parts.first().map(|part| part.id);
     let delete_archives = config.delete_archive_after_extract;
     blocking(move || {
-        let plan = archive_plan(&owned)
-            .ok_or_else(|| ShioError::Extract("no extractable archive found".into()))?;
-        let destination = crate::extract::extract(&plan, password.as_deref(), &cancel)?;
+        let (Some(owner), Some(plan)) = (owner, archive_plan(&owned)) else {
+            return Err(ShioError::Extract("no extractable archive found".into()));
+        };
+        let destination = crate::extract::extract(&plan, password.as_deref(), owner, &cancel)?;
         tracing::info!(
             "extracted {} -> {}",
             plan.first_volume.display(),
@@ -858,6 +874,34 @@ mod tests {
         let mut download = Download::new(format!("https://example.com/{name}"), dir.to_owned());
         download.filename = name.into();
         download
+    }
+
+    #[tokio::test]
+    async fn several_archive_sets_are_nothing_to_extract() {
+        use crate::types::{DownloadKind, TorrentFile, TorrentSource, TorrentState};
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut state = TorrentState::new(TorrentSource::Magnet(String::new()), [0; 20]);
+        state.files = ["release/movie.zip", "release/Subs/subs.zip"]
+            .into_iter()
+            .map(|path| TorrentFile {
+                path: PathBuf::from(path),
+                size: 1,
+                selected: true,
+            })
+            .collect();
+        for file in &state.files {
+            let path = temp.path().join(&file.path);
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("dir");
+            crate::extract::tests::write_zip(&path, &[("a.txt", b"a")]);
+        }
+        let download = Download::with_kind(
+            "release".into(),
+            temp.path().to_owned(),
+            DownloadKind::Torrent(state),
+        );
+
+        assert_eq!(extraction_readiness(&download).await, None);
     }
 
     #[test]
@@ -1053,6 +1097,7 @@ mod tests {
             client,
             db,
             progress_tx,
+            status: StatusCommit::detached(),
             cancel: CancellationToken::new(),
             limiter: BandwidthLimiter::new(None),
             host: Arc::new(Semaphore::new(16)),

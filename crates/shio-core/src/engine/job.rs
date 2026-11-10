@@ -10,7 +10,7 @@ use crate::error::{Result, ShioError};
 use crate::probe::HttpProbe;
 use crate::resolve::{Resolved, Target};
 use crate::torrent::TorrentManifest;
-use crate::types::{Download, DownloadId, DownloadProgress};
+use crate::types::{Download, DownloadId, DownloadProgress, DownloadStatus};
 use crate::worker::blocking;
 
 const RESOLVE_TIMEOUT: Duration = Duration::from_mins(2);
@@ -83,6 +83,35 @@ impl MetadataCommit {
     }
 }
 
+/// Progress moves a row between active statuses in memory only; a status that recovery must
+/// see, such as `Extracting` before any staging exists, is committed through the engine.
+pub(crate) struct StatusCommit {
+    id: DownloadId,
+    loop_tx: mpsc::UnboundedSender<Internal>,
+}
+
+impl StatusCommit {
+    pub(crate) async fn commit(&self, status: DownloadStatus) -> Result<()> {
+        let (reply, result) = oneshot::channel();
+        self.loop_tx
+            .send(Internal::CommitStatus {
+                id: self.id,
+                status,
+                reply,
+            })
+            .map_err(|_| ShioError::Cancelled)?;
+        result.await.map_err(|_| ShioError::Cancelled)?
+    }
+
+    #[cfg(test)]
+    pub(crate) fn detached() -> Self {
+        Self {
+            id: DownloadId::new(),
+            loop_tx: mpsc::unbounded_channel().0,
+        }
+    }
+}
+
 pub(super) async fn run_http(
     ctx: Context,
     http: reqwest::Client,
@@ -108,6 +137,10 @@ pub(super) async fn run_http(
                 client: http,
                 db: ctx.db.clone(),
                 progress_tx,
+                status: StatusCommit {
+                    id,
+                    loop_tx: ctx.loop_tx.clone(),
+                },
                 cancel,
                 limiter: ctx.shared.limiter.clone(),
                 host: ctx.shared.hosts.get(&url),
@@ -152,6 +185,10 @@ pub(super) async fn run_http(
             client: http,
             db: ctx.db.clone(),
             progress_tx,
+            status: StatusCommit {
+                id,
+                loop_tx: ctx.loop_tx.clone(),
+            },
             cancel,
             limiter: ctx.shared.limiter.clone(),
             host,
@@ -225,6 +262,10 @@ pub(super) async fn run_torrent(
         config: ctx.shared.config.subscribe(),
         slot,
         metadata: MetadataCommit {
+            id,
+            loop_tx: ctx.loop_tx.clone(),
+        },
+        status: StatusCommit {
             id,
             loop_tx: ctx.loop_tx.clone(),
         },
