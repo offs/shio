@@ -27,7 +27,7 @@ pub(crate) use self::staging::{
     cleanup_staging, prepare_completed_recheck, published_files, staging_root,
 };
 use crate::config::AppConfig;
-use crate::engine::{ActiveSlot, MetadataCommit};
+use crate::engine::{ActiveSlot, MetadataCommit, StatusCommit};
 use crate::error::{Result, ShioError};
 use crate::extract::Readiness;
 use crate::types::{
@@ -92,6 +92,7 @@ pub(crate) struct TorrentWorkerDeps {
     pub(crate) config: watch::Receiver<AppConfig>,
     pub(crate) slot: ActiveSlot,
     pub(crate) metadata: MetadataCommit,
+    pub(crate) status: StatusCommit,
 }
 
 pub(crate) async fn run_torrent(download: Download, deps: TorrentWorkerDeps) -> Result<()> {
@@ -102,6 +103,7 @@ pub(crate) async fn run_torrent(download: Download, deps: TorrentWorkerDeps) -> 
         config,
         slot,
         metadata,
+        status,
     } = deps;
     let state = download
         .torrent()
@@ -117,6 +119,7 @@ pub(crate) async fn run_torrent(download: Download, deps: TorrentWorkerDeps) -> 
         progress_tx,
         cancel,
         config,
+        status,
     };
     let result = worker.run(slot, &metadata).await;
     if result.is_err()
@@ -134,6 +137,7 @@ struct Worker {
     progress_tx: mpsc::Sender<DownloadProgress>,
     cancel: CancellationToken,
     config: watch::Receiver<AppConfig>,
+    status: StatusCommit,
     /// Counters from earlier runs; librqbit restarts its own in every session.
     base: TorrentStats,
     last_uploaded: u64,
@@ -300,6 +304,7 @@ impl Worker {
                 return Err(ShioError::Extract("archive set is incomplete".into()));
             },
         }
+        self.status.commit(DownloadStatus::Extracting).await?;
         self.send(self.progress(
             &handle.stats(),
             DownloadStatus::Extracting,
@@ -313,7 +318,8 @@ impl Worker {
             None,
             self.cancel.clone(),
         )
-        .await
+        .await?;
+        self.status.commit(DownloadStatus::Downloading).await
     }
 
     async fn seed(&mut self, handle: &Arc<ManagedTorrent>) -> Result<()> {
@@ -540,6 +546,7 @@ mod tests {
             config: config_rx,
             slot: ActiveSlot::detached(),
             metadata: MetadataCommit::detached(),
+            status: StatusCommit::detached(),
         };
         let result =
             tokio::time::timeout(Duration::from_secs(30), run_torrent(download.clone(), deps))

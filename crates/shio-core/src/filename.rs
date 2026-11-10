@@ -11,9 +11,8 @@ pub struct ArchivePart {
 pub fn parse_archive_part(filename: &str) -> Option<ArchivePart> {
     let (base, digits) = rar_part(filename)?;
     let part_number = digits.parse().ok().filter(|&number| number > 0)?;
-    let base_name = sanitize_filename(base);
-    (base_name != FALLBACK_FILENAME).then_some(ArchivePart {
-        base_name,
+    (!trim(base).is_empty()).then(|| ArchivePart {
+        base_name: sanitize_filename(base),
         part_number,
     })
 }
@@ -418,6 +417,20 @@ mod tests {
             "Game.part00.rar",
             "Game.part0.rar",
         ] {
+            assert_eq!(parse_archive_part(name), None, "{name}");
+        }
+    }
+
+    #[test]
+    fn parse_archive_part_accepts_a_base_named_like_the_fallback() {
+        assert_eq!(
+            parse_archive_part("download.part1.rar"),
+            Some(ArchivePart {
+                base_name: "download".into(),
+                part_number: 1,
+            })
+        );
+        for name in [".part1.rar", " .part1.rar", "...part1.rar"] {
             assert_eq!(parse_archive_part(name), None, "{name}");
         }
     }

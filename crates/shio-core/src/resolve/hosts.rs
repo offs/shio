@@ -8,7 +8,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use url::Url;
 
-use super::{Resolved, Target, read_bounded};
+use super::{MAX_PAGE_BYTES, Resolved, Target, read_bounded};
 use crate::error::{Result, ShioError};
 
 const GOFILE_API: &str = "https://api.gofile.io";
@@ -161,7 +161,7 @@ async fn contents(client: &reqwest::Client, id: &str, token: &str) -> Result<Opt
         .await?;
     let status = response.status();
     let error = crate::probe::http_error(&response);
-    let Ok(reply) = serde_json::from_str::<Reply>(&read_bounded(response).await?) else {
+    let Some(reply) = folder_reply(response).await? else {
         return if status.as_u16() == 401 {
             Ok(None)
         } else {
@@ -179,6 +179,19 @@ async fn contents(client: &reqwest::Client, id: &str, token: &str) -> Result<Opt
         "error-passwordRequired" => Err(ShioError::PagePasswordProtected),
         "error-token" | "error-notPremium" => Ok(None),
         _ => Err(refused()),
+    }
+}
+
+/// `None` when the body is not a gofile reply; a reply cut at the page cap is a folder too large
+/// to list.
+async fn folder_reply(response: reqwest::Response) -> Result<Option<Reply>> {
+    let body = read_bounded(response).await?;
+    match serde_json::from_str::<Reply>(&body) {
+        Ok(reply) => Ok(Some(reply)),
+        Err(_) if body.len() >= MAX_PAGE_BYTES => {
+            Err(ShioError::Other("gofile folder is too large".into()))
+        },
+        Err(_) => Ok(None),
     }
 }
 
@@ -304,5 +317,41 @@ mod tests {
             pick(folder(&["a.mkv"]), Some("other.zip")),
             Err(ShioError::NoFileOnPage)
         ));
+    }
+
+    #[tokio::test]
+    async fn gofile_folders_cut_at_the_page_cap_are_too_large() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut request = vec![0_u8; 4096];
+                let read = socket.read(&mut request).await.unwrap_or(0);
+                let body = if request[..read].starts_with(b"GET /large ") {
+                    let mut body =
+                        br#"{"status":"ok","data":{"type":"folder","children":{"#.to_vec();
+                    body.resize(MAX_PAGE_BYTES + 1024, b' ');
+                    body
+                } else {
+                    b"<html>busy</html>".to_vec()
+                };
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = socket.write_all(head.as_bytes()).await;
+                let _ = socket.write_all(&body).await;
+            }
+        });
+        let client = reqwest::Client::new();
+        let reply = |path: &'static str| {
+            let request = client.get(format!("http://{address}/{path}")).send();
+            async move { folder_reply(request.await.unwrap()).await }
+        };
+
+        assert!(matches!(reply("large").await, Err(ShioError::Other(_))));
+        assert!(matches!(reply("small").await, Ok(None)));
     }
 }
