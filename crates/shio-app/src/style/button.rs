@@ -29,20 +29,18 @@ pub(crate) fn button(p: Palette, kind: Button) -> impl Fn(&Theme, Status) -> Sty
         } else {
             p.text_secondary
         };
+        let danger = if hot { p.text_primary } else { p.error };
 
         let (background, text_color) = match kind {
             Button::Primary => (Some(alpha(p.accent, SOFT_ALPHA[level])), p.accent_text),
             Button::Secondary => (Some([p.hover, p.pressed, p.pressed][level]), p.text_primary),
             Button::Ghost | Button::Nav { active: false } => (overlay, emphasis),
-            Button::Danger => (
-                Some(alpha(p.error, DANGER_ALPHA * [1.0, 1.5, 2.0][level])),
-                p.error,
-            ),
+            Button::Danger => (Some(alpha(p.error, DANGER_ALPHA)), danger),
             Button::MenuItem { highlighted } => (
                 menu_fill.or_else(|| highlighted.then_some(p.selected())),
                 p.text_primary,
             ),
-            Button::MenuDanger => (menu_fill, if hot { p.text_primary } else { p.error }),
+            Button::MenuDanger => (menu_fill, danger),
             Button::Nav { active: true } => (Some(overlay.unwrap_or(p.hover)), p.text_primary),
             Button::Close if hot => (Some(p.error), p.on_error),
             Button::Close => (None, p.text_secondary),

@@ -361,13 +361,13 @@ impl Colors {
             checks.push(("accent button", accent_text, fill, MIN_TEXT_CONTRAST, field));
         }
         let danger = composite(alpha(self.error, DANGER_ALPHA), raised);
-        checks.push((
-            "danger button",
-            self.error,
-            danger,
-            MIN_TEXT_CONTRAST,
-            |c| &mut c.error,
-        ));
+        let danger_text: [(Color, Field); 2] = [
+            (self.error, |c| &mut c.error),
+            (self.text_primary, |c| &mut c.text_primary),
+        ];
+        for (color, field) in danger_text {
+            checks.push(("danger button", color, danger, MIN_TEXT_CONTRAST, field));
+        }
         checks.push((
             "toggle knob",
             self.on_accent(),
@@ -623,6 +623,30 @@ border = "#7a776d"
                 "{}: blur tint {tint} out of range",
                 raw.id
             );
+        }
+    }
+
+    #[test]
+    fn danger_buttons_stay_readable_in_every_state() {
+        use crate::style::{Button, button};
+        use iced::widget::button::Status;
+
+        let catalog = ThemeCatalog::built_in();
+        for definition in catalog.themes() {
+            let theme = catalog.resolve(&definition.id, false);
+            let style = button(theme.palette, Button::Danger);
+            for status in [Status::Active, Status::Hovered, Status::Pressed] {
+                let style = style(&theme.iced_theme, status);
+                let Some(iced::Background::Color(fill)) = style.background else {
+                    panic!("{}: danger button has no solid fill", definition.id);
+                };
+                let ratio = contrast_ratio(style.text_color, composite(fill, theme.palette.raised));
+                assert!(
+                    ratio >= MIN_TEXT_CONTRAST,
+                    "{} {status:?}: {ratio}",
+                    definition.id
+                );
+            }
         }
     }
 

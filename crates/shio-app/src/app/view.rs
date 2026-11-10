@@ -6,7 +6,7 @@ use crate::views::{
 };
 use crate::widgets::{SoftwareProbe, download_row, icon_button, menu_anchor, modal, text_button};
 use iced::widget::text::Wrapping;
-use iced::widget::{Text, column, container, row, stack, text};
+use iced::widget::{Text, column, container, row, sensor, stack, text};
 use iced::{Alignment, Element, Length, window};
 use iced_fonts::bootstrap;
 use shio_core::{DownloadId, DownloadKind, DownloadStatus, TorrentSource};
@@ -92,10 +92,13 @@ impl Shio {
         } else {
             chrome::Search::Inert(&self.search)
         };
-        let base: Element<'a, Message> = column![
+        let header = column![
             chrome::titlebar(search, self.window.maximized, self.window.size.width, p),
             self.banners(p),
             tabs,
+        ];
+        let base: Element<'a, Message> = column![
+            sensor(header).on_resize(|size| Message::HeaderResized(size.height)),
             container(list).height(Length::Fill),
             status_bar::view(
                 &self.totals,
@@ -122,6 +125,7 @@ impl Shio {
             Some(Menu::Sort) => Some(menus::sort_menu(
                 self.sort,
                 self.sort_descending,
+                self.window.header_height,
                 self.window.size,
                 p,
             )),
