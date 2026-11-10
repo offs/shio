@@ -1,6 +1,6 @@
 use crate::error::{Result, ShioError};
 use crate::probe::{
-    apply_custom_headers, http_error, is_transient, reject_encoded_body, retry_delay,
+    READ_TIMEOUT, apply_custom_headers, http_error, is_transient, reject_encoded_body, retry_delay,
 };
 use crate::types::{ChunkInfo, ChunkStatus};
 use crate::worker::blocking;
@@ -169,7 +169,12 @@ impl Pieces {
                 .map(|chunk| Piece {
                     start: chunk.start,
                     end: chunk.end,
-                    len: total.map(|_| chunk.end - chunk.start + 1),
+                    len: match total {
+                        Some(_) => Some(chunk.end - chunk.start + 1),
+                        None => {
+                            (chunk.status == ChunkStatus::Completed).then_some(chunk.downloaded)
+                        },
+                    },
                     downloaded: chunk.downloaded,
                     persisted: chunk.downloaded,
                     busy: false,
@@ -307,11 +312,12 @@ pub(crate) async fn connect(
 ) -> Result<Exit> {
     let mut connection = Connection::new(&transfer, piece);
     let mut retries = 0_u32;
+    let mut furthest = 0_u64;
     let exit = loop {
         connection.progressed = false;
         match connection.fetch().await {
             Ok(()) => {
-                retries = 0;
+                (retries, furthest) = (0, 0);
                 transfer.pieces.release(connection.piece);
                 match transfer.pieces.claim() {
                     Some(next) => connection.load(next),
@@ -319,7 +325,9 @@ pub(crate) async fn connect(
                 }
             },
             Err(error) => {
-                retries = if connection.progressed {
+                let reached = connection.start + connection.downloaded;
+                retries = if connection.progressed && reached > furthest {
+                    furthest = reached;
                     1
                 } else {
                     retries + 1
@@ -407,7 +415,9 @@ impl<'a> Connection<'a> {
         let request = apply_custom_headers(request, &transfer.headers)?;
         let response = tokio::select! {
             () = transfer.cancel.cancelled() => return Err(ShioError::Cancelled),
-            response = request.send() => response?,
+            response = tokio::time::timeout(READ_TIMEOUT, request.send()) => {
+                response.map_err(|_| ShioError::TimedOut)??
+            },
         };
         if !response.status().is_success() {
             return Err(http_error(&response));
@@ -439,12 +449,13 @@ impl<'a> Connection<'a> {
         let received = 'stream: loop {
             let next = tokio::select! {
                 () = transfer.cancel.cancelled() => break Err(ShioError::Cancelled),
-                next = stream.next() => next,
+                next = tokio::time::timeout(READ_TIMEOUT, stream.next()) => next,
             };
             let bytes = match next {
-                None => break Ok(()),
-                Some(Ok(bytes)) => bytes,
-                Some(Err(error)) => break Err(error.into()),
+                Err(_) => break Err(ShioError::TimedOut),
+                Ok(None) => break Ok(()),
+                Ok(Some(Ok(bytes))) => bytes,
+                Ok(Some(Err(error))) => break Err(error.into()),
             };
             if let Err(error) = transfer
                 .limiter
@@ -677,6 +688,21 @@ mod tests {
         pieces.record(1, 10);
         assert_eq!(pieces.advance(1), None, "a busy piece is never taken over");
         assert_eq!(pieces.claim(), Some(3));
+    }
+
+    #[test]
+    fn a_finished_stream_of_unknown_length_is_not_fetched_again() {
+        let pieces = Pieces::new(
+            vec![ChunkInfo {
+                downloaded: 7,
+                status: ChunkStatus::Completed,
+                ..pending(0, 0, 0)
+            }],
+            None,
+        );
+        assert!(pieces.is_complete());
+        assert_eq!(pieces.claim(), None);
+        assert_eq!(pieces.downloaded(), 7);
     }
 
     #[test]

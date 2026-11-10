@@ -98,6 +98,22 @@ pub(super) async fn run_http(
             .map(|http| (http.url.clone(), http.headers.clone()))
             .ok_or_else(|| ShioError::Other("expected an HTTP download".into()))?;
         let max_retries = download.max_retries;
+        let published = {
+            let download = download.clone();
+            blocking(move || crate::worker::recover_published(&download)).await?
+        };
+        if let Some(size) = published {
+            let job = crate::worker::HttpJob {
+                config: ctx.shared.config.subscribe(),
+                client: http,
+                db: ctx.db.clone(),
+                progress_tx,
+                cancel,
+                limiter: ctx.shared.limiter.clone(),
+                host: ctx.shared.hosts.get(&url),
+            };
+            return crate::worker::after_publish(&download, size, &job).await;
+        }
         let direct = crate::probe::retrying(max_retries, &cancel, || {
             crate::probe::probe(&http, &url, &headers)
         })
@@ -268,5 +284,60 @@ async fn track_progress(
                 tracing::warn!(download = %id, "progress flush failed: {error}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::AppConfig;
+    use crate::engine::DownloadEngine;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    async fn server(response: &'static [u8]) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let address = listener.local_addr().expect("address");
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut request = vec![0_u8; 4096];
+                let _ = socket.read(&mut request).await;
+                let _ = socket.write_all(response).await;
+            }
+        });
+        format!("http://{address}/file.bin")
+    }
+
+    #[tokio::test]
+    async fn a_published_payload_completes_without_probing_again() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = AppConfig {
+            download_dir: dir.path().to_owned(),
+            ..AppConfig::default()
+        };
+        let (engine, _commands, _events) = DownloadEngine::new(config, dir.path()).expect("engine");
+        let ok =
+            server(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello").await;
+        let mut download = Download::new(ok, dir.path().to_owned());
+        engine.ctx.db.insert_download(&download).expect("row");
+        let run = |download: Download| {
+            run_http(
+                engine.ctx.clone(),
+                engine.http.clone(),
+                download,
+                false,
+                CancellationToken::new(),
+            )
+        };
+        run(download.clone()).await.expect("first run publishes");
+
+        let expired = server(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n").await;
+        download.http_mut().expect("http").url = expired;
+        run(download.clone())
+            .await
+            .expect("published payload needs no probe");
+
+        assert_eq!(std::fs::read(download.file_path()).expect("file"), b"hello");
     }
 }

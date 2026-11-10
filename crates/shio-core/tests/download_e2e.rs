@@ -174,10 +174,14 @@ struct Engine {
 
 impl Engine {
     fn start(dir: &Path) -> Self {
+        Self::with_retries(dir, 0)
+    }
+
+    fn with_retries(dir: &Path, max_retries: u32) -> Self {
         let config = AppConfig {
             download_dir: dir.to_owned(),
             max_concurrent: 1,
-            max_retries: 0,
+            max_retries,
             ..AppConfig::default()
         };
         let (engine, commands, progress) = DownloadEngine::new(config, dir).unwrap();
@@ -299,15 +303,23 @@ async fn downloads_complete_exactly() {
         }
     })
     .await;
+    let small = payload(1000);
+    let unknown_length = spawn_server({
+        let small = small.clone();
+        move |_| [&b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n"[..], &small].concat()
+    })
+    .await;
 
     for (server, segments, expected) in [
         (single, 1, &body[..]),
         (ranged_server, 4, &body[..]),
         (ignores_ranges, 4, &body[..]),
         (empty, 4, &[][..]),
+        (unknown_length, 4, &small[..]),
     ] {
         let (row, _dir) = download(format!("{server}/file.bin"), segments).await;
         assert_eq!(row.status, DownloadStatus::Completed, "{server}");
+        assert_eq!(row.downloaded, expected.len() as u64, "{server}");
         assert_eq!(
             std::fs::read(row.file_path()).unwrap(),
             expected,
@@ -426,6 +438,26 @@ async fn corrupt_responses_fail_instead_of_publishing() {
         assert_eq!(row.status, DownloadStatus::Error, "{url}");
         assert!(!dir.path().join("file.bin").exists());
     }
+}
+
+#[tokio::test]
+async fn a_body_cut_at_the_same_point_every_time_fails_after_its_retries() {
+    let server = spawn_server(|_| {
+        let mut bytes = response("200 OK", "", b"0123456789");
+        bytes.truncate(bytes.len() - 4);
+        bytes
+    })
+    .await;
+    let dir = TempDir::new().unwrap();
+    let engine = Engine::with_retries(dir.path(), 2);
+    let id = engine
+        .add(format!("{server}/file.bin"), dir.path(), 1)
+        .await;
+
+    let row = engine.finish(id).await;
+
+    assert_eq!(row.status, DownloadStatus::Error);
+    assert!(!dir.path().join("file.bin").exists());
 }
 
 /// Paced writes keep several connections open at once.
@@ -777,16 +809,21 @@ async fn captcha_and_password_pages_fail_with_a_clear_reason() {
     }
 }
 
-#[tokio::test]
-async fn mixed_host_part_sets_download_and_extract() {
+fn rar_volumes() -> Arc<Vec<Vec<u8>>> {
     let mut builder = rars::Builder::new(rars::ArchiveVersion::Rar50).store(true);
     for (name, content) in [("notes.txt", &b"notes"[..]), ("payload.bin", &[7; 900][..])] {
         builder
             .add_bytes(name.as_bytes().to_vec(), content.to_vec(), None, None)
             .unwrap();
     }
-    let volumes = Arc::new(builder.volume_size(Some(600)).build_volumes(None).unwrap());
+    let volumes = builder.volume_size(Some(600)).build_volumes(None).unwrap();
     assert!((2..=9).contains(&volumes.len()), "{}", volumes.len());
+    Arc::new(volumes)
+}
+
+#[tokio::test]
+async fn mixed_host_part_sets_download_and_extract() {
+    let volumes = rar_volumes();
 
     let page_host = spawn_server({
         let volumes = volumes.clone();
@@ -858,6 +895,52 @@ async fn mixed_host_part_sets_download_and_extract() {
 
     assert_eq!(
         std::fs::read(dir.path().join("Some Game/game/notes.txt")).unwrap(),
+        b"notes"
+    );
+}
+
+#[tokio::test]
+async fn volumes_added_as_separate_downloads_extract_once_all_arrive() {
+    let volumes = rar_volumes();
+    let server = spawn_server({
+        let volumes = volumes.clone();
+        move |request| {
+            let part = request
+                .path
+                .strip_prefix("/p")
+                .and_then(|path| path.strip_suffix(".rar"))
+                .and_then(|number| number.parse::<usize>().ok());
+            match part.and_then(|number| volumes.get(number - 1)) {
+                Some(volume) => ranged(volume, request),
+                None => not_found(),
+            }
+        }
+    })
+    .await;
+    let dir = TempDir::new().unwrap();
+    let mut engine = Engine::start(dir.path());
+    let mut ids = Vec::new();
+    for number in 1..=volumes.len() {
+        let request =
+            HttpDownloadRequest::new(format!("{server}/p{number}.rar"), dir.path().to_owned())
+                .with_filename(format!("game.part{number}.rar"))
+                .with_auto_extract(true);
+        let id = request.id();
+        engine
+            .command(|reply| EngineCommand::AddHttp { request, reply })
+            .await;
+        ids.push(id);
+    }
+
+    for id in ids {
+        let row = engine
+            .wait(id, |status, _| status.is_terminal() || status.is_failed())
+            .await;
+        assert_eq!(row.status, DownloadStatus::Completed, "{}", row.filename);
+    }
+
+    assert_eq!(
+        std::fs::read(dir.path().join("game/notes.txt")).unwrap(),
         b"notes"
     );
 }
