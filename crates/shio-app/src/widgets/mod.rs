@@ -10,10 +10,13 @@ pub(crate) use software_probe::SoftwareProbe;
 use crate::message::Message;
 use crate::style::{self, Button, ICON_BUTTON, Palette, SPACE_L, SPACE_S, SPACE_XL, SPACE_XS};
 use iced::widget::{
-    Space, Text, button, center, column, container, mouse_area, opaque, row, text, toggler, tooltip,
+    Space, Text, button, center, column, container, mouse_area, opaque, row, scrollable, text,
+    toggler, tooltip,
 };
 use iced::{Alignment, Color, Element, Length};
 use std::time::Duration;
+
+const MODAL_INSET: f32 = 2.0 * SPACE_XL;
 
 pub(crate) fn modal<'a>(
     card: impl Into<Element<'a, Message>>,
@@ -30,6 +33,21 @@ pub(crate) fn modal<'a>(
         None => backdrop,
     };
     opaque(backdrop)
+}
+
+/// A modal card's scrolling body, capped to the window.
+///
+/// iced lays out a shrinking column's children in order, so an uncapped body would take the
+/// height of the rows after it; `chrome` is the card's height without the body.
+pub(crate) fn modal_body<'a>(
+    body: impl Into<Element<'a, Message>>,
+    window_height: f32,
+    chrome: f32,
+    p: &Palette,
+) -> Element<'a, Message> {
+    container(scrollable(body).style(style::scrollable(*p)))
+        .max_height((window_height - MODAL_INSET - chrome).max(0.0))
+        .into()
 }
 
 pub(crate) fn text_button<'a>(

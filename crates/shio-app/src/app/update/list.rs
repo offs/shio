@@ -300,7 +300,7 @@ impl Shio {
     }
 }
 
-const fn is_resumable(status: DownloadStatus) -> bool {
+pub(super) const fn is_resumable(status: DownloadStatus) -> bool {
     matches!(status, DownloadStatus::Paused | DownloadStatus::Error)
 }
 

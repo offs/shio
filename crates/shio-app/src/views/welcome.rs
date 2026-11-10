@@ -3,10 +3,18 @@ use crate::message::{FirstRunStep, Message};
 use crate::platform::ASSOCIATION_SETUP_SUPPORTED;
 use crate::style::{self, Button, Palette, SPACE_L, SPACE_S, SPACE_XL, SPACE_XS};
 use crate::theme::ThemeCatalog;
-use crate::widgets::{pill, setting, text_button};
+use crate::widgets::{modal_body, pill, setting, text_button};
 use iced::widget::{Space, column, container, row, text};
 use iced::{Alignment, Element, Length};
 use shio_core::AppConfig;
+
+const PILL_HEIGHT: f32 = 6.0;
+const CHROME: f32 = 2.0 * SPACE_XL
+    + PILL_HEIGHT
+    + 3.0 * SPACE_XL
+    + (style::TEXT_TITLE + style::TEXT_BODY) * style::LINE_HEIGHT
+    + SPACE_XS
+    + style::CONTROL_HEIGHT;
 
 pub(crate) fn view<'a>(
     step: FirstRunStep,
@@ -14,6 +22,7 @@ pub(crate) fn view<'a>(
     catalog: &'a ThemeCatalog,
     blur_active: bool,
     noctalia: bool,
+    window_height: f32,
     p: &Palette,
 ) -> Element<'a, Message> {
     let (title, lead, body) = match step {
@@ -58,9 +67,9 @@ pub(crate) fn view<'a>(
     ]
     .map(|each| {
         if each == step {
-            pill(p.accent, 18.0, 6.0)
+            pill(p.accent, 18.0, PILL_HEIGHT)
         } else {
-            pill(p.pressed, 6.0, 6.0)
+            pill(p.pressed, PILL_HEIGHT, PILL_HEIGHT)
         }
     }))
     .spacing(SPACE_XS);
@@ -94,7 +103,7 @@ pub(crate) fn view<'a>(
                 text(lead).size(style::TEXT_BODY).color(p.text_secondary),
             ]
             .spacing(SPACE_XS),
-            body.spacing(SPACE_L),
+            modal_body(body.spacing(SPACE_L), window_height, CHROME, p),
             actions,
         ]
         .spacing(SPACE_XL),

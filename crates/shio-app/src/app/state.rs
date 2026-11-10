@@ -193,12 +193,7 @@ impl SettingsDraft {
         } else {
             SpeedUnit::KiB
         };
-        let (ratio, seconds) = match config.torrent.seed_policy {
-            SeedPolicy::RatioOrTime { ratio, seconds } => (ratio, seconds),
-            SeedPolicy::StopAtRatio { ratio } => (ratio, 7 * SECONDS_PER_DAY),
-            SeedPolicy::StopAtTime { seconds } => (1.0, seconds),
-            SeedPolicy::SeedForever | SeedPolicy::NeverSeed => (1.0, 7 * SECONDS_PER_DAY),
-        };
+        let (ratio, seconds) = seed_limits(config.torrent.seed_policy);
         Self {
             section: SettingsSection::General,
             max_concurrent: config.max_concurrent,
@@ -217,13 +212,21 @@ impl SettingsDraft {
         }
     }
 
+    // Fields whose text still matches what the config renders to keep the exact config value;
+    // the rendering is lossy (KiB, two decimals, whole days, one seed-policy shape).
     pub(super) fn apply(&mut self, config: &AppConfig) -> AppConfig {
+        let shown = Self::new(config);
         let mut next = config.clone();
         next.max_concurrent = self.max_concurrent;
         next.default_segments = self.segments;
 
         self.speed_limit_error = None;
-        if self.speed_limit_on {
+        let speed_limit_edited = self.speed_limit_on != shown.speed_limit_on
+            || self.speed_limit != shown.speed_limit
+            || self.speed_unit != shown.speed_unit;
+        if !self.speed_limit_on {
+            next.speed_limit = None;
+        } else if speed_limit_edited {
             match self
                 .speed_limit
                 .trim()
@@ -235,8 +238,6 @@ impl SettingsDraft {
                 Some(limit) => next.speed_limit = Some(limit),
                 None => self.speed_limit_error = Some("enter a whole number above 0"),
             }
-        } else {
-            next.speed_limit = None;
         }
 
         self.port_error = None;
@@ -247,38 +248,55 @@ impl SettingsDraft {
 
         self.ratio_error = None;
         self.days_error = None;
+        let (shown_ratio, shown_seconds) = seed_limits(config.torrent.seed_policy);
+        let seed_edited =
+            self.seed != shown.seed || self.ratio != shown.ratio || self.days != shown.days;
         next.torrent.seed_policy = match self.seed {
+            _ if !seed_edited => config.torrent.seed_policy,
             SeedPolicyChoice::SeedForever => SeedPolicy::SeedForever,
             SeedPolicyChoice::NeverSeed => SeedPolicy::NeverSeed,
             SeedPolicyChoice::StopAutomatically => {
-                let ratio = self
-                    .ratio
-                    .trim()
-                    .parse::<f32>()
-                    .ok()
-                    .filter(|ratio| ratio.is_finite() && *ratio >= 0.0);
-                let days = self
-                    .days
-                    .trim()
-                    .parse::<u64>()
-                    .ok()
-                    .filter(|days| *days <= MAX_SEED_DAYS);
+                let ratio = if self.ratio == shown.ratio {
+                    Some(shown_ratio)
+                } else {
+                    self.ratio
+                        .trim()
+                        .parse::<f32>()
+                        .ok()
+                        .filter(|ratio| ratio.is_finite() && *ratio >= 0.0)
+                };
+                let seconds = if self.days == shown.days {
+                    Some(shown_seconds)
+                } else {
+                    self.days
+                        .trim()
+                        .parse::<u64>()
+                        .ok()
+                        .filter(|days| *days <= MAX_SEED_DAYS)
+                        .map(|days| days * SECONDS_PER_DAY)
+                };
                 if ratio.is_none() {
                     self.ratio_error = Some("enter a ratio of 0 or more");
                 }
-                if days.is_none() {
+                if seconds.is_none() {
                     self.days_error = Some("enter whole days, up to 3650");
                 }
-                match (ratio, days) {
-                    (Some(ratio), Some(days)) => SeedPolicy::RatioOrTime {
-                        ratio,
-                        seconds: days * SECONDS_PER_DAY,
-                    },
+                match (ratio, seconds) {
+                    (Some(ratio), Some(seconds)) => SeedPolicy::RatioOrTime { ratio, seconds },
                     _ => config.torrent.seed_policy,
                 }
             },
         };
         next
+    }
+}
+
+const fn seed_limits(policy: SeedPolicy) -> (f32, u64) {
+    match policy {
+        SeedPolicy::RatioOrTime { ratio, seconds } => (ratio, seconds),
+        SeedPolicy::StopAtRatio { ratio } => (ratio, 7 * SECONDS_PER_DAY),
+        SeedPolicy::StopAtTime { seconds } => (1.0, seconds),
+        SeedPolicy::SeedForever | SeedPolicy::NeverSeed => (1.0, 7 * SECONDS_PER_DAY),
     }
 }
 
@@ -352,16 +370,39 @@ impl Shio {
     pub(super) fn row_error(&self, row: &Row) -> Option<&str> {
         match row.source {
             RowSource::Download(index) => self.downloads[index].error_message.as_deref(),
-            RowSource::Package(index) => {
-                let package = &self.packages[index];
-                package.error_message.as_deref().or_else(|| {
-                    package
-                        .child_ids()
-                        .filter_map(|id| self.download(id))
-                        .find_map(|part| part.error_message.as_deref())
-                })
-            },
+            RowSource::Package(index) => self.package_error(&self.packages[index]),
         }
+    }
+
+    pub(super) fn package_error<'a>(&'a self, package: &'a ArchivePackage) -> Option<&'a str> {
+        package.error_message.as_deref().or_else(|| {
+            package
+                .child_ids()
+                .filter_map(|id| self.download(id))
+                .find_map(|part| part.error_message.as_deref())
+        })
+    }
+
+    /// Row status of each package, in `packages` order.
+    pub(super) fn package_statuses(&self) -> Vec<DownloadStatus> {
+        if self.packages.is_empty() {
+            return Vec::new();
+        }
+        let by_id: HashMap<DownloadId, &Download> = self
+            .downloads
+            .iter()
+            .map(|download| (download.id, download))
+            .collect();
+        self.packages
+            .iter()
+            .map(|package| {
+                let parts: Vec<&Download> = package
+                    .child_ids()
+                    .filter_map(|id| by_id.get(&id).copied())
+                    .collect();
+                package_status(package, &parts)
+            })
+            .collect()
     }
 
     pub(super) fn download(&self, id: DownloadId) -> Option<&Download> {

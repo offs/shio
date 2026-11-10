@@ -86,7 +86,7 @@ impl Shio {
             Message::OpenAdd => self.open_add(""),
             Message::AddUrlsAction(action) => self.add_urls_action(action),
             Message::AddSubmit => self.add_submit(),
-            Message::AddSubmitted(results) => self.add_submitted(results),
+            Message::AddSubmitted { id, results } => self.add_submitted(id, results),
             Message::PickTorrentFiles => add::pick_torrent_files(),
             Message::TorrentFilesPicked(paths) => self.queue_sources("", paths),
             Message::TorrentFilesRead(picks) => self.torrent_files_read(picks),

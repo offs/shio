@@ -118,9 +118,7 @@ pub(crate) fn row_menu<'a>(
         | DownloadStatus::FetchingMetadata => {
             Some(entry("pause", Some("space"), Message::Pause(id)))
         },
-        DownloadStatus::Paused | DownloadStatus::Cancelled => {
-            Some(entry("resume", Some("space"), Message::Resume(id)))
-        },
+        DownloadStatus::Paused => Some(entry("resume", Some("space"), Message::Resume(id))),
         DownloadStatus::Error => Some(entry("retry", Some("f5"), Message::Retry(id))),
         DownloadStatus::ExtractError => Some(entry(
             "retry extraction",
@@ -131,7 +129,7 @@ pub(crate) fn row_menu<'a>(
             Some(entry("enter password…", None, Message::RequestPassword(id)))
         },
         DownloadStatus::Seeding => Some(entry("stop seeding", None, Message::StopSeeding(id))),
-        DownloadStatus::Extracting | DownloadStatus::Completed => None,
+        DownloadStatus::Extracting | DownloadStatus::Completed | DownloadStatus::Cancelled => None,
     };
     let verifiable = m.torrent
         && matches!(

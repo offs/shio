@@ -142,12 +142,17 @@ impl Shio {
                     &self.theme_catalog,
                     self.blur_active,
                     self.noctalia.is_some(),
+                    self.window.size.height,
                     p,
                 ),
                 None,
                 p,
             )),
-            Overlay::Add(add) => Some(modal(add_dialog::view(add, p), dismiss, p)),
+            Overlay::Add(add) => Some(modal(
+                add_dialog::view(add, self.window.size.height, p),
+                dismiss,
+                p,
+            )),
             Overlay::Settings(draft) => Some(modal(
                 settings::view(
                     draft,

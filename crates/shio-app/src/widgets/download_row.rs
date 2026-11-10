@@ -159,9 +159,7 @@ fn actions(r: &RowView<'_>, p: &Palette) -> Element<'static, Message> {
         | DownloadStatus::FetchingMetadata => {
             Some((bootstrap::pause_fill(), "pause", Message::Pause(id)))
         },
-        DownloadStatus::Paused | DownloadStatus::Cancelled => {
-            Some((bootstrap::play_fill(), "resume", Message::Resume(id)))
-        },
+        DownloadStatus::Paused => Some((bootstrap::play_fill(), "resume", Message::Resume(id))),
         DownloadStatus::Error => Some((bootstrap::arrow_clockwise(), "retry", Message::Retry(id))),
         DownloadStatus::ExtractError => Some((
             bootstrap::arrow_clockwise(),
@@ -178,7 +176,7 @@ fn actions(r: &RowView<'_>, p: &Palette) -> Element<'static, Message> {
             "stop seeding",
             Message::StopSeeding(id),
         )),
-        DownloadStatus::Extracting | DownloadStatus::Completed => None,
+        DownloadStatus::Extracting | DownloadStatus::Completed | DownloadStatus::Cancelled => None,
     };
     let primary = match primary {
         Some((icon, hint, message)) => icon_button(icon, hint, Some(message), p),

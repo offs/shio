@@ -134,10 +134,12 @@ impl Shio {
         let Overlay::Add(dialog) = &mut self.overlay else {
             return Task::none();
         };
-        if dialog.submitting || !matches!(dialog.validation, AddValidation::Ready(_)) {
+        if dialog.submitting.is_some() || !matches!(dialog.validation, AddValidation::Ready(_)) {
             return Task::none();
         }
-        let requests = dialog.submit();
+        self.next_request += 1;
+        let id = self.next_request;
+        let requests = dialog.submit(id);
         let engine = self.engine.clone();
         Task::perform(
             async move {
@@ -167,17 +169,24 @@ impl Shio {
                 }
                 results
             },
-            Message::AddSubmitted,
+            move |results| Message::AddSubmitted { id, results },
         )
     }
 
-    pub(super) fn add_submitted(&mut self, results: Vec<Result<(), String>>) -> Task<Message> {
-        let Overlay::Add(dialog) = &mut self.overlay else {
-            let failed = results.iter().filter(|result| result.is_err()).count();
-            if failed > 0 {
-                self.push_toast(ToastKind::Error, format!("{failed} could not be added"));
-            }
-            return Task::none();
+    pub(super) fn add_submitted(
+        &mut self,
+        id: u64,
+        results: Vec<Result<(), String>>,
+    ) -> Task<Message> {
+        let dialog = match &mut self.overlay {
+            Overlay::Add(dialog) if dialog.submitting == Some(id) => dialog,
+            _ => {
+                let failed = results.iter().filter(|result| result.is_err()).count();
+                if failed > 0 {
+                    self.push_toast(ToastKind::Error, format!("{failed} could not be added"));
+                }
+                return Task::none();
+            },
         };
         let (added, previews) = dialog.finish_submit(results, &mut self.next_request);
         let finished =
@@ -441,5 +450,41 @@ mod tests {
         app.clipboard_offer = None;
         app.clipboard_read(Some("https://e.com/new.iso".to_owned()));
         assert_eq!(offered(&app), None, "the same text is never offered twice");
+    }
+
+    #[test]
+    fn add_results_only_finish_the_submission_that_sent_them() {
+        let (engine, _) = mpsc::channel(1);
+        let config = shio_core::AppConfig {
+            download_dir: std::env::temp_dir(),
+            ..Default::default()
+        };
+        let mut app = Shio::build(config, engine);
+        let submitting = |app: &Shio| match &app.overlay {
+            Overlay::Add(dialog) => dialog.submitting,
+            _ => None,
+        };
+
+        let _ = app.open_add("https://e.com/a.bin");
+        let _ = app.add_submit();
+        let cancelled = submitting(&app).expect("the first batch is submitting");
+        let _ = app.close_overlay();
+        let _ = app.open_add("https://e.com/b.bin");
+        let _ = app.add_submitted(cancelled, vec![Err("not found (404)".to_owned())]);
+
+        let Overlay::Add(dialog) = &app.overlay else {
+            panic!("the new dialog stays open");
+        };
+        assert_eq!(dialog.urls.text().trim(), "https://e.com/b.bin");
+        assert_eq!(dialog.failures, Vec::<(String, String)>::new());
+        assert_eq!(
+            app.toast.as_ref().map(|toast| toast.kind),
+            Some(ToastKind::Error)
+        );
+
+        let _ = app.add_submit();
+        let current = submitting(&app).expect("the new batch is submitting");
+        let _ = app.add_submitted(cancelled, vec![Ok(())]);
+        assert_eq!(submitting(&app), Some(current));
     }
 }

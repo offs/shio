@@ -112,12 +112,15 @@ pub(crate) fn reject_activations() {
 fn listen(listener: &Listener, tx: &Sender<Activation>) {
     loop {
         let result = transport::accept(listener).and_then(|mut stream| {
-            let activation = decode(&read_request(&mut stream)?)?;
-            if !ACCEPTING.load(Ordering::Acquire) {
-                return Err(io::Error::other("shio is shutting down"));
-            }
-            tx.try_send(activation).map_err(io::Error::other)?;
-            stream.write_all(&[1])
+            let request = read_request(&mut stream)?;
+            let accepted = decode(&request).and_then(|activation| {
+                if !ACCEPTING.load(Ordering::Acquire) {
+                    return Err(io::Error::other("shio is shutting down"));
+                }
+                tx.try_send(activation).map_err(io::Error::other)
+            });
+            let ack = stream.write_all(&[u8::from(accepted.is_ok())]);
+            accepted.and(ack)
         });
         if let Err(error) = result {
             tracing::warn!("ignored instance activation: {error}");
@@ -151,13 +154,15 @@ fn forward(endpoint: &Path, activation: &Activation) -> io::Result<()> {
     let deadline = Instant::now() + FORWARD_TIMEOUT;
     loop {
         match forward_once(endpoint, &request) {
+            Ok(true) => return Ok(()),
+            Ok(false) => return Err(io::Error::other("the running shio rejected the launch")),
             Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(25)),
-            result => return result,
+            Err(error) => return Err(error),
         }
     }
 }
 
-fn forward_once(endpoint: &Path, request: &[u8]) -> io::Result<()> {
+fn forward_once(endpoint: &Path, request: &[u8]) -> io::Result<bool> {
     let mut stream = transport::connect(endpoint)?;
     stream.set_read_timeout(Some(FORWARD_TIMEOUT))?;
     stream.set_write_timeout(Some(FORWARD_TIMEOUT))?;
@@ -165,11 +170,7 @@ fn forward_once(endpoint: &Path, request: &[u8]) -> io::Result<()> {
     stream.shutdown(std::net::Shutdown::Write)?;
     let mut ack = [0];
     stream.read_exact(&mut ack)?;
-    if ack == [1] {
-        Ok(())
-    } else {
-        Err(io::Error::other("the running shio rejected the launch"))
-    }
+    Ok(ack == [1])
 }
 
 #[cfg(unix)]
@@ -439,6 +440,22 @@ mod tests {
 
         drop(first);
         drop(InstanceGuard::acquire_in(&dir, &endpoint, &idle).unwrap());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn rejected_launches_fail_without_retrying() {
+        let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().simple().to_string());
+        create_private_dir(&dir).unwrap();
+        let endpoint = transport::local_endpoint(&dir);
+        let listener = transport::bind(&endpoint).unwrap();
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        drop(rx);
+        std::thread::spawn(move || listen(&listener, &tx));
+
+        let started = Instant::now();
+        assert!(forward(&endpoint, &activation(&["magnet:?a"], None)).is_err());
+        assert!(started.elapsed() < FORWARD_TIMEOUT);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

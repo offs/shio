@@ -21,7 +21,10 @@ const INTER_BYTES: &[u8] = include_bytes!("../../../assets/fonts/Inter-Variable.
 fn main() -> iced::Result {
     prefer_integrated_gpu();
     if std::env::args_os().any(|arg| arg == platform::UNREGISTER_FLAG) {
-        if let Err(error) = platform::unregister_associations() {
+        let removed = platform::unregister_associations();
+        #[cfg(windows)]
+        let removed = removed.and_then(|()| platform::unregister_app_id());
+        if let Err(error) = removed {
             eprintln!("could not remove file associations: {error}");
             std::process::exit(1);
         }

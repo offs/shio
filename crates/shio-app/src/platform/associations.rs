@@ -342,7 +342,6 @@ mod linux {
 #[cfg(windows)]
 mod windows {
     use crate::platform::registry::{delete_tree, delete_value, read_default, write_key};
-    use crate::platform::{app_id_key, icon_path, remove_if_exists};
     use std::io;
     use std::path::Path;
 
@@ -428,15 +427,11 @@ mod windows {
             TORRENT_PROG_ID,
             MAGNET_PROG_ID,
             APPLICATION,
-            &app_id_key(),
         ] {
             delete_tree(key)?;
         }
         delete_value("Software\\RegisteredApplications", "Shio")?;
         delete_value(OPEN_WITH, "Shio.Torrent")?;
-        if let Some(icon) = icon_path() {
-            remove_if_exists(&icon)?;
-        }
         notify_changed();
         Ok(())
     }

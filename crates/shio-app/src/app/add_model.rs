@@ -25,7 +25,7 @@ pub(crate) struct AddDialog {
     pub(crate) create_subfolder: bool,
     pub(crate) subfolder: String,
     pub(crate) auto_extract: bool,
-    pub(crate) submitting: bool,
+    pub(crate) submitting: Option<u64>,
     pub(crate) failures: Vec<(String, String)>,
     pub(crate) validation: AddValidation,
     subfolder_edited: bool,
@@ -177,7 +177,7 @@ impl AddDialog {
             create_subfolder: config.default_create_subfolder,
             subfolder: String::new(),
             auto_extract: config.default_auto_extract,
-            submitting: false,
+            submitting: None,
             failures: Vec::new(),
             validation: AddValidation::Empty,
             subfolder_edited: false,
@@ -205,7 +205,7 @@ impl AddDialog {
             urls.push('\n');
         }
         urls.push_str(text);
-        self.urls = text_editor::Content::with_text(&truncate_text_bytes(urls, MAX_URL_TEXT_BYTES));
+        self.urls = text_editor::Content::with_text(&urls);
     }
 
     pub(super) fn set_subfolder(&mut self, name: String) {
@@ -432,6 +432,10 @@ impl AddDialog {
             return;
         };
         match result.result {
+            Ok(_) if self.torrents.len() >= MAX_TORRENTS => {
+                self.links[index].state =
+                    LinkState::Failed(format!("up to {MAX_TORRENTS} torrents at once"));
+            },
             Ok(manifest) => {
                 self.links.remove(index);
                 self.torrents.push(TorrentPick {
@@ -456,7 +460,7 @@ impl AddDialog {
         let mut problems = Vec::new();
         for pick in picks {
             match pick {
-                Ok(_) if self.torrents.len() == MAX_TORRENTS => {
+                Ok(_) if self.torrents.len() >= MAX_TORRENTS => {
                     problems.push(format!("up to {MAX_TORRENTS} torrents at once"));
                     break;
                 },
@@ -640,7 +644,7 @@ impl AddDialog {
         Ok(items)
     }
 
-    pub(super) fn submit(&mut self) -> Vec<AddRequest> {
+    pub(super) fn submit(&mut self, id: u64) -> Vec<AddRequest> {
         let save_path = PathBuf::from(self.save_path.trim());
         let subfolder = shio_core::subfolder_value(self.create_subfolder, &self.subfolder);
         let torrent_path = subfolder
@@ -648,7 +652,7 @@ impl AddDialog {
             .map_or_else(|| save_path.clone(), |subfolder| save_path.join(subfolder));
         let rename = self.filename.trim();
         let rename = (self.single_http() && !rename.is_empty()).then_some(rename);
-        self.submitting = true;
+        self.submitting = Some(id);
         self.failures.clear();
         self.submitted.clear();
         let mut requests = Vec::with_capacity(self.plan.len());
@@ -716,7 +720,7 @@ impl AddDialog {
         results: Vec<Result<(), String>>,
         next_request: &mut u64,
     ) -> (usize, Previews) {
-        self.submitting = false;
+        self.submitting = None;
         let mut added = 0;
         let mut added_urls = HashSet::new();
         for ((label, source), result) in self.submitted.drain(..).zip(results) {
@@ -850,14 +854,14 @@ mod tests {
     #[test]
     fn failed_items_stay_in_the_form_with_their_reason() {
         let (mut dialog, _) = dialog("https://e.com/a.bin\nhttps://e.com/b.bin");
-        assert_eq!(dialog.submit().len(), 2);
-        assert!(dialog.submitting);
+        assert_eq!(dialog.submit(1).len(), 2);
+        assert_eq!(dialog.submitting, Some(1));
 
         let (added, _) =
             dialog.finish_submit(vec![Ok(()), Err("not found (404)".to_owned())], &mut 2);
 
         assert_eq!(added, 1);
-        assert!(!dialog.submitting);
+        assert_eq!(dialog.submitting, None);
         assert_eq!(
             dialog.failures,
             [("b.bin".to_owned(), "not found (404)".to_owned())]
@@ -877,7 +881,7 @@ mod tests {
         assert_eq!(dialog.validation, one_set);
         assert!(dialog.links[2].mirror);
         assert_eq!(dialog.subfolder, "Game");
-        assert_eq!(dialog.submit().len(), 1);
+        assert_eq!(dialog.submit(3).len(), 1);
         dialog.finish_submit(vec![Ok(())], &mut 3);
         assert_eq!(dialog.urls.text().trim(), "");
 
@@ -931,6 +935,55 @@ mod tests {
             dialog.validation,
             AddValidation::Ready("1 archive set".to_owned())
         );
+    }
+
+    #[test]
+    fn appending_past_the_text_cap_is_flagged_instead_of_cut_silently() {
+        let long = |n: usize| format!("https://e.com/{n}/{}.bin", "x".repeat(280));
+        let text: Vec<String> = (0..200).map(long).collect();
+        let (mut dialog, _) = dialog(&text.join("\n"));
+        assert!(matches!(dialog.validation, AddValidation::Ready(_)));
+
+        let more: Vec<String> = (200..240).map(long).collect();
+        dialog.append_text(&more.join("\n"));
+        dialog.sync_links(&mut 0);
+
+        assert!(matches!(dialog.validation, AddValidation::Invalid(_)));
+    }
+
+    #[test]
+    fn magnet_previews_and_picks_share_the_torrent_cap() {
+        let magnets: Vec<String> = (0..=MAX_TORRENTS)
+            .map(|n| format!("magnet:?xt=urn:btih:{n:040x}"))
+            .collect();
+        let (mut dialog, previews) = dialog(&magnets.join("\n"));
+        assert_eq!(previews.magnets.len(), MAX_TORRENTS + 1);
+        for (request_id, magnet) in previews.magnets {
+            dialog.apply_magnet_preview(MagnetPreviewResult {
+                request_id,
+                magnet,
+                result: Ok(shio_core::MagnetPreviewManifest {
+                    name: "t".to_owned(),
+                    total_size: 1,
+                    is_private: false,
+                    files: Vec::new(),
+                    trackers: Vec::new(),
+                    metadata_bytes: Vec::new(),
+                }),
+            });
+        }
+        assert_eq!(dialog.torrents.len(), MAX_TORRENTS);
+
+        let pick = TorrentPick {
+            id: 0,
+            name: "f".to_owned(),
+            files: Vec::new(),
+            source: PickSource::File("/f.torrent".into()),
+            bytes: Vec::new(),
+        };
+        let problems = dialog.add_torrents(vec![Ok(pick)], &mut 100);
+        assert_eq!(problems.len(), 1);
+        assert_eq!(dialog.torrents.len(), MAX_TORRENTS);
     }
 
     #[test]
