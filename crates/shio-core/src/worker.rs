@@ -727,7 +727,7 @@ pub(crate) async fn same_file(left: &Path, right: &Path) -> Result<bool> {
     Ok(false)
 }
 
-fn files_equal(left: &Path, right: &Path) -> Result<bool> {
+pub(crate) fn files_equal(left: &Path, right: &Path) -> Result<bool> {
     if regular_file_len(left) != regular_file_len(right) {
         return Ok(false);
     }

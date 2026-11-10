@@ -86,6 +86,13 @@ fn parse_torrent(bytes: &[u8]) -> Result<(TorrentManifest, Vec<StagedFile>)> {
         {
             return Err(invalid("torrent file path escapes its folder"));
         }
+        // librqbit stages under the raw names, so Windows could not create a renamed one.
+        if cfg!(windows) && components.iter().any(|component| needs_rename(component)) {
+            return Err(invalid(
+                "this torrent cannot be downloaded on Windows: a file name contains \
+                 \\ : * ? \" < > | or a control character, or ends with a dot or space",
+            ));
+        }
         let path = components
             .iter()
             .map(|component| destination_component(component))
@@ -166,6 +173,10 @@ fn destination_component(raw: &str) -> String {
         name.push('_');
     }
     name
+}
+
+fn needs_rename(raw: &str) -> bool {
+    destination_component(raw) != raw
 }
 
 fn validate_collections(files: &[TorrentFile], trackers: &[String]) -> Result<()> {
@@ -404,11 +415,36 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn names_windows_cannot_store_need_a_rename() {
+        for name in [
+            "dir:x",
+            "what?.mkv",
+            "a*b",
+            "\"q\"",
+            "<x>",
+            "a|b",
+            "end.",
+            "end ",
+            "a\tb",
+        ] {
+            assert!(needs_rename(name), "{name:?}");
+        }
+        for name in ["ok.txt", "日本語.mkv", ".hidden", "a b.c"] {
+            assert!(!needs_rename(name), "{name:?}");
+        }
+    }
+
+    #[test]
     fn portable_destination_names_keep_the_raw_staged_name() {
         let bytes = bencode_torrent(&[("", &["dir:x", "what?.mkv "], 10), ("", &["ok.txt"], 1)]);
 
-        let (manifest, staged) = parse_torrent(&bytes).expect("manifest");
+        let parsed = parse_torrent(&bytes);
 
+        if cfg!(windows) {
+            assert!(parsed.is_err(), "librqbit could not stage these names");
+            return;
+        }
+        let (manifest, staged) = parsed.expect("manifest");
         assert_eq!(manifest.files[0].path, PathBuf::from("dir_x/what_.mkv"));
         assert_eq!(staged[0].path, PathBuf::from("dir:x/what?.mkv "));
         assert_eq!(manifest.files[1].path, PathBuf::from("ok.txt"));

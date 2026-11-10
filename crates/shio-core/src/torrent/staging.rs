@@ -20,6 +20,10 @@ fn published_marker(download: &Download) -> PathBuf {
     staging_root(download).join("published")
 }
 
+fn publish_intent(download: &Download) -> PathBuf {
+    staging_root(download).join("publishing")
+}
+
 fn owner_marker(download: &Download) -> PathBuf {
     staging_root(download).join("owner")
 }
@@ -41,22 +45,16 @@ pub(super) async fn ensure_owned_staging(download: &Download) -> Result<PathBuf>
     tokio::fs::create_dir_all(&download.save_path).await?;
     let root = staging_root(download);
     match tokio::fs::create_dir(&root).await {
-        Ok(()) => {
-            #[cfg(unix)]
-            tokio::fs::set_permissions(&root, std::os::unix::fs::PermissionsExt::from_mode(0o700))
-                .await?;
-            crate::worker::sync_parent_directory(&root).await?;
-            if let Err(error) =
-                write_marker(&owner_marker(download), download.id.to_string().as_bytes()).await
-            {
-                if let Err(cleanup_error) = tokio::fs::remove_dir(&root).await {
-                    tracing::warn!(path = %root.display(), "failed to clean uninitialized torrent staging directory: {cleanup_error}");
-                }
-                return Err(error);
-            }
-        },
+        Ok(()) => initialize_staging(download).await?,
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            verify_owner(download).await?;
+            if let Err(error) = verify_owner(download).await {
+                if !matches!(error, ShioError::DestinationExists(_))
+                    || !adopt_ownerless(download).await?
+                {
+                    return Err(error);
+                }
+                initialize_staging(download).await?;
+            }
         },
         Err(error) => return Err(error.into()),
     }
@@ -72,6 +70,47 @@ pub(super) async fn ensure_owned_staging(download: &Download) -> Result<PathBuf>
         Err(error) => return Err(error.into()),
     }
     Ok(payload)
+}
+
+async fn initialize_staging(download: &Download) -> Result<()> {
+    let root = staging_root(download);
+    let initialized = async {
+        #[cfg(unix)]
+        tokio::fs::set_permissions(&root, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .await?;
+        crate::worker::sync_parent_directory(&root).await?;
+        write_marker(&owner_marker(download), download.id.to_string().as_bytes()).await
+    }
+    .await;
+    if initialized.is_err()
+        && let Err(cleanup_error) = tokio::fs::remove_dir(&root).await
+    {
+        tracing::warn!(path = %root.display(), "failed to clean uninitialized torrent staging directory: {cleanup_error}");
+    }
+    initialized
+}
+
+/// A crash during creation leaves the root empty or holding only an empty owner file; such a
+/// root is adopted, anything else may be someone else's.
+async fn adopt_ownerless(download: &Download) -> Result<bool> {
+    let root = staging_root(download);
+    let metadata = tokio::fs::symlink_metadata(&root).await?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Ok(false);
+    }
+    let mut entries = tokio::fs::read_dir(&root).await?;
+    let mut empty_owner = false;
+    while let Some(entry) = entries.next_entry().await? {
+        let metadata = entry.metadata().await?;
+        if entry.file_name() != "owner" || !metadata.is_file() || metadata.len() != 0 {
+            return Ok(false);
+        }
+        empty_owner = true;
+    }
+    if empty_owner {
+        tokio::fs::remove_file(owner_marker(download)).await?;
+    }
+    Ok(true)
 }
 
 async fn write_marker(path: &Path, contents: &[u8]) -> Result<()> {
@@ -211,14 +250,14 @@ pub(crate) async fn prepare_completed_recheck(download: &Download) -> Result<()>
 
 pub(super) async fn check_destinations(download: &Download, staged: &[StagedFile]) -> Result<()> {
     let payload = payload_dir(download);
-    for (file, staged) in selected(&torrent(download)?.files, staged) {
+    let files = &torrent(download)?.files;
+    let intended = marker_matches(&publish_intent(download), &intent_contents(files)).await?;
+    for (file, staged) in selected(files, staged) {
         let destination = download.save_path.join(&file.path);
         match tokio::fs::symlink_metadata(&destination).await {
             Ok(_) => {
-                if !matches!(
-                    crate::worker::same_file(&payload.join(&staged.path), &destination).await,
-                    Ok(true)
-                ) {
+                let source = payload.join(&staged.path);
+                if !is_own_publication(&source, &destination, file.size, intended).await? {
                     return Err(ShioError::DestinationExists(destination));
                 }
             },
@@ -227,6 +266,54 @@ pub(super) async fn check_destinations(download: &Download, staged: &[StagedFile
         }
     }
     Ok(())
+}
+
+/// The selected file indices; durable before the first destination of a publication appears.
+fn intent_contents(files: &[TorrentFile]) -> Vec<u8> {
+    use std::fmt::Write as _;
+    let mut intent = String::new();
+    for (index, _) in files.iter().enumerate().filter(|(_, file)| file.selected) {
+        let _ = writeln!(intent, "{index}");
+    }
+    intent.into_bytes()
+}
+
+/// An existing destination is this download's own when it links the staged file or, when an
+/// interrupted publication intended it, is a byte-equal copy or the staged file moved out.
+async fn is_own_publication(
+    source: &Path,
+    destination: &Path,
+    size: u64,
+    intended: bool,
+) -> Result<bool> {
+    if matches!(
+        crate::worker::same_file(source, destination).await,
+        Ok(true)
+    ) {
+        return Ok(true);
+    }
+    if !intended {
+        return Ok(false);
+    }
+    match tokio::fs::symlink_metadata(source).await {
+        Ok(_) => {
+            let (source, destination) = (source.to_owned(), destination.to_owned());
+            crate::worker::blocking(move || crate::worker::files_equal(&source, &destination)).await
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(tokio::fs::symlink_metadata(destination)
+                .await
+                .is_ok_and(|metadata| metadata.is_file() && metadata.len() == size))
+        },
+        Err(error) => Err(error.into()),
+    }
+}
+
+async fn remove_file_if_exists(path: &Path) -> std::io::Result<()> {
+    match tokio::fs::remove_file(path).await {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        removed => removed,
+    }
 }
 
 /// `may_move` lets a file leave staging when hard links are unsupported; rollback moves it back.
@@ -238,18 +325,23 @@ pub(super) async fn publish_payload(
     if is_published(download).await? {
         return Ok(());
     }
+    let files = &torrent(download)?.files;
+    let intent_path = publish_intent(download);
+    let intent = intent_contents(files);
+    let recovering = marker_matches(&intent_path, &intent).await?;
+    if !recovering {
+        remove_file_if_exists(&intent_path).await?;
+        write_marker(&intent_path, &intent).await?;
+    }
     let payload = payload_dir(download);
     let mut published = Vec::new();
     let result = async {
-        for (file, staged) in selected(&torrent(download)?.files, staged) {
+        for (file, staged) in selected(files, staged) {
             ensure_destination_parent(&download.save_path, &file.path).await?;
             let source = payload.join(&staged.path);
             let destination = download.save_path.join(&file.path);
             if tokio::fs::symlink_metadata(&destination).await.is_ok() {
-                if matches!(
-                    crate::worker::same_file(&source, &destination).await,
-                    Ok(true)
-                ) {
+                if is_own_publication(&source, &destination, file.size, recovering).await? {
                     continue;
                 }
                 return Err(ShioError::DestinationExists(destination));
@@ -262,17 +354,22 @@ pub(super) async fn publish_payload(
     }
     .await;
     if result.is_err() {
+        let mut rolled_back = true;
         for (path, moved_from) in &published {
             let undone = match moved_from {
                 Some(source) => crate::worker::rename_no_clobber(path, source),
-                None => match tokio::fs::remove_file(path).await {
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                    undone => undone,
-                },
+                None => remove_file_if_exists(path).await,
             };
             if let Err(error) = undone {
+                rolled_back = false;
                 tracing::warn!(path = %path.display(), "torrent publish rollback failed: {error}");
             }
+        }
+        if !recovering
+            && rolled_back
+            && let Err(error) = remove_file_if_exists(&intent_path).await
+        {
+            tracing::warn!(path = %intent_path.display(), "failed to clear torrent publish intent: {error}");
         }
     }
     result
@@ -349,6 +446,78 @@ mod tests {
             published_files(&download).await.expect("owned"),
             Vec::<PathBuf>::new()
         );
+
+        tokio::fs::write(&destination, b"torrent")
+            .await
+            .expect("identical user file");
+        assert!(matches!(
+            check_destinations(&download, &staged_layout).await,
+            Err(ShioError::DestinationExists(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn publication_interrupted_after_a_copy_or_move_is_recovered() {
+        for moved in [false, true] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let (download, staged_layout) = staged_download(temp.path());
+            let staged = stage_payload(&download).await;
+            let destination = temp.path().join("release/file.bin");
+            tokio::fs::create_dir(temp.path().join("release"))
+                .await
+                .expect("dir");
+            tokio::fs::copy(&staged, &destination).await.expect("copy");
+            assert!(
+                matches!(
+                    check_destinations(&download, &staged_layout).await,
+                    Err(ShioError::DestinationExists(_))
+                ),
+                "a copy is never adopted without a publish intent"
+            );
+            let files = &download.torrent().expect("torrent").files;
+            write_marker(&publish_intent(&download), &intent_contents(files))
+                .await
+                .expect("intent");
+            if moved {
+                tokio::fs::remove_file(&staged).await.expect("moved out");
+            }
+
+            check_destinations(&download, &staged_layout)
+                .await
+                .expect("own publication is accepted");
+            publish_payload(&download, &staged_layout, moved)
+                .await
+                .expect("publication resumes");
+
+            assert_eq!(
+                published_files(&download).await.expect("owned"),
+                std::slice::from_ref(&destination)
+            );
+            assert_eq!(
+                tokio::fs::read(&destination).await.expect("dest"),
+                b"torrent"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn ownerless_staging_root_left_by_a_crash_is_adopted() {
+        for empty_owner in [false, true] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let (download, _) = staged_download(temp.path());
+            let root = staging_root(&download);
+            tokio::fs::create_dir(&root).await.expect("crashed stage");
+            if empty_owner {
+                tokio::fs::write(owner_marker(&download), b"")
+                    .await
+                    .expect("empty owner");
+            }
+
+            let payload = ensure_owned_staging(&download).await.expect("adopted");
+
+            assert!(payload.is_dir());
+            verify_owner(&download).await.expect("owned");
+        }
     }
 
     #[tokio::test]
