@@ -132,10 +132,17 @@ struct Evidence {
     captcha: bool,
     challenged: bool,
     password: bool,
+    transient: Option<ShioError>,
 }
 
 impl Evidence {
-    const fn into_error(self) -> ShioError {
+    fn note(&mut self, error: ShioError) {
+        if self.transient.is_none() && crate::probe::is_transient(&error) {
+            self.transient = Some(error);
+        }
+    }
+
+    fn into_error(self) -> ShioError {
         if self.password {
             ShioError::PagePasswordProtected
         } else if self.captcha {
@@ -143,7 +150,7 @@ impl Evidence {
         } else if self.challenged {
             ShioError::BrowserCheck
         } else {
-            ShioError::NoFileOnPage
+            self.transient.unwrap_or(ShioError::NoFileOnPage)
         }
     }
 }
@@ -184,7 +191,10 @@ async fn search(client: &reqwest::Client, start: Url) -> Result<Resolved> {
         let response = match send(client, request).await {
             Ok(response) => response,
             Err(error) if step.depth == 0 => return Err(error),
-            Err(_) => continue,
+            Err(error) => {
+                evidence.note(error);
+                continue;
+            },
         };
         if step.depth == 0 {
             origins.push(site(response.url()));
@@ -221,9 +231,11 @@ async fn search(client: &reqwest::Client, start: Url) -> Result<Resolved> {
             continue;
         }
         if !status.is_success() {
+            let error = crate::probe::http_error(&response);
             if step.depth == 0 {
-                return Err(crate::probe::http_error(&response));
+                return Err(error);
             }
+            evidence.note(error);
             continue;
         }
 
@@ -245,7 +257,10 @@ async fn search(client: &reqwest::Client, start: Url) -> Result<Resolved> {
         let body = match read_bounded(response).await {
             Ok(body) => body,
             Err(error) if step.depth == 0 => return Err(error),
-            Err(_) => continue,
+            Err(error) => {
+                evidence.note(error);
+                continue;
+            },
         };
         let page = crate::worker::blocking(move || {
             Ok(if json {
@@ -303,8 +318,13 @@ fn accept_file(
         && (hint.name.is_some() || disposition.is_some());
     accepted.then(|| {
         let referer = request.referer.as_ref().unwrap_or_else(|| response.url());
+        let url = if request.body.is_none() && !request.htmx {
+            without_fragment(&request.url)
+        } else {
+            response.url().to_string()
+        };
         Resolved {
-            url: response.url().to_string(),
+            url,
             headers: vec![("Referer".to_owned(), referer.to_string())],
         }
     })

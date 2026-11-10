@@ -693,6 +693,63 @@ async fn decoy_files_are_never_downloaded() {
 }
 
 #[tokio::test]
+async fn resolved_links_reissue_their_signed_redirects() {
+    let body = payload(BODY_LEN);
+    let issued = AtomicUsize::new(0);
+    let used = Mutex::new(std::collections::HashSet::new());
+    let server = spawn_server({
+        let body = body.clone();
+        move |request| match request.path.as_str() {
+            "/page" => html(r#"<a href="/dl/file.bin">file.bin</a>"#),
+            "/dl/file.bin" => {
+                let signature = issued.fetch_add(1, Ordering::SeqCst);
+                let location = format!("Location: /cdn/file.bin?sig={signature}\r\n");
+                response("302 Found", &location, b"")
+            },
+            path if path.starts_with("/cdn/") && used.lock().insert(path.to_owned()) => {
+                ranged(&body, request)
+            },
+            _ => response("403 Forbidden", "", b""),
+        }
+    })
+    .await;
+
+    let (row, _dir) = download(format!("{server}/page#file.bin"), 4).await;
+
+    assert_eq!(
+        row.status,
+        DownloadStatus::Completed,
+        "{:?}",
+        row.error_message
+    );
+    assert_eq!(std::fs::read(row.file_path()).unwrap(), body);
+}
+
+#[tokio::test]
+async fn busy_hosts_report_their_error_instead_of_an_empty_page() {
+    let server = spawn_server(|request| match request.path.as_str() {
+        "/page" => html(r#"<a href="/file.bin">file.bin</a>"#),
+        "/file.bin" => response("503 Service Unavailable", "", b""),
+        _ => not_found(),
+    })
+    .await;
+
+    let (row, _dir) = download(format!("{server}/page#file.bin"), 1).await;
+
+    assert_eq!(row.status, DownloadStatus::Error);
+    assert_eq!(
+        row.error_message,
+        Some(
+            ShioError::Http {
+                code: 503,
+                retry_after: None
+            }
+            .short_label()
+        )
+    );
+}
+
+#[tokio::test]
 async fn captcha_and_password_pages_fail_with_a_clear_reason() {
     let captcha = spawn_server(|_| {
         html(
