@@ -76,6 +76,8 @@ pub(super) struct Window {
     pub(super) focused: bool,
     pub(super) maximized: bool,
     pub(super) size: Size,
+    /// Bottom of the title bar, banners and tabs, where the sort menu opens.
+    pub(super) header_height: f32,
     /// Whether the window was opened with blur; see `blur::apply`.
     pub(super) blur: bool,
 }
@@ -314,6 +316,7 @@ impl Shio {
                 focused: false,
                 maximized: false,
                 size: super::update::WINDOW_SIZE,
+                header_height: 0.0,
                 blur: false,
             },
             blur_active: false,

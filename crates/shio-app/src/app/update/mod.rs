@@ -309,6 +309,10 @@ impl Shio {
             Message::WindowOpened => self.window_opened(),
             Message::WindowFocused(focused) => self.window_focused(focused),
             Message::WindowResized(size) => self.window_resized(size),
+            Message::HeaderResized(height) => {
+                self.window.header_height = height;
+                Task::none()
+            },
             Message::Maximized(maximized) => {
                 self.window.maximized = maximized;
                 Task::none()

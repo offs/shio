@@ -10,7 +10,6 @@ use shio_core::{DownloadId, DownloadStatus};
 const MENU_WIDTH: f32 = 200.0;
 const ITEM_HEIGHT: f32 = 28.0;
 const CARD_INSET: f32 = 2.0 * (SPACE_XS + 1.0);
-const SORT_MENU_TOP: f32 = TITLEBAR_HEIGHT + 30.0;
 const COPY_SHORTCUT: &str = if cfg!(target_os = "macos") {
     "⌘c"
 } else {
@@ -193,6 +192,7 @@ pub(crate) fn row_menu<'a>(
 pub(crate) fn sort_menu<'a>(
     current: SortKey,
     descending: bool,
+    top: f32,
     window: Size,
     p: &Palette,
 ) -> Element<'a, Message> {
@@ -215,7 +215,7 @@ pub(crate) fn sort_menu<'a>(
         })
         .collect();
     let menu = card([items], MENU_WIDTH, p);
-    let at = Point::new(window.width - MENU_WIDTH - SPACE_S, SORT_MENU_TOP);
+    let at = Point::new(window.width - MENU_WIDTH - SPACE_S, top);
     float(menu, at, window)
 }
 

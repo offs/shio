@@ -146,6 +146,7 @@ pub(crate) enum Message {
     WindowOpened,
     WindowFocused(bool),
     WindowResized(Size),
+    HeaderResized(f32),
     Maximized(bool),
     WindowDrag,
     WindowResize(window::Direction),

@@ -43,7 +43,7 @@ impl std::fmt::Display for InstanceGuardError {
             Self::ForwardFailed(error) => {
                 write!(f, "shio is already running, but forwarding failed: {error}")
             },
-            Self::Unavailable { path, source } => write!(f, "lock {}: {source}", path.display()),
+            Self::Unavailable { path, source } => write!(f, "{}: {source}", path.display()),
         }
     }
 }
@@ -57,12 +57,12 @@ impl InstanceGuard {
                 .ok()
                 .filter(|token| valid_token(token.as_bytes())),
         };
-        Self::acquire_in(&dir, &transport::endpoint(&dir), &activation)
+        Self::acquire_in(&dir, transport::endpoint, &activation)
     }
 
     fn acquire_in(
         dir: &Path,
-        endpoint: &Path,
+        endpoint: fn(&Path) -> PathBuf,
         activation: &Activation,
     ) -> Result<Self, InstanceGuardError> {
         let path = dir.join("shio.instance.lock");
@@ -80,9 +80,15 @@ impl InstanceGuard {
                 .write(true),
         )
         .map_err(unavailable)?;
+        let endpoint = endpoint(dir);
         match lock.try_lock() {
             Ok(()) => {
-                let listener = transport::bind(endpoint).map_err(unavailable)?;
+                let listener = transport::bind(&endpoint).map_err(|source| {
+                    InstanceGuardError::Unavailable {
+                        path: endpoint.clone(),
+                        source,
+                    }
+                })?;
                 let (tx, rx) = tokio::sync::mpsc::channel(32);
                 *ACTIVATIONS.lock() = Some(rx);
                 std::thread::Builder::new()
@@ -92,7 +98,7 @@ impl InstanceGuard {
                 Ok(Self { _lock: lock })
             },
             Err(std::fs::TryLockError::WouldBlock) => {
-                forward(endpoint, activation).map_err(InstanceGuardError::ForwardFailed)?;
+                forward(&endpoint, activation).map_err(InstanceGuardError::ForwardFailed)?;
                 Err(InstanceGuardError::Forwarded)
             },
             Err(std::fs::TryLockError::Error(source)) => Err(unavailable(source)),
@@ -183,11 +189,33 @@ mod transport {
     pub(super) type Listener = UnixListener;
     pub(super) type Stream = UnixStream;
 
-    // Only this user can connect: the runtime dir is user-only and the data dir is 0700. The
-    // runtime socket is named by a hash of the data dir to fit the 108-byte path limit.
+    // Only this user can connect: the runtime dir must be a directory this user owns and the data
+    // dir is 0700. The runtime socket is named by a hash of the data dir to fit the 108-byte path
+    // limit.
     pub(super) fn endpoint(data_dir: &Path) -> PathBuf {
-        match std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from) {
-            Some(runtime) if runtime.is_absolute() => {
+        use std::os::unix::fs::MetadataExt as _;
+        // std exposes no process uid; the caller opened the lock inside the 0700 data dir, which
+        // only its owner (or root) can do, so the data dir's owner stands in for this user.
+        match std::fs::metadata(data_dir) {
+            Ok(data) => select_endpoint(
+                data_dir,
+                std::env::var_os("XDG_RUNTIME_DIR")
+                    .as_deref()
+                    .map(Path::new),
+                data.uid(),
+            ),
+            Err(_) => local_endpoint(data_dir),
+        }
+    }
+
+    pub(super) fn select_endpoint(data_dir: &Path, runtime: Option<&Path>, user: u32) -> PathBuf {
+        use std::os::unix::fs::MetadataExt as _;
+        match runtime {
+            Some(runtime)
+                if runtime.is_absolute()
+                    && std::fs::metadata(runtime)
+                        .is_ok_and(|runtime| runtime.is_dir() && runtime.uid() == user) =>
+            {
                 runtime.join(format!("shio-{:016x}.sock", fnv1a(data_dir.as_os_str())))
             },
             _ => local_endpoint(data_dir),
@@ -426,20 +454,20 @@ mod tests {
     fn second_launch_is_forwarded_and_lock_releases_on_drop() {
         // macOS caps socket paths at 104 bytes and its temp dir is already long.
         let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().simple().to_string());
-        let endpoint = transport::local_endpoint(&dir);
+        let endpoint = transport::local_endpoint;
         let idle = activation(&[], None);
         let launch = activation(&["magnet:?xt=urn:btih:test"], Some("launcher/42_TIME7"));
 
-        let first = InstanceGuard::acquire_in(&dir, &endpoint, &idle).unwrap();
+        let first = InstanceGuard::acquire_in(&dir, endpoint, &idle).unwrap();
         let mut activations = take_activation_receiver().unwrap();
         assert!(matches!(
-            InstanceGuard::acquire_in(&dir, &endpoint, &launch),
+            InstanceGuard::acquire_in(&dir, endpoint, &launch),
             Err(InstanceGuardError::Forwarded)
         ));
         assert_eq!(activations.blocking_recv(), Some(launch));
 
         drop(first);
-        drop(InstanceGuard::acquire_in(&dir, &endpoint, &idle).unwrap());
+        drop(InstanceGuard::acquire_in(&dir, endpoint, &idle).unwrap());
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -459,6 +487,46 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    #[test]
+    fn bind_failures_name_the_endpoint() {
+        let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().simple().to_string());
+        let unbindable = |dir: &Path| dir.join("missing").join("shio.sock");
+
+        let error = InstanceGuard::acquire_in(&dir, unbindable, &activation(&[], None));
+        assert!(matches!(
+            error,
+            Err(InstanceGuardError::Unavailable { path, .. }) if path == unbindable(&dir)
+        ));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_endpoint_requires_a_directory_owned_by_this_user() {
+        use std::os::unix::fs::MetadataExt as _;
+        let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().simple().to_string());
+        let runtime = dir.join("runtime");
+        let file = dir.join("file");
+        let missing = dir.join("missing");
+        std::fs::create_dir_all(&runtime).unwrap();
+        std::fs::write(&file, b"").unwrap();
+        let user = std::fs::metadata(&dir).unwrap().uid();
+        let local = transport::local_endpoint(&dir);
+
+        let selected = transport::select_endpoint(&dir, Some(&runtime), user);
+        assert!(selected.starts_with(&runtime), "{}", selected.display());
+        for (candidate, owner) in [
+            (None, user),
+            (Some(Path::new("relative")), user),
+            (Some(missing.as_path()), user),
+            (Some(file.as_path()), user),
+            (Some(runtime.as_path()), user.wrapping_add(1)),
+        ] {
+            assert_eq!(transport::select_endpoint(&dir, candidate, owner), local);
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[cfg(unix)]
     #[test]
     fn data_dir_is_private_and_lock_refuses_symbolic_links() {
@@ -471,11 +539,7 @@ mod tests {
         std::os::unix::fs::symlink(&target, dir.join("shio.instance.lock")).unwrap();
 
         assert!(matches!(
-            InstanceGuard::acquire_in(
-                &dir,
-                &transport::local_endpoint(&dir),
-                &activation(&[], None)
-            ),
+            InstanceGuard::acquire_in(&dir, transport::local_endpoint, &activation(&[], None)),
             Err(InstanceGuardError::Unavailable { .. })
         ));
         assert_eq!(
