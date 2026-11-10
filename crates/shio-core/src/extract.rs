@@ -454,7 +454,7 @@ fn extract_rar(
         failure = Some(error);
         rars::Error::WriterFailure("extraction stopped")
     };
-    let result = rars::extract_volumes_to_with_options(&archives, options, |meta| {
+    let mut open = |meta: &rars::ExtractedEntryMeta| -> rars::Result<Box<dyn Write>> {
         let name = rars::entry_relative_path(&meta.name)
             .map_err(|_| stash(invalid("archive entry escapes destination")))?;
         if meta.is_directory {
@@ -469,7 +469,41 @@ fn extract_rar(
             file,
             cancel: output.cancel.clone(),
         }))
-    });
+    };
+    let mut unsupported = false;
+    let result = if archives
+        .iter()
+        .all(|archive| matches!(archive, rars::Archive::Rar50Plus(_)))
+    {
+        let volumes: Vec<_> = archives
+            .into_iter()
+            .filter_map(|archive| match archive {
+                rars::Archive::Rar50Plus(archive) => Some(archive),
+                _ => None,
+            })
+            .collect();
+        // Types 1-3 are symbolic links and junctions; any other redirection stands for file
+        // content that would silently go missing.
+        rars::rar50::extract_volumes_to_with_redirections(
+            &volumes,
+            options,
+            |meta| open(&rars::rar50_meta(meta)),
+            |_, redirection| {
+                if (1..=3).contains(&redirection.redirection_type) {
+                    return Ok(());
+                }
+                unsupported = true;
+                Err(rars::Error::WriterFailure("extraction stopped"))
+            },
+        )
+    } else {
+        rars::extract_volumes_to_with_options(&archives, options, open)
+    };
+    if unsupported {
+        return Err(invalid(
+            "archive stores hard links or file copies, which Shio cannot extract",
+        ));
+    }
     if let Some(error) = failure {
         return Err(error);
     }
@@ -835,6 +869,69 @@ pub(crate) mod tests {
 
         assert_eq!(std::fs::read(out.join("file.txt")).unwrap(), b"file");
         assert!(std::fs::symlink_metadata(out.join("link")).is_err());
+    }
+
+    #[test]
+    fn rar_hard_links_and_file_copies_fail_instead_of_dropping_files() {
+        let tmp = tempdir().unwrap();
+        let mut builder = rar_builder(&[("file.txt", b"file")]);
+        builder
+            .add_unix_symlink(
+                b"copy.txt".to_vec(),
+                b"file.txt".to_vec(),
+                false,
+                None,
+                None,
+            )
+            .unwrap();
+        let symlinked = builder.to_bytes().unwrap();
+        // The builder only writes symbolic links, so retype the link record (type, flags,
+        // target length, target) and re-seal its header CRC.
+        let record = [&[1, 0, 8][..], b"file.txt"].concat();
+        let at = symlinked
+            .windows(record.len())
+            .position(|window| window == record)
+            .unwrap();
+        let header_end = |start: usize| {
+            let (mut size, mut shift, mut at) = (0_usize, 0, start + 4);
+            loop {
+                let byte = *symlinked.get(at)?;
+                size |= usize::from(byte & 0x7f) << shift;
+                at += 1;
+                if byte & 0x80 == 0 {
+                    return Some(at + size);
+                }
+                shift += 7;
+                if shift > 28 {
+                    return None;
+                }
+            }
+        };
+        let header = (0..at)
+            .rev()
+            .find(|&start| {
+                header_end(start).is_some_and(|end| {
+                    end > at
+                        && end <= symlinked.len()
+                        && symlinked[start..start + 4]
+                            == rars::crc32::crc32(&symlinked[start + 4..end]).to_le_bytes()
+                })
+            })
+            .unwrap();
+        let end = header_end(header).unwrap();
+        for kind in [4, 5] {
+            let mut bytes = symlinked.clone();
+            bytes[at] = kind;
+            let crc = rars::crc32::crc32(&bytes[header + 4..end]);
+            bytes[header..header + 4].copy_from_slice(&crc.to_le_bytes());
+            let archive = tmp.path().join(format!("links{kind}.rar"));
+            std::fs::write(&archive, bytes).unwrap();
+
+            let result = extract_path(&archive, None);
+
+            assert!(matches!(result, Err(ShioError::Extract(_))), "{kind}");
+            assert!(!tmp.path().join(format!("links{kind}")).exists());
+        }
     }
 
     #[test]

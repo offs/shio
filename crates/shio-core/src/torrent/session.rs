@@ -9,7 +9,7 @@ use librqbit::api::TorrentIdOrHash;
 use librqbit::dht::{DhtPersistenceConfig, Id20};
 use librqbit::{
     AddTorrent, AddTorrentOptions, AddTorrentResponse, DhtSessionConfig, ListenerOptions,
-    ManagedTorrentState, Session, SessionOptions, SessionPersistenceConfig,
+    ManagedTorrent, ManagedTorrentState, Session, SessionOptions, SessionPersistenceConfig,
 };
 use serde::{Deserialize, Serialize};
 
@@ -179,10 +179,23 @@ async fn with_timeout<E: std::fmt::Display>(
         .map_err(|e| ShioError::Other(format!("{operation}: {e:#}")))
 }
 
-pub(crate) async fn stop_torrent_in_session(session: &Session, info_hash: [u8; 20]) -> Result<()> {
-    if session.get(torrent_id(info_hash)).is_none() {
-        return Ok(());
+// librqbit keys entries by info hash alone, so an entry may belong to another row of the torrent.
+fn owned_handle(session: &Session, download: &Download) -> Option<Arc<ManagedTorrent>> {
+    let handle = session.get(torrent_id(download.torrent()?.info_hash))?;
+    (handle.output_folder() == payload_dir(download)).then_some(handle)
+}
+
+pub(crate) async fn stop_torrent_in_session(session: &Session, download: &Download) -> Result<()> {
+    match owned_handle(session, download) {
+        Some(handle) => delete_torrent_in_session(session, handle.info_hash().0).await,
+        None => Ok(()),
     }
+}
+
+pub(super) async fn delete_torrent_in_session(
+    session: &Session,
+    info_hash: [u8; 20],
+) -> Result<()> {
     with_timeout(
         "delete torrent session",
         session.delete(torrent_id(info_hash), false),
@@ -190,8 +203,8 @@ pub(crate) async fn stop_torrent_in_session(session: &Session, info_hash: [u8; 2
     .await
 }
 
-pub(super) async fn pause_torrent_in_session(session: &Session, info_hash: [u8; 20]) -> Result<()> {
-    let Some(handle) = session.get(torrent_id(info_hash)) else {
+pub(super) async fn pause_torrent_in_session(session: &Session, download: &Download) -> Result<()> {
+    let Some(handle) = owned_handle(session, download) else {
         return Ok(());
     };
     if handle.is_paused()

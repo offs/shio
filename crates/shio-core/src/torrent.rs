@@ -16,10 +16,12 @@ use tokio_util::sync::CancellationToken;
 use self::metainfo::staged_files;
 pub use self::metainfo::{MAX_TORRENT_METADATA_BYTES, TorrentManifest, parse_torrent_manifest};
 pub(crate) use self::metainfo::{parse_magnet_info_hash, validate_torrent_state};
+use self::session::{
+    delete_torrent_in_session, pause_torrent_in_session, resolve_magnet, torrent_id,
+};
 pub(crate) use self::session::{
     librqbit_rate_limit, open_session, resolve_magnet_preview, stop_torrent_in_session,
 };
-use self::session::{pause_torrent_in_session, resolve_magnet, torrent_id};
 use self::staging::ensure_owned_staging;
 pub(crate) use self::staging::{
     cleanup_staging, prepare_completed_recheck, published_files, staging_root,
@@ -118,7 +120,7 @@ pub(crate) async fn run_torrent(download: Download, deps: TorrentWorkerDeps) -> 
     };
     let result = worker.run(slot, &metadata).await;
     if result.is_err()
-        && let Err(error) = pause_torrent_in_session(&worker.session, worker.info_hash).await
+        && let Err(error) = pause_torrent_in_session(&worker.session, &worker.download).await
     {
         tracing::warn!(download = %worker.download.id, "pause torrent after interrupt failed: {error}");
     }
@@ -248,7 +250,7 @@ impl Worker {
                 }
                 return Ok(handle);
             }
-            stop_torrent_in_session(&self.session, self.info_hash).await?;
+            delete_torrent_in_session(&self.session, self.info_hash).await?;
         }
         let output_folder = output_folder
             .to_str()
@@ -339,11 +341,11 @@ impl Worker {
 
     /// The payload is published, so failing to leave the session must not fail the download.
     async fn leave_session(&self) {
-        let left = match stop_torrent_in_session(&self.session, self.info_hash).await {
+        let left = match stop_torrent_in_session(&self.session, &self.download).await {
             Ok(()) => cleanup_staging(&self.download).await,
             Err(error) => {
                 if let Err(pause_error) =
-                    pause_torrent_in_session(&self.session, self.info_hash).await
+                    pause_torrent_in_session(&self.session, &self.download).await
                 {
                     tracing::warn!(download = %self.download.id, "pause finished torrent failed: {pause_error}");
                 }
@@ -582,5 +584,42 @@ mod tests {
             "the bogus archive must fail its first extraction"
         );
         resumed.expect("resume skips extraction of the published payload");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn removing_an_old_row_spares_the_same_torrents_active_entry() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (active, session) = staged_torrent(temp.path(), "data.bin").await;
+        let TorrentSource::File(bytes) = &active.torrent().expect("torrent").source else {
+            unreachable!("fixture is a .torrent file");
+        };
+        let options = AddTorrentOptions {
+            paused: true,
+            overwrite: true,
+            output_folder: Some(
+                staging::payload_dir(&active)
+                    .to_str()
+                    .expect("utf-8")
+                    .to_owned(),
+            ),
+            ..Default::default()
+        };
+        session
+            .add_torrent(AddTorrent::from_bytes(bytes.clone()), Some(options))
+            .await
+            .expect("add torrent");
+        let mut old = active.clone();
+        old.id = crate::types::DownloadId::new();
+        let info_hash = active.torrent().expect("torrent").info_hash;
+
+        stop_torrent_in_session(&session, &old)
+            .await
+            .expect("stop old");
+        assert!(session.get(torrent_id(info_hash)).is_some());
+
+        stop_torrent_in_session(&session, &active)
+            .await
+            .expect("stop active");
+        assert!(session.get(torrent_id(info_hash)).is_none());
     }
 }
